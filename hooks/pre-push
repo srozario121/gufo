@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pre-push — run leakcheck.sh on every tip being pushed (git's pre-push stdin:
+# `<local ref> <local sha> <remote ref> <remote sha>` per line). A non-zero
+# exit blocks the push. Installed by install-hooks.sh as core.hooksPath.
+set -uo pipefail
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/leakcheck.sh" --stdin
