@@ -106,7 +106,9 @@ EXPECTED_DRV=/nix/store/izfwqpzfim1bz2n1nj3i6nsbpdww2q6w-gufo-runtime.tar.gz.drv
   memory. Each is refused before any build container starts.
 - **Result.** `docker load`, then a retag to
   `ai-sdlc/gufo-runtime-fork-unlabelled:<HEAD12>`. The loaded name is the
-  stock tag's name, so it is untagged only while it names this build. A
+  stock tag's name: what it held before the load is recorded, and afterwards
+  it is removed if the load created it, or pointed back if the load moved it
+  (stock is pinned by digest either way). A
   label-only `docker build` (no new layer) then makes
   `ai-sdlc/gufo-runtime-fork:<HEAD12>` with the labels
   `org.ai-sdlc.gufo-fork.{commit,branch,base-tag,base-commit,toolboxes-commit}`.
@@ -121,10 +123,11 @@ EXPECTED_DRV=/nix/store/izfwqpzfim1bz2n1nj3i6nsbpdww2q6w-gufo-runtime.tar.gz.drv
   derivation are still stock's, but the unsandboxed build runs in a random
   `/builds/nix-<n>-<rand>/` directory instead of the sandbox's `/build`, and
   gufo embeds that path in assert strings, in the host code and in the HIP
-  fatbin. The empty `ai-sdlc/v0.10.0` build (2026-10-11) matched stock in its
+  fatbin. The empty `ai-sdlc/v0.10.0` build (2026-10-11; its evidence is
+  recorded with the deployment's evaluation notes) matched stock in its
   derivation, its engine store path, `gufo --version` and 99 of its 100
-  layers; only the gufo engine layer differs (its binary is 25,093,760 bytes,
-  stock's 25,080,832). So `--compare` reports `DIFFERS: diff_ids` by design:
+  layers; only the gufo engine layer differs (its `bin/gufo` is
+  25,093,760 B, stock's 25,080,832 B). So `--compare` reports `DIFFERS: diff_ids` by design:
   equivalence with stock rests on the greedy fixed-prompt check, not on the
   bytes. Two builds of the same commit differ from each other too, so a
   patch's baseline is an exact image ID of the unpatched build, never a

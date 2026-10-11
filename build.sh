@@ -36,8 +36,9 @@
 #      SwapFree < SWAP_FLOOR_MIB (when there is swap), or the store over
 #      BUDGET_GIB / its filesystem under RESERVE_GIB (checked every 60 s).
 #   4. docker load, retag to $IMAGE_REPO-unlabelled:<HEAD12> (the loaded name
-#      is the stock tag's name; it is untagged only when it points at the
-#      loaded image), then a label-only docker build (no new layer) to
+#      is the stock tag's name: what it held before the load is recorded, and
+#      afterwards it is removed if the load created it or pointed back if the
+#      load moved it), then a label-only docker build (no new layer) to
 #      $IMAGE_REPO:<HEAD12> with the org.ai-sdlc.gufo-fork.* labels.
 #   5. Report on stdout, key=value: drv sandbox engine_path image image_id
 #      diff_ids_sha256 build_s peak_mem_bytes store_used_bytes out_dir; with
@@ -327,12 +328,23 @@ main() {
   if [ -s "$GF_OUT/stopped" ]; then why="$(cat "$GF_OUT/stopped")"; gf_die "$why" 5; fi
   [ "$rc" = 4 ] && gf_die "drv differs from stock — patched or drifted (expected ${EXPECTED_DRV}); nothing was built" 4
   [ "$rc" = 0 ] && [ -s "$GF_OUT/image.tar.gz" ] || gf_die "the build container exited $rc (see $GF_OUT/build.log)" 3
+  # The archive names the image as stock does (the Nix expression's tag), so
+  # loading it moves that name. Record what the name held BEFORE the load, then
+  # afterwards remove the name if the load created it, or point it back at its
+  # old image if the load moved it. Stock is pinned by digest either way.
+  name="$(tar -xzOf "$GF_OUT/image.tar.gz" manifest.json 2>/dev/null | sed -n 's/.*"RepoTags":\["\([^"]*\)".*/\1/p' | head -1)"
+  pre=""; [ -n "$name" ] && pre="$(gf_cfg "$name" '{{.Id}}')"
   loaded="$(docker_ load -i "$GF_OUT/image.tar.gz" | sed -n 's/^Loaded image: //p' | tail -1)"
   lid="$(gf_cfg "$loaded" '{{.Id}}')"
   [ -n "$lid" ] || gf_die "docker load did not report an image (loaded '$loaded')" 3
   docker_ tag "$loaded" "$IMAGE_REPO-unlabelled:$h12" || gf_die "cannot tag $loaded" 3
-  # The loaded name is the stock tag's: untag it only while it names this build.
-  [ "$(gf_cfg "$loaded" '{{.Id}}')" = "$lid" ] && docker_ rmi "$loaded" >/dev/null 2>&1
+  if [ -n "$name" ] && [ "$loaded" = "$name" ]; then
+    if [ -z "$pre" ]; then docker_ rmi "$loaded" >/dev/null 2>&1
+    elif [ "$pre" != "$lid" ]; then docker_ tag "$pre" "$loaded" >/dev/null 2>&1 || gf_say "build: could not point $loaded back at $pre"
+    fi
+  else
+    gf_say "build: left $loaded as loaded (its name was not read from the archive beforehand)"
+  fi
   printf 'FROM %s-unlabelled:%s\nLABEL org.ai-sdlc.gufo-fork.commit=%s org.ai-sdlc.gufo-fork.branch=%s org.ai-sdlc.gufo-fork.base-tag=%s org.ai-sdlc.gufo-fork.base-commit=%s org.ai-sdlc.gufo-fork.toolboxes-commit=%s\n' \
     "$IMAGE_REPO" "$h12" "$GF_HEAD" "ai-sdlc/$BASE_TAG" "$BASE_TAG" "$BASE_COMMIT" "$TOOLBOXES_COMMIT" \
     | docker_ build -q --pull=false -t "$IMAGE_REPO:$h12" - >/dev/null || gf_die "the label step failed" 3
