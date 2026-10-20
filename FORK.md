@@ -12,6 +12,14 @@ well (`LICENSE-NOTE`).
 
 ## Branches
 
+> **Fork state as built: the v0.10.0 era.** Everything below records the fork at
+> the base it was cut on. **2026-10-15 (item 113.2):** the managed pin moved to
+> gufo v0.15.0 and `serving-gufo.env`, `gufo-fork.lock` and `build.conf` name
+> `ai-sdlc/v0.15.0` as the base, but **that branch is not cut yet** — ADR 0042 §7
+> re-cuts it before item 85.5 makes `SERVE_GUFO_FORK=required` true; a miss is a
+> hard error then, so the fork must exist by then. What follows is the procedure
+> and the v0.10.0 evidence, unchanged.
+
 | Branch | What it holds |
 |---|---|
 | `ai-sdlc/v0.10.0` | The patch branch: upstream's `v0.10.0` commit plus our patches, as ordinary commits. Today it has **no patches**, so it is exactly upstream's `3020d2460211b921a8a5be1989b4d4640f432d4c` |
@@ -137,6 +145,38 @@ Exit codes: 0 built; 1 refused; 2 usage; 3 build failed; 4 the derivation
 differs from `EXPECTED_DRV` (nothing built); 5 stopped by the memory floor or
 the disk budget; 6 built, but `--compare` differs.
 
+## Test
+
+`ai-sdlc/test.sh` runs upstream's own hosted checks on the checked-out patch
+branch, in the same container image and Nix store volume as the build, with
+nothing installed on the host. Run it from the main clone:
+
+```
+cd gufo_fork
+GF_DRY_RUN=1 ai-sdlc/test.sh                  # every check, and the exact docker run
+ai-sdlc/test.sh                               # format pr-tests cache-tests docs dependency-inventory
+ai-sdlc/test.sh format                        # or any subset
+```
+
+- **The checks.** `format` (clang-format), `pr-tests` (the CPU contract suite,
+  `check-pr`), `docs` and `dependency-inventory` are the flake's
+  `checks.x86_64-linux.*`, built from a bare clone of the branch's HEAD.
+  `cache-tests` is not a flake check: it configures the same CPU build and
+  runs `continuation_cache_test`, which `check-pr` leaves to the full suite.
+- **Small by design.** The engine may be running, so the container is capped at
+  `GF_TEST_MEM_MIB` (8192) of memory with no extra swap and `GF_TEST_CORES` (4) CPUs,
+  with one Nix job; the build's watcher stops it at the same memory floor and
+  disk budget. The first run fetches compilers from the binary cache; the
+  CPU suite then takes a few minutes. Same refusals as the build (main clone,
+  clean tree, on `ai-sdlc/<base tag>`, the Nix image by digest and local) plus
+  MemAvailable of at least the floor plus the cap.
+- **Result.** `check_<name>=PASS|FAIL` lines on stdout and the full log in
+  `~/.cache/gufo-fork-test/<HEAD12>/test.log`. Exit: 0 all passed; 1 refused;
+  2 usage; 3 a check failed; 5 stopped by the floor or the budget.
+- **Not covered.** `static-analysis` (whole-tree clang-tidy), the full `tests`
+  suite and every GPU or model oracle stay explicit checks; the patch's
+  equivalence rests on the tier-1 proof, not on these.
+
 ## Rebase onto a new upstream release
 
 1. In the main clone: `git fetch upstream --tags`.
@@ -201,5 +241,6 @@ Each outward change, with its removal command:
 | A built image | `docker rmi ai-sdlc/gufo-runtime-fork:<HEAD12>` (and `…-unlabelled:<HEAD12>` if left) |
 | The Nix image | `docker rmi nixos/nix@sha256:7a007c766426c1877758ddc5cb87a965ac131fc78c582ce0083d922d51ae945c` |
 | Build output | `rm -rf ~/.cache/gufo-fork-build` |
+| Test output | `rm -rf ~/.cache/gufo-fork-test` |
 | This clone | `rm -rf gufo_fork` (after a bundle, if anything is unpushed) |
 | The GitHub fork | GitHub, repository Settings, "Delete this repository" |
