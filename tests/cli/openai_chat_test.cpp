@@ -1831,6 +1831,129 @@ void TestAllSamplingControlsReachBackend() {
          "presence penalty reaches backend");
 }
 
+// With the server flag on (a non-null default bias), `logit_bias` is parsed
+// into the request's sampling; with it off the field is rejected as before.
+void TestLogitBiasAcceptedWhenEnabled() {
+  FakeBackend backend;
+  backend.defaults.sampling.logit_bias =
+      std::make_shared<gufo::sampling::LogitBias>(
+          gufo::sampling::LogitBias{.vocab = 1000});
+  const auto post = [&](const std::string& bias) {
+    return gufo::server::HandleOpenAiChat(
+        Request(R"({"model":"test-model","messages":[{"role":"user",)"
+                R"("content":"hi"}],"logit_bias":)" +
+                bias + "}"),
+        backend);
+  };
+  auto response = post(R"({"5":-3.5,"999":100,"0":-100,"17":2})");
+  Expect(response.status == 200, "a request logit_bias is accepted");
+  const auto& bias = backend.last_sampling.logit_bias;
+  Expect(bias != nullptr && bias->entries.size() == 4 &&
+             bias->entries.front().first == 0 &&
+             bias->entries.back().first == 999 && bias->at(5) == -3.5F &&
+             bias->at(17) == 2.0F && bias->at(6) == 0.0F,
+         "entries are sorted by token and carry their values");
+  Expect(backend.last_sampling.bias_active() &&
+             !backend.last_sampling.can_use_unmodified_argmax(),
+         "a biased request is not an unmodified-argmax request");
+  for (const char* empty : {"{}", "null"}) {
+    Expect(post(empty).status == 200, "an empty bias is accepted");
+    Expect(!backend.last_sampling.bias_active(), "an empty bias is inactive");
+  }
+}
+
+// The request's entries replace the server default for their token, and the
+// shared default is not copied or changed.
+void TestLogitBiasMergesWithDefault() {
+  FakeBackend backend;
+  auto dense = std::make_shared<std::vector<float>>(1000, 0.0F);
+  (*dense)[7] = -8.0F;
+  (*dense)[8] = -8.0F;
+  backend.defaults.sampling.logit_bias =
+      std::make_shared<gufo::sampling::LogitBias>(
+          gufo::sampling::LogitBias{.vocab = 1000, .defaults = dense});
+  Expect(backend.defaults.sampling.bias_active(), "the default set is active");
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(R"({"model":"test-model","messages":[{"role":"user",)"
+              R"("content":"hi"}],"logit_bias":{"7":5}})"),
+      backend);
+  Expect(response.status == 200, "a request over a default set is accepted");
+  const auto& bias = backend.last_sampling.logit_bias;
+  Expect(bias->defaults == dense && bias->at(7) == 5.0F &&
+             bias->at(8) == -8.0F && bias->at(9) == 0.0F,
+         "a request entry replaces the default for its token only");
+  Expect((*dense)[7] == -8.0F, "the shared default is unchanged");
+  const auto plain = gufo::server::HandleOpenAiChat(
+      Request(R"({"model":"test-model","messages":[{"role":"user",)"
+              R"("content":"hi"}]})"),
+      backend);
+  Expect(plain.status == 200 && backend.last_sampling.bias_active() &&
+             backend.last_sampling.logit_bias->at(8) == -8.0F,
+         "a request without logit_bias keeps the default suppression");
+}
+
+// Hostile bodies: each is refused with invalid_logit_bias and never reaches
+// the backend.
+void TestLogitBiasHostileBodies() {
+  FakeBackend backend;
+  backend.defaults.sampling.logit_bias =
+      std::make_shared<gufo::sampling::LogitBias>(
+          gufo::sampling::LogitBias{.vocab = 1000});
+  std::string at_cap = "{";
+  std::string over_cap = "{";
+  for (int i = 0; i < 301; ++i) {
+    if (i < 300)
+      at_cap += (i ? "," : "") + std::string("\"") + std::to_string(i) + "\":1";
+    over_cap += (i ? "," : "") + std::string("\"") + std::to_string(i) + "\":1";
+  }
+  at_cap += "}";
+  over_cap += "}";
+  const auto post = [&](const std::string& bias) {
+    return gufo::server::HandleOpenAiChat(
+        Request(R"({"model":"test-model","messages":[{"role":"user",)"
+                R"("content":"hi"}],"logit_bias":)" +
+                bias + "}"),
+        backend);
+  };
+  Expect(post(at_cap).status == 200 &&
+             backend.last_sampling.logit_bias->entries.size() == 300,
+         "300 entries are accepted");
+  const auto calls = backend.chat_calls.load();
+  for (const std::string& hostile :
+       {over_cap,
+        std::string(R"({"1000":1})"),
+        std::string(R"({"-1":1})"),
+        std::string(R"({"01":1})"),
+        std::string(R"({"1.5":1})"),
+        std::string(R"({"abc":1})"),
+        std::string(R"({"":1})"),
+        std::string(R"({"+1":1})"),
+        std::string(R"({"1234567890":1})"),
+        std::string(R"({"99999999999999999999":1})"),
+        std::string(R"({"1":101})"),
+        std::string(R"({"1":-100.5})"),
+        std::string(R"({"1":"2"})"),
+        std::string(R"({"1":null})"),
+        std::string(R"({"1":true})"),
+        std::string(R"({"1":[1]})"),
+        std::string(R"({"1":{"a":1}})"),
+        std::string(R"([1,2])"),
+        std::string(R"("5")"),
+        std::string("5"),
+        std::string("true")}) {
+    const auto response = post(hostile);
+    Expect(response.status == 400 &&
+               response.body.find("invalid_logit_bias") != std::string::npos,
+           ("hostile logit_bias was not refused: " + hostile.substr(0, 40))
+               .c_str());
+  }
+  // A number the JSON reader cannot hold is refused by it or by the bias
+  // check; either way it is a 400 that never reaches the backend.
+  Expect(post(R"({"1":1e999})").status == 400, "an overflowing value");
+  Expect(backend.chat_calls.load() == calls,
+         "a refused body reached the backend");
+}
+
 void TestUnsupportedSamplingControlsAreRejected() {
   FakeBackend backend;
   for (const auto& [field, value] :
@@ -6192,6 +6315,9 @@ void TestIncrementalToolArguments() {
 }
 
 int main() {
+  TestLogitBiasAcceptedWhenEnabled();
+  TestLogitBiasMergesWithDefault();
+  TestLogitBiasHostileBodies();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();

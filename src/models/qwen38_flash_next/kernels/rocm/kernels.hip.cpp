@@ -7706,6 +7706,22 @@ void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
                      stream, logits, table, n);
 }
 
+__global__ void MaskSuppressedLogitsKernel(float* logits,
+                                           const std::uint8_t* flags,
+                                           std::uint32_t n,
+                                           std::size_t stride) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && flags[i] != 0)
+    logits[blockIdx.y * stride + i] = -INFINITY;
+}
+
+void MaskSuppressedLogits(float* logits, const std::uint8_t* flags,
+                          std::uint32_t n, std::uint32_t rows,
+                          std::size_t stride, hipStream_t stream) {
+  hipLaunchKernelGGL(MaskSuppressedLogitsKernel, dim3(Blocks(n), rows),
+                     dim3(kThreads), 0, stream, logits, flags, n, stride);
+}
+
 __global__ void GatherDraftLogitsKernel(float* logits,
                                         const std::int32_t* table,
                                         std::uint32_t prefix, std::uint32_t n) {

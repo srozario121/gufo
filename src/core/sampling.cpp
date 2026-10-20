@@ -217,6 +217,57 @@ void SamplingConfig::Validate() const {
   }
 }
 
+float LogitBias::at(TokenId token) const noexcept {
+  const auto found = std::ranges::lower_bound(
+      entries, token, {}, &std::pair<TokenId, float>::first);
+  if (found != entries.end() && found->first == token)
+    return found->second;
+  return defaults != nullptr && token < defaults->size() ? (*defaults)[token]
+                                                         : 0.0F;
+}
+
+class SamplerState::BiasScope {
+public:
+  explicit BiasScope(const SamplerState& state)
+      : state_(state), previous_(state.bias_added_) {
+    state_.bias_added_ = true;
+  }
+  ~BiasScope() { state_.bias_added_ = previous_; }
+  BiasScope(const BiasScope&) = delete;
+  BiasScope& operator=(const BiasScope&) = delete;
+
+private:
+  const SamplerState& state_;
+  bool previous_;
+};
+
+static std::vector<float> AddLogitBias(const LogitBias& bias,
+                                       std::span<const float> logits) {
+  std::vector<float> out(logits.begin(), logits.end());
+  if (bias.defaults != nullptr) {
+    const auto count = std::min(out.size(), bias.defaults->size());
+    for (std::size_t token = 0; token < count; ++token)
+      out[token] += (*bias.defaults)[token];
+  }
+  for (const auto& [token, value] : bias.entries)
+    if (token < out.size())
+      out[token] = logits[token] + value;
+  return out;
+}
+
+std::vector<float> SamplerState::Biased(std::span<const float> logits) const {
+  return AddLogitBias(*config_.logit_bias, logits);
+}
+
+std::vector<float> SamplerState::Biased(std::span<const float> logits,
+                                        std::span<const TokenId> ids) const {
+  std::vector<float> out(logits.begin(), logits.end());
+  const auto& bias = *config_.logit_bias;
+  for (std::size_t index = 0; index < out.size() && index < ids.size(); ++index)
+    out[index] += bias.at(ids[index]);
+  return out;
+}
+
 bool SamplingConfig::penalties_enabled() const noexcept {
   return repeat_penalty != 1.0F || frequency_penalty != 0.0F ||
          presence_penalty != 0.0F;
@@ -228,7 +279,7 @@ bool SamplingConfig::uses_random_sampling() const noexcept {
 
 bool SamplingConfig::can_use_unmodified_argmax() const noexcept {
   return !constraint && !reasoning_budget && temperature == 0.0F &&
-         !penalties_enabled();
+         !penalties_enabled() && !bias_active();
 }
 
 bool SamplerState::CanSelectArgmax(TokenId token,
@@ -236,7 +287,8 @@ bool SamplerState::CanSelectArgmax(TokenId token,
   if (const auto forced = ForcedToken())
     return !pending_sample_ && token == *forced;
   if (pending_sample_ || config_.temperature != 0.0F ||
-      (!penalties_applied && config_.penalties_enabled()))
+      (!penalties_applied && config_.penalties_enabled()) ||
+      config_.bias_active())
     return false;
   if (!config_.constraint)
     return true;
@@ -414,6 +466,12 @@ SamplingDistribution BuildDistribution(
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens,
     std::span<const TokenId> generated_tokens) {
+  if (config.bias_active()) {
+    auto unbiased = config;
+    unbiased.logit_bias.reset();
+    return BuildDistribution(AddLogitBias(*config.logit_bias, logits), unbiased,
+                             prompt_tokens, generated_tokens);
+  }
   if (config.constraint || config.reasoning_budget) {
     SamplerState sampler(config, prompt_tokens);
     sampler.Accept(generated_tokens);
@@ -469,6 +527,7 @@ SamplerState::SamplerState(const SamplerState& other)
       penalty_counts_(other.penalty_counts_),
       rng_state_(other.rng_state_),
       pending_sample_(other.pending_sample_),
+      bias_added_(other.bias_added_),
       reasoning_phase_(other.reasoning_phase_),
       reasoning_remaining_(other.reasoning_remaining_),
       reasoning_forced_(other.reasoning_forced_) {}
@@ -486,6 +545,7 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
   candidate_scratch_.clear();
   rng_state_ = other.rng_state_;
   pending_sample_ = other.pending_sample_;
+  bias_added_ = other.bias_added_;
   reasoning_phase_ = other.reasoning_phase_;
   reasoning_remaining_ = other.reasoning_remaining_;
   reasoning_forced_ = other.reasoning_forced_;
@@ -662,6 +722,11 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits) const {
+  if (BiasPending()) {
+    const auto biased = Biased(logits);
+    const BiasScope scope(*this);
+    return Distribution(biased);
+  }
   if (const auto forced = ForcedToken()) {
     if (*forced >= logits.size())
       throw std::invalid_argument("forced token exceeds vocabulary");
@@ -699,6 +764,11 @@ SamplingDistribution SamplerState::Distribution(
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits, std::span<const TokenId> token_ids) const {
+  if (BiasPending() && logits.size() == token_ids.size()) {
+    const auto biased = Biased(logits, token_ids);
+    const BiasScope scope(*this);
+    return Distribution(biased, token_ids);
+  }
   if (const auto forced = ForcedToken()) {
     const auto found = std::ranges::find(token_ids, *forced);
     if (found != token_ids.end())
@@ -763,6 +833,11 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
       throw std::runtime_error("pending sample violates JSON constraint");
     pending_sample_.reset();
     return token;
+  }
+  if (BiasPending()) {
+    const auto biased = Biased(logits);
+    const BiasScope scope(*this);
+    return Sample(biased);
   }
   if (config_.constraint) {
     const auto distribution = Distribution(logits);

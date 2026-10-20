@@ -1353,6 +1353,15 @@ bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
       AssignError(error_msg, "draft table token out of range");
       return false;
     }
+    // A suppressed row is never proposed: its slot stays empty (ID -1).
+    if (model_->IsSuppressed(ids[i])) {
+      if (!Check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(
+                                       session.mtp_.draft_ids + first + i),
+                                   0xFFFFFFFFU, 1, stream_),
+                 "draft table id", error_msg))
+        return false;
+      continue;
+    }
     // The ID goes by value, so no host buffer has to outlive the call.
     if (!Check(hipMemcpyAsync(session.mtp_.draft_rows + (first + i) * row_bytes,
                               static_cast<const std::uint8_t*>(output.data) +
@@ -1391,11 +1400,21 @@ DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
   return table;
 }
 
+void Executor::MaskSuppressed(float* logits, std::uint32_t n,
+                              std::uint32_t rows,
+                              std::size_t stride) const noexcept {
+  if (model_->suppressed_device() != nullptr && n != 0 && rows != 0)
+    MaskSuppressedLogits(logits, model_->suppressed_device(), n, rows, stride,
+                         stream_);
+}
+
 bool Executor::DraftLogits(const Session& session, const float* x,
                            float* logits, std::string* error_msg) const {
   const auto& prefix = model_->draft_output();
-  if (!Dense(prefix, x, logits, 1, error_msg) ||
-      !Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
+  if (!Dense(prefix, x, logits, 1, error_msg))
+    return false;
+  MaskSuppressed(logits, prefix.rows);
+  if (!Dense(DraftTable(session), x, logits + prefix.rows, 1, error_msg))
     return false;
   MaskDraftLogits(logits + prefix.rows, session.mtp_.draft_ids,
                   kMtpDraftExtraRows, stream_);
@@ -2797,6 +2816,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
             : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
     return false;
   }
+  if (draft == nullptr)
+    MaskSuppressed(s_.logits, rows);
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
   if (candidates) {
     MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,

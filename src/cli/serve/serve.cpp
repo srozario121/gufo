@@ -595,6 +595,9 @@ void PrintServeHelp(std::string_view program_name,
     std::string mtp_model_path;
     std::size_t mtp_draft_vocab_prefix = 0;
     std::string mtp_draft_vocab_set;
+    bool logit_bias = false;
+    std::string suppress_nonascii_keep;
+    double suppress_nonascii_value = -8.0;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -688,6 +691,18 @@ void PrintServeHelp(std::string_view program_name,
                      "Token-ID list (one decimal ID per line) the Qwen MTP "
                      "draft also scores above its prefix",
                      "Speculative", &mtp_draft_vocab_set);
+    parser.AddFlag("", "--logit-bias",
+                   "Accept the OpenAI logit_bias request field (token IDs; "
+                   "at most 300 entries, values -100..100)",
+                   "Sampling", &logit_bias);
+    parser.AddOption("", "--suppress-nonascii-keep", "PATH",
+                     "Suppress every non-ASCII, non-special output row except "
+                     "the token IDs listed in PATH (one decimal ID per line) "
+                     "by --suppress-nonascii-value; implies --logit-bias",
+                     "Sampling", &suppress_nonascii_keep);
+    parser.AddOption("", "--suppress-nonascii-value", "V",
+                     "Logit added to suppressed rows (default: -8)", "Sampling",
+                     &suppress_nonascii_value);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1158,6 +1173,9 @@ int RunServe(std::span<const char* const> args) {
     std::string mtp_model_path;
     std::size_t mtp_draft_vocab_prefix = 0;
     std::string mtp_draft_vocab_set;
+    bool logit_bias = false;
+    std::string suppress_nonascii_keep;
+    double suppress_nonascii_value = -8.0;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1248,6 +1266,19 @@ int RunServe(std::span<const char* const> args) {
         "Token-ID list (one decimal ID per line) the Qwen MTP draft also "
         "scores above its prefix",
         "Speculative", &mtp_draft_vocab_set);
+    llm_parser.AddFlag("", "--logit-bias",
+                       "Accept the OpenAI logit_bias request field (token "
+                       "IDs; at most 300 entries, values -100..100)",
+                       "Sampling", &logit_bias);
+    llm_parser.AddOption(
+        "", "--suppress-nonascii-keep", "PATH",
+        "Suppress every non-ASCII, non-special output row except the token "
+        "IDs listed in PATH (one decimal ID per line) by "
+        "--suppress-nonascii-value; implies --logit-bias",
+        "Sampling", &suppress_nonascii_keep);
+    llm_parser.AddOption("", "--suppress-nonascii-value", "V",
+                         "Logit added to suppressed rows (default: -8)",
+                         "Sampling", &suppress_nonascii_value);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1445,6 +1476,18 @@ int RunServe(std::span<const char* const> args) {
     speculative_config.mtp_draft_vocab_prefix =
         static_cast<std::uint32_t>(mtp_draft_vocab_prefix);
     speculative_config.mtp_draft_vocab_set = mtp_draft_vocab_set;
+    if (!std::isfinite(suppress_nonascii_value) ||
+        ((logit_bias || !suppress_nonascii_keep.empty()) &&
+         speculative_config.backend != server::TextSpeculativeBackend::kMtp)) {
+      std::cerr << "Error: --logit-bias and --suppress-nonascii-keep need "
+                   "--speculative mtp (Qwen3.8-Flash-Next), and the "
+                   "suppression value must be finite\n";
+      return 2;
+    }
+    speculative_config.logit_bias = logit_bias;
+    speculative_config.suppress_nonascii_keep = suppress_nonascii_keep;
+    speculative_config.suppress_nonascii_value =
+        static_cast<float>(suppress_nonascii_value);
     if (model.empty()) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;

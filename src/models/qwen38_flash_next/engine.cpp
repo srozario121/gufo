@@ -18,6 +18,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/logit_bias_default.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
@@ -145,6 +146,48 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                          m->mtp_reader_.get(), error_msg);
   if (!m->device_) {
     return nullptr;
+  }
+  if (options.logit_bias || !options.suppress_keep_path.empty()) {
+    const std::uint32_t vocab = m->device_->output().rows;
+    auto bias = std::make_shared<sampling::LogitBias>();
+    bias->vocab = vocab;
+    if (!options.suppress_keep_path.empty()) {
+      std::ifstream in(options.suppress_keep_path, std::ios::binary);
+      std::ostringstream text;
+      text << in.rdbuf();
+      if (!in.is_open() || in.bad()) {
+        AssignError(error_msg, "cannot read the suppression keep file");
+        return nullptr;
+      }
+      std::string parse_error;
+      auto keep = ParseTokenIdList(text.str(), vocab, &parse_error);
+      if (!keep) {
+        AssignError(error_msg, "suppression keep file: " + parse_error);
+        return nullptr;
+      }
+      if (!std::isfinite(options.suppress_value)) {
+        AssignError(error_msg, "the suppression value must be finite");
+        return nullptr;
+      }
+      const auto& tokenizer = *m->tokenizer_;
+      auto plan = PlanSuppression(
+          vocab, options.suppress_value, *keep,
+          [&](std::uint32_t id) {
+            for (const char c : tokenizer.DecodeToken(id))
+              if (static_cast<unsigned char>(c) >= 0x80)
+                return true;
+            return false;
+          },
+          [&](std::uint32_t id) { return tokenizer.IsSpecialToken(id); });
+      std::cerr << "[logit-bias] default suppression value="
+                << options.suppress_value
+                << " non_ascii_rows=" << plan.non_ascii << " kept=" << plan.kept
+                << " suppressed=" << plan.suppressed << '\n';
+      if (!m->device_->SetSuppressedRows(std::move(plan.flags), error_msg))
+        return nullptr;
+      bias->defaults = std::move(plan.bias);
+    }
+    m->default_bias_ = std::move(bias);
   }
   const std::uint32_t draft_prefix = options.draft_vocab_prefix != 0
                                          ? options.draft_vocab_prefix
@@ -1010,7 +1053,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
-  const bool gpu_greedy = sampler.config().temperature == 0.0F;
+  // A biased request's logits are adjusted on the host, so its verification
+  // rows are downloaded instead of argmaxed on the device.
+  const bool gpu_greedy =
+      sampler.config().temperature == 0.0F && !sampler.config().bias_active();
   const bool gpu_verification = gpu_greedy;
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
   // Target verification keeps its own draws after this independent seed.

@@ -353,6 +353,30 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
   return true;
 }
 
+bool DeviceModel::SetSuppressedRows(std::vector<std::uint8_t> flags,
+                                    std::string* error_msg) {
+  const auto fail = [&](const std::string& message) {
+    if (error_msg != nullptr)
+      *error_msg = message;
+    return false;
+  };
+  if (output_.empty() || flags.size() != output_.rows)
+    return fail("suppressed rows must have one flag per output row");
+  void* device = nullptr;
+  if (hipMalloc(&device, flags.size()) != hipSuccess)
+    return fail("suppressed rows: device allocation failed");
+  if (hipMemcpy(device, flags.data(), flags.size(), hipMemcpyHostToDevice) !=
+      hipSuccess) {
+    (void)hipFree(device);
+    return fail("suppressed rows: upload failed");
+  }
+  allocations_.push_back(device);
+  bytes_ += flags.size();
+  suppressed_ = std::move(flags);
+  suppressed_device_ = static_cast<const std::uint8_t*>(device);
+  return true;
+}
+
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,

@@ -574,6 +574,13 @@ void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
 void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
                      hipStream_t stream);
 
+/// Logits of suppressed rows (flags[i] != 0) become -infinity, for `rows` rows
+/// of `n` entries starting `stride` floats apart. flags is indexed by token
+/// ID and so by column, which holds for a head that starts at row 0.
+void MaskSuppressedLogits(float* logits, const std::uint8_t* flags,
+                          std::uint32_t n, std::uint32_t rows,
+                          std::size_t stride, hipStream_t stream);
+
 /// Full-vocabulary logits to the small-head layout, in place: row
 /// prefix + i becomes logits[table[i]], or -infinity for an empty slot
 /// (table[i] < 0). n is at most 1024 (one block).

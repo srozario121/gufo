@@ -98,6 +98,18 @@ public:
   [[nodiscard]] bool SetDraftVocab(std::uint32_t prefix_rows,
                                    std::vector<std::int32_t> specials,
                                    std::string* error_msg);
+  /// Rows the draft head must never propose (1 = masked), by token ID: the
+  /// medium level's default suppression (logit_bias_default.hpp). The device
+  /// copy is read by MaskSuppressedLogits; nothing else changes.
+  [[nodiscard]] bool SetSuppressedRows(std::vector<std::uint8_t> flags,
+                                       std::string* error_msg);
+  [[nodiscard]] const std::uint8_t* suppressed_device() const noexcept {
+    return suppressed_device_;
+  }
+  [[nodiscard]] bool IsSuppressed(std::int32_t id) const noexcept {
+    return id >= 0 && static_cast<std::size_t>(id) < suppressed_.size() &&
+           suppressed_[static_cast<std::size_t>(id)] != 0;
+  }
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
@@ -121,6 +133,8 @@ private:
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
   std::vector<std::int32_t> draft_specials_;
+  std::vector<std::uint8_t> suppressed_;
+  const std::uint8_t* suppressed_device_{nullptr};
   DeviceMixer hc_head_;
   std::vector<DeviceLayer> layers_;
   DeviceLayer mtp_;

@@ -58,6 +58,13 @@ struct ModelOptions {
   /// Optional token-ID list (one decimal ID per line) added to every
   /// session's draft table above the prefix. Empty adds none.
   std::string draft_vocab_set_path;
+  /// Accept `logit_bias` in requests (medium level of the vocab trim).
+  bool logit_bias = false;
+  /// Token-ID list (one decimal ID per line) NOT to suppress. Non-empty turns
+  /// on the default suppression of every other non-ASCII, non-special row, at
+  /// `suppress_value`, and implies `logit_bias`.
+  std::string suppress_keep_path;
+  float suppress_value = -8.0F;
 };
 
 class Session;
@@ -91,6 +98,13 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// The server-wide logit bias (vocabulary size and default suppression); null
+  /// when `logit_bias` is off. Its presence is what makes a server accept
+  /// `logit_bias` in a request.
+  [[nodiscard]] std::shared_ptr<const sampling::LogitBias> DefaultLogitBias()
+      const noexcept {
+    return default_bias_;
+  }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -128,6 +142,7 @@ private:
   /// Static rows at the start of every session's draft table: the special
   /// tokens, then the draft set's IDs above the prefix.
   std::uint32_t draft_specials_{0};
+  std::shared_ptr<const sampling::LogitBias> default_bias_;
   /// The small head's prefix and static rows (draft_vocab.hpp).
   MtpDraftPlan draft_plan_;
   /// Prefix and static rows: always in the small head.

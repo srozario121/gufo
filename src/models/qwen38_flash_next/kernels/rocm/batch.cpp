@@ -518,6 +518,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     if (mixed) {
       if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
         return false;
+      MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(vocab), n,
+                     vocab);
       for (std::uint32_t i = 0; i < n; ++i) {
         if (slot[i] < subset_rows)
           GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
@@ -534,6 +536,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                                subset_rows, hipMemcpyDeviceToDevice, stream_),
               error))
         return false;
+      MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(prefix),
+                     subset_rows, kSmall);
       for (std::uint32_t i = 0; i < n; ++i) {
         if (slot[i] >= subset_rows)
           continue;
@@ -546,9 +550,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                         kMtpDraftExtraRows, stream_);
       }
     }
-    if (subset_rows == 0 &&
-        !DenseBatch(full_head, base.mixed, batch_logits_, n, error))
-      return false;
+    if (subset_rows == 0) {
+      if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+        return false;
+      MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(vocab), n,
+                     vocab);
+    }
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
         continue;

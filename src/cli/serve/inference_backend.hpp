@@ -48,6 +48,11 @@ struct TextSpeculativeConfig {
   std::uint32_t mtp_draft_vocab_prefix{0};
   /// Token-ID list added to every session's draft table; empty adds none.
   std::string mtp_draft_vocab_set;
+  /// Accept `logit_bias`; and the file of token IDs not to suppress, whose
+  /// presence turns the default suppression of non-ASCII rows on.
+  bool logit_bias{false};
+  std::string suppress_nonascii_keep;
+  float suppress_nonascii_value{-8.0F};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };
