@@ -3158,6 +3158,9 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .rope_scaling = rope_scaling,
             .draft_vocab_prefix = speculative_config.mtp_draft_vocab_prefix,
             .draft_vocab_set_path = speculative_config.mtp_draft_vocab_set,
+            .logit_bias = speculative_config.logit_bias,
+            .suppress_keep_path = speculative_config.suppress_nonascii_keep,
+            .suppress_value = speculative_config.suppress_nonascii_value,
         },
         &load_error);
     if (model == nullptr) {
@@ -3528,6 +3531,8 @@ bool InferenceBackend::load(
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
+    new_state->sampling_defaults.sampling.logit_bias =
+        model->DefaultLogitBias();
     new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
@@ -3711,7 +3716,12 @@ void InferenceBackend::set_sampling_defaults(
   }
   auto updated = std::make_shared<Impl::State>(*impl_->state);
   updated->sampling_defaults.max_tokens = max_tokens;
+  // The model owns the logit bias (its vocabulary and default suppression);
+  // a configuration without one keeps it.
+  auto logit_bias = std::move(updated->sampling_defaults.sampling.logit_bias);
   updated->sampling_defaults.sampling = sampling_config;
+  if (updated->sampling_defaults.sampling.logit_bias == nullptr)
+    updated->sampling_defaults.sampling.logit_bias = std::move(logit_bias);
   updated->sampling_defaults.supplied = supplied;
   impl_->state = std::move(updated);
 #else

@@ -47,6 +47,7 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   SamplingConfig result;
   // Presets change sampling controls, never the caller's output grammar.
   result.constraint = configured.constraint;
+  result.logit_bias = configured.logit_bias;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
   if (model == TextModelPreset::kQwen38) {

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -43,6 +44,77 @@ void TestDefaultConfigPreservesGreedyDecoding() {
   Expect(token == 1, "default sampler is greedy");
   Expect(sampler.rng_state() == before,
          "default sampler does not consume RNG state");
+}
+
+// A logit bias is added on the host before penalties and the filters, for the
+// full row, for compact candidate logits (by token ID) and for the sampled and
+// greedy paths; it takes the GPU argmax shortcuts away.
+void TestLogitBias() {
+  using gufo::sampling::LogitBias;
+  using gufo::sampling::SamplerState;
+  const std::array<float, 4> logits = {1.0F, 5.0F, 4.5F, 0.0F};
+  auto dense = std::make_shared<std::vector<float>>(4, 0.0F);
+  (*dense)[1] = -8.0F;
+  auto bias = std::make_shared<LogitBias>();
+  bias->vocab = 4;
+  bias->defaults = dense;
+  gufo::sampling::SamplingConfig config;
+  config.logit_bias = bias;
+  SamplerState greedy(config);
+  Expect(greedy.Sample(logits) == 2,
+         "the default bias moves the greedy winner");
+  Expect(!greedy.config().can_use_unmodified_argmax() &&
+             !greedy.CanSelectArgmax(2),
+         "a biased request cannot take the GPU argmax");
+  Expect(logits[1] == 5.0F, "the caller's logits are not edited");
+
+  // A request entry replaces the default for its token.
+  auto request = std::make_shared<LogitBias>(*bias);
+  request->entries = {{1, 0.0F}, {2, -1.0F}};
+  config.logit_bias = request;
+  SamplerState replaced(config);
+  Expect(replaced.Sample(logits) == 1, "a request entry replaces the default");
+
+  // The inactive bias is a no-op and keeps the shortcuts.
+  config.logit_bias = std::make_shared<LogitBias>(LogitBias{.vocab = 4});
+  SamplerState inactive(config);
+  Expect(inactive.Sample(logits) == 1 &&
+             inactive.config().can_use_unmodified_argmax() &&
+             inactive.CanSelectArgmax(1),
+         "an inactive bias changes nothing");
+
+  // Compact candidates are biased by token ID, not by position.
+  config.logit_bias = bias;
+  const std::array<gufo::sampling::TokenId, 2> ids = {1, 3};
+  const std::array<float, 2> compact = {5.0F, 4.0F};
+  SamplerState compacted(config);
+  const auto distribution = compacted.Distribution(compact, ids);
+  Expect(distribution.best_token() == 1, "compact greedy keeps positions");
+  Expect(distribution.entries().size() == 1 &&
+             distribution.entries()[0].token == 1,
+         "compact distribution is an index into the candidates");
+  config.temperature = 1.0F;
+  SamplerState sampled(config);
+  const auto soft = sampled.Distribution(logits);
+  Expect(soft.probability(2) > soft.probability(1) * 10.0,
+         "a -8 bias makes a one-point-ahead token rare when sampling");
+
+  // Penalties still apply after the bias.
+  gufo::sampling::SamplingConfig penalized;
+  penalized.logit_bias = request;
+  penalized.presence_penalty = 10.0F;
+  SamplerState with_penalty(penalized,
+                            std::array<gufo::sampling::TokenId, 1>{1});
+  with_penalty.Accept(1);
+  Expect(with_penalty.Sample(logits) == 2, "penalties run on biased logits");
+
+  // The standalone distribution helper honours the bias too.
+  gufo::sampling::SamplingConfig built;
+  built.logit_bias = bias;
+  built.temperature = 1.0F;
+  const auto by_helper = gufo::sampling::BuildDistribution(logits, built);
+  Expect(by_helper.probability(2) > by_helper.probability(1) * 10.0,
+         "BuildDistribution applies the bias");
 }
 
 void TestExternalArgmaxRequiresAppliedPenalties() {
@@ -633,6 +705,7 @@ int main() {
         draw != static_cast<double>(static_cast<float>(draw));
   }
   Expect(sub_float_resolution, "uniform must exceed float resolution");
+  TestLogitBias();
   TestCanonicalTargetDistribution();
   TestResponsePenaltyScope();
   TestGreedySelectsFiniteArgmaxWithoutAdvancingRng();

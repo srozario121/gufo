@@ -1,10 +1,12 @@
 #ifndef GUFO_SERVER_SAMPLING_REQUEST_HPP_
 #define GUFO_SERVER_SAMPLING_REQUEST_HPP_
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -81,6 +83,68 @@ inline std::optional<SamplingRequestError> ReadSamplingInteger(
   return std::nullopt;
 }
 
+/// Most `logit_bias` entries one request may carry (OpenAI's own limit).
+inline constexpr std::size_t kMaxLogitBiasEntries = 300;
+inline constexpr double kMaxLogitBiasMagnitude = 100.0;
+
+/// Reads a request's `logit_bias`: an object of decimal token IDs (no sign,
+/// no leading zeros, below the vocabulary) to finite numbers in [-100, 100],
+/// at most kMaxLogitBiasEntries of them. The request's entries replace the
+/// server default for their tokens. Called only when the server accepts it.
+inline std::optional<SamplingRequestError> ReadLogitBias(
+    const json::Value& body, const sampling::LogitBias& server,
+    sampling::SamplingConfig* output) {
+  const json::Value* value = body.find("logit_bias");
+  if (value == nullptr || value->is_null() ||
+      (value->is_object() && value->empty())) {
+    return std::nullopt;
+  }
+  const auto invalid = [](std::string message) {
+    return SamplingRequestError{.message = std::move(message),
+                                .code = "invalid_logit_bias"};
+  };
+  if (!value->is_object()) {
+    return invalid("'logit_bias' must be an object of token IDs to numbers");
+  }
+  sampling::LogitBias bias;
+  bias.vocab = server.vocab;
+  bias.defaults = server.defaults;
+  for (const auto& [key, entry] : value->members()) {
+    if (bias.entries.size() >= kMaxLogitBiasEntries) {
+      return invalid("'logit_bias' has more than " +
+                     std::to_string(kMaxLogitBiasEntries) + " entries");
+    }
+    const bool canonical =
+        !key.empty() && key.size() <= 9 && (key == "0" || key.front() != '0') &&
+        std::ranges::all_of(key, [](char c) { return c >= '0' && c <= '9'; });
+    const std::uint64_t token = canonical
+                                    ? std::stoull(key)
+                                    : std::numeric_limits<std::uint64_t>::max();
+    if (!canonical || token >= server.vocab) {
+      return invalid("'logit_bias' keys must be token IDs below " +
+                     std::to_string(server.vocab));
+    }
+    if (!entry.is_number() || !std::isfinite(entry.as_double()) ||
+        std::abs(entry.as_double()) > kMaxLogitBiasMagnitude) {
+      return invalid(
+          "'logit_bias' values must be finite numbers between -100 "
+          "and 100");
+    }
+    bias.entries.emplace_back(static_cast<sampling::TokenId>(token),
+                              static_cast<float>(entry.as_double()));
+  }
+  std::ranges::sort(bias.entries, {},
+                    &std::pair<sampling::TokenId, float>::first);
+  if (std::ranges::adjacent_find(bias.entries, {},
+                                 &std::pair<sampling::TokenId, float>::first) !=
+      bias.entries.end()) {
+    return invalid("'logit_bias' repeats a token ID");
+  }
+  output->logit_bias =
+      std::make_shared<const sampling::LogitBias>(std::move(bias));
+  return std::nullopt;
+}
+
 }  // namespace detail
 
 /// Reads all shared sampling controls, using defaults for omitted fields.
@@ -97,9 +161,11 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
 
   // These controls alter proposal/target probabilities. Reject unsupported
   // spellings instead of accepting a request with a different distribution.
+  // A server that accepts `logit_bias` (a non-null default) reads it below.
+  const bool accepts_logit_bias = defaults.logit_bias != nullptr;
   for (const auto& [field, value] : body.members()) {
-    if (field == "logit_bias" &&
-        (value.is_null() || (value.is_object() && value.empty())))
+    if (field == "logit_bias" && (accepts_logit_bias || value.is_null() ||
+                                  (value.is_object() && value.empty())))
       continue;
     const bool draft_control = field.starts_with("draft_") ||
                                field.ends_with("_draft") || field == "draft" ||
@@ -117,6 +183,12 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
     }
   }
 
+  if (accepts_logit_bias) {
+    if (auto error =
+            detail::ReadLogitBias(body, *defaults.logit_bias, output)) {
+      return error;
+    }
+  }
   if (auto error = detail::ReadSamplingFloat(body, "temperature",
                                              &output->temperature, true)) {
     return error;

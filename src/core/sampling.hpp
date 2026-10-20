@@ -30,6 +30,26 @@ struct ReasoningBudget {
   std::shared_ptr<const std::vector<bool>> partial_utf8;
 };
 
+/// An additive logit adjustment: a server-wide dense default (the soft
+/// suppression of rows nobody uses) and a short sorted list of the request's
+/// own `logit_bias` entries, which replace the default for their token. It is
+/// added to the raw logits before penalties, temperature and the filters, on
+/// the host, so cached and downloaded logits stay raw. A configuration holding
+/// one is not "unmodified": the GPU argmax paths do not see the bias.
+struct LogitBias {
+  /// Token IDs the model has; the parser rejects an ID at or above it.
+  std::uint32_t vocab{0};
+  /// Indexed by token ID, `vocab` long, or null for no default.
+  std::shared_ptr<const std::vector<float>> defaults;
+  /// Sorted by token, unique.
+  std::vector<std::pair<TokenId, float>> entries;
+
+  [[nodiscard]] bool active() const noexcept {
+    return defaults != nullptr || !entries.empty();
+  }
+  [[nodiscard]] float at(TokenId token) const noexcept;
+};
+
 /// Model-independent controls for selecting a token from a logit row.
 ///
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
@@ -48,8 +68,15 @@ struct SamplingConfig {
   std::shared_ptr<const TokenConstraint> constraint;
   /// Set only for requests that start in their reasoning phase.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
+  /// Null: the server does not accept `logit_bias` (the default). Non-null:
+  /// accepted, and the bias applies when it is active().
+  std::shared_ptr<const LogitBias> logit_bias;
 
   void Validate() const;
+
+  [[nodiscard]] bool bias_active() const noexcept {
+    return logit_bias != nullptr && logit_bias->active();
+  }
 
   [[nodiscard]] bool penalties_enabled() const noexcept;
   [[nodiscard]] bool uses_random_sampling() const noexcept;
@@ -186,6 +213,17 @@ private:
   void TrimHistory();
   void RebuildPenaltyCounts();
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
+  /// The logits with the bias added; the compact form adds by token ID.
+  [[nodiscard]] std::vector<float> Biased(std::span<const float> logits) const;
+  [[nodiscard]] std::vector<float> Biased(std::span<const float> logits,
+                                          std::span<const TokenId> ids) const;
+  /// Whether the entry points must add the bias (not while they run on logits
+  /// that already carry it).
+  [[nodiscard]] bool BiasPending() const noexcept {
+    return config_.bias_active() && !bias_added_;
+  }
+  /// Holds `bias_added_` while the unbiased code runs on biased logits.
+  class BiasScope;
   [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
   [[nodiscard]] TokenId SampleConstrainedGreedy(
       std::span<const float> logits) const;
@@ -207,6 +245,7 @@ private:
   std::vector<Probability> candidate_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
+  mutable bool bias_added_{false};
   enum class ReasoningPhase : std::uint8_t {
     kOff,
     kCounting,

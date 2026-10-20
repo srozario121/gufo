@@ -559,6 +559,11 @@ private:
   }
   /// The session's draft table as a weight of kMtpDraftExtraRows rows.
   DeviceTensor DraftTable(const Session& session) const noexcept;
+  /// Sets the suppressed rows (DeviceModel::SetSuppressedRows) of `rows` draft
+  /// logit rows, `n` columns wide and `stride` floats apart, to -infinity. A
+  /// no-op unless the model has a suppression set.
+  void MaskSuppressed(float* logits, std::uint32_t n, std::uint32_t rows = 1,
+                      std::size_t stride = 0) const noexcept;
   /// Small-head draft logits: prefix rows, then the table rows with empty
   /// slots at -infinity.
   bool DraftLogits(const Session& session, const float* x, float* logits,
