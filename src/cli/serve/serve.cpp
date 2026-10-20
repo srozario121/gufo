@@ -593,6 +593,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string draft_policy;
     std::string dspark_model_path;
     std::string mtp_model_path;
+    std::size_t mtp_draft_vocab_prefix = 0;
+    std::string mtp_draft_vocab_set;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -677,6 +679,15 @@ void PrintServeHelp(std::string_view program_name,
                      "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
                      "mtp-...-shared-*.gguf sidecar)",
                      "Speculative", &mtp_model_path);
+    parser.AddOption("", "--mtp-draft-vocab-prefix", "N",
+                     "Output rows the Qwen MTP draft head scores in place "
+                     "(default: 98304; fewer rows read less per draft token; "
+                     "the target still verifies over every row)",
+                     "Speculative", &mtp_draft_vocab_prefix);
+    parser.AddOption("", "--mtp-draft-vocab-set", "PATH",
+                     "Token-ID list (one decimal ID per line) the Qwen MTP "
+                     "draft also scores above its prefix",
+                     "Speculative", &mtp_draft_vocab_set);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1145,6 +1156,8 @@ int RunServe(std::span<const char* const> args) {
     std::string draft_policy;
     std::string dspark_model_path;
     std::string mtp_model_path;
+    std::size_t mtp_draft_vocab_prefix = 0;
+    std::string mtp_draft_vocab_set;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1224,6 +1237,17 @@ int RunServe(std::span<const char* const> args) {
         "Path to the Qwen MTP draft GGUF (Qwen3.8-Flash-Next: the "
         "mtp-...-shared-*.gguf sidecar)",
         "Speculative", &mtp_model_path);
+    llm_parser.AddOption(
+        "", "--mtp-draft-vocab-prefix", "N",
+        "Output rows the Qwen MTP draft head scores in place (default: "
+        "98304; fewer rows read less per draft token; the target still "
+        "verifies over every row)",
+        "Speculative", &mtp_draft_vocab_prefix);
+    llm_parser.AddOption(
+        "", "--mtp-draft-vocab-set", "PATH",
+        "Token-ID list (one decimal ID per line) the Qwen MTP draft also "
+        "scores above its prefix",
+        "Speculative", &mtp_draft_vocab_set);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1411,6 +1435,16 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
+    if (mtp_draft_vocab_prefix > std::numeric_limits<std::uint32_t>::max() ||
+        ((mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()) &&
+         speculative_config.backend != server::TextSpeculativeBackend::kMtp)) {
+      std::cerr << "Error: --mtp-draft-vocab-prefix and --mtp-draft-vocab-set "
+                   "need --speculative mtp and a 32-bit prefix\n";
+      return 2;
+    }
+    speculative_config.mtp_draft_vocab_prefix =
+        static_cast<std::uint32_t>(mtp_draft_vocab_prefix);
+    speculative_config.mtp_draft_vocab_set = mtp_draft_vocab_set;
     if (model.empty()) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;

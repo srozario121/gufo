@@ -51,6 +51,13 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Output rows the MTP draft head scores in place (draft_vocab.hpp). Zero
+  /// keeps kMtpDraftVocab. A lower prefix reads fewer rows per draft token;
+  /// the target still verifies over the whole vocabulary.
+  std::uint32_t draft_vocab_prefix = 0;
+  /// Optional token-ID list (one decimal ID per line) added to every
+  /// session's draft table above the prefix. Empty adds none.
+  std::string draft_vocab_set_path;
 };
 
 class Session;
@@ -118,9 +125,12 @@ private:
   MtpBatchController batch_policy_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
-  /// Special tokens at the start of every session's draft table.
+  /// Static rows at the start of every session's draft table: the special
+  /// tokens, then the draft set's IDs above the prefix.
   std::uint32_t draft_specials_{0};
-  /// Prefix and special tokens: always in the small head.
+  /// The small head's prefix and static rows (draft_vocab.hpp).
+  MtpDraftPlan draft_plan_;
+  /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
   friend class Session;

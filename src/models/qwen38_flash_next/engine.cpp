@@ -5,8 +5,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
@@ -143,20 +146,58 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
-  if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
+  const std::uint32_t draft_prefix = options.draft_vocab_prefix != 0
+                                         ? options.draft_vocab_prefix
+                                         : kMtpDraftVocab;
+  if (m->mtp_weights_ && options.draft_vocab_prefix != 0 &&
+      (draft_prefix >= m->device_->output().rows)) {
+    AssignError(error_msg, "draft vocabulary prefix must leave rows out");
+    return nullptr;
+  }
+  std::vector<std::int32_t> draft_set;
+  if (m->mtp_weights_ && !options.draft_vocab_set_path.empty()) {
+    std::ifstream in(options.draft_vocab_set_path, std::ios::binary);
+    std::ostringstream text;
+    text << in.rdbuf();
+    if (!in.is_open() || in.bad()) {
+      AssignError(error_msg, "cannot read the draft vocabulary set file");
+      return nullptr;
+    }
+    std::string parse_error;
+    auto ids =
+        ParseTokenIdList(text.str(), m->device_->output().rows, &parse_error);
+    if (!ids) {
+      AssignError(error_msg, "draft vocabulary set: " + parse_error);
+      return nullptr;
+    }
+    draft_set = std::move(*ids);
+  }
+  if (m->mtp_weights_ && m->device_->output().rows > draft_prefix) {
     std::vector<std::int32_t> specials;
-    for (std::uint32_t id = kMtpDraftVocab; id < m->device_->output().rows;
-         ++id)
+    for (std::uint32_t id = draft_prefix; id < m->device_->output().rows; ++id)
       if (m->tokenizer_->IsSpecialToken(id))
         specials.push_back(static_cast<std::int32_t>(id));
     // A vocabulary with more special tokens than table rows drafts over the
     // full head.
     if (specials.size() < kMtpDraftExtraRows) {
-      m->draft_specials_ = static_cast<std::uint32_t>(specials.size());
-      if (!m->device_->SetDraftVocab(kMtpDraftVocab, std::move(specials),
+      m->draft_plan_ =
+          PlanMtpDraftVocab(draft_prefix, m->device_->output().rows,
+                            std::move(specials), draft_set);
+      m->draft_specials_ =
+          static_cast<std::uint32_t>(m->draft_plan_.rows.size());
+      if (!m->device_->SetDraftVocab(draft_prefix, m->draft_plan_.rows,
                                      error_msg))
         return nullptr;
       m->draft_subset_ = true;
+      if (draft_prefix != kMtpDraftVocab || !draft_set.empty()) {
+        // One line at load, so a run records what the draft head scores.
+        std::cerr << "[draft-vocab] prefix=" << draft_prefix
+                  << " static_rows=" << m->draft_plan_.rows.size()
+                  << " set_ids=" << m->draft_plan_.set_ids
+                  << " set_below_prefix=" << m->draft_plan_.set_prefix
+                  << " set_rows=" << m->draft_plan_.set_rows
+                  << " set_dropped=" << m->draft_plan_.set_dropped << '\n';
+      }
     }
   }
   rocm::Executor::Options exec;
@@ -233,9 +274,10 @@ bool Model::HasMtp() const noexcept {
 }
 
 bool Model::InDraftSubset(std::int32_t token) const {
-  return token >= 0 && (static_cast<std::uint32_t>(token) < kMtpDraftVocab ||
-                        tokenizer_->IsSpecialToken(
-                            static_cast<tokenization::TokenId>(token)));
+  return token >= 0 &&
+         (static_cast<std::uint32_t>(token) < draft_plan_.prefix ||
+          (static_cast<std::size_t>(token) < draft_plan_.member.size() &&
+           draft_plan_.member[static_cast<std::size_t>(token)]));
 }
 
 std::string Model::ModelName() const {

@@ -44,6 +44,10 @@ struct TextSpeculativeConfig {
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
+  /// Qwen MTP draft head rows (draft_vocab.hpp); 0 keeps the built-in prefix.
+  std::uint32_t mtp_draft_vocab_prefix{0};
+  /// Token-ID list added to every session's draft table; empty adds none.
+  std::string mtp_draft_vocab_set;
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };
