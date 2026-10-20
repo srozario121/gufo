@@ -1,10 +1,14 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_DRAFT_VOCAB_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_DRAFT_VOCAB_HPP_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace gufo::models::qwen38_flash_next {
@@ -28,8 +32,109 @@ inline constexpr std::uint32_t kMtpDraftVocab = 98304;
 /// tokens above kMtpDraftVocab in first-use order.
 inline constexpr std::uint32_t kMtpDraftExtraRows = 1024;
 
+/// Table rows always left to the request's own tokens, whatever a draft set
+/// asks for.
+inline constexpr std::uint32_t kMtpDraftRequestReserve = 256;
+
 /// Committed tokens the head choice looks back over.
 inline constexpr std::size_t kMtpDraftVocabWindow = 32;
+
+/// Reads a token-ID list: one decimal ID per line. Blank lines and lines that
+/// start with '#' are ignored; surrounding spaces, tabs and a trailing CR are
+/// trimmed. Every other line must be digits only, below `vocab`. The order of
+/// the file is kept (it is the priority order of a draft set) and a repeated
+/// ID keeps its first place.
+[[nodiscard]] inline std::optional<std::vector<std::int32_t>> ParseTokenIdList(
+    std::string_view text, std::uint32_t vocab, std::string* error) {
+  std::vector<std::int32_t> ids;
+  std::vector<bool> seen(vocab, false);
+  std::size_t line_number = 0;
+  while (!text.empty()) {
+    const auto end = text.find('\n');
+    std::string_view line = text.substr(0, end);
+    text = end == std::string_view::npos ? std::string_view{}
+                                         : text.substr(end + 1);
+    ++line_number;
+    while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+      line.remove_prefix(1);
+    while (!line.empty() &&
+           (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
+      line.remove_suffix(1);
+    if (line.empty() || line.front() == '#')
+      continue;
+    std::uint64_t id = 0;
+    bool valid = line.size() <= 9;
+    for (const char c : line) {
+      valid = valid && c >= '0' && c <= '9';
+      if (valid)
+        id = id * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    if (!valid || id >= vocab) {
+      if (error != nullptr)
+        *error = "token ID list line " + std::to_string(line_number) +
+                 " is not a decimal ID below " + std::to_string(vocab);
+      return std::nullopt;
+    }
+    if (!seen[id]) {
+      seen[id] = true;
+      ids.push_back(static_cast<std::int32_t>(id));
+    }
+  }
+  return ids;
+}
+
+/// The part of a draft vocabulary every session shares: the prefix, the
+/// special tokens above it and the ids of a draft set that lie above the
+/// prefix. A set ID below the prefix is scored anyway, so it costs nothing.
+/// `rows` is the static part of each session's table in table order, specials
+/// first; the request's own tokens follow it.
+struct MtpDraftPlan {
+  std::uint32_t prefix{0};
+  std::vector<std::int32_t> rows;
+  /// Indexed by token ID: true for the IDs in `rows`.
+  std::vector<bool> member;
+  std::size_t set_ids{0};      ///< IDs in the set
+  std::size_t set_prefix{0};   ///< of those, below the prefix
+  std::size_t set_rows{0};     ///< of those, put in the static rows
+  std::size_t set_dropped{0};  ///< of those, left out for want of rows
+};
+
+/// Builds the plan. `specials` are IDs at or above `prefix`. Set IDs above the
+/// prefix are taken in the set's order until kMtpDraftRequestReserve rows
+/// would no longer be left to the request. Never fails: what does not fit is
+/// counted in `set_dropped`.
+[[nodiscard]] inline MtpDraftPlan PlanMtpDraftVocab(
+    std::uint32_t prefix, std::uint32_t vocab,
+    std::vector<std::int32_t> specials,
+    std::span<const std::int32_t> set = {}) {
+  MtpDraftPlan plan;
+  plan.prefix = prefix;
+  plan.rows = std::move(specials);
+  plan.member.assign(vocab, false);
+  for (const auto id : plan.rows)
+    plan.member[static_cast<std::size_t>(id)] = true;
+  const std::size_t room =
+      kMtpDraftExtraRows > kMtpDraftRequestReserve + plan.rows.size()
+          ? kMtpDraftExtraRows - kMtpDraftRequestReserve - plan.rows.size()
+          : 0;
+  plan.set_ids = set.size();
+  for (const auto id : set) {
+    if (id < 0 || static_cast<std::uint32_t>(id) >= vocab)
+      continue;
+    if (static_cast<std::uint32_t>(id) < prefix) {
+      ++plan.set_prefix;
+    } else if (plan.member[static_cast<std::size_t>(id)]) {
+      continue;  // a special token: already a static row
+    } else if (plan.set_rows < room) {
+      plan.member[static_cast<std::size_t>(id)] = true;
+      plan.rows.push_back(id);
+      ++plan.set_rows;
+    } else {
+      ++plan.set_dropped;
+    }
+  }
+  return plan;
+}
 
 /// Whether a request's cycle may draft through the small head; the table then
 /// decides per cycle (MtpDraftVocab::Fits). Sampled requests may at any

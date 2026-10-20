@@ -3156,6 +3156,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
+            .draft_vocab_prefix = speculative_config.mtp_draft_vocab_prefix,
+            .draft_vocab_set_path = speculative_config.mtp_draft_vocab_set,
         },
         &load_error);
     if (model == nullptr) {

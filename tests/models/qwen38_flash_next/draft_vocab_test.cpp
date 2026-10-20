@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -103,6 +104,87 @@ void CheckEligibility() {
   }
 }
 
+// The draft-set tests use small SYNTHETIC lists. They are test data only; the
+// real sets are files given on the command line, never compiled in.
+
+// One decimal ID per line; blanks, comments, CRLF and padding are tolerated,
+// first place wins for a repeat, and anything else is refused with its line.
+void CheckTokenIdList() {
+  std::string error;
+  auto ids =
+      qfn::ParseTokenIdList("5\n# note\n\n  7 \r\n5\n0\n99", 100, &error);
+  Require(ids && *ids == std::vector<std::int32_t>{5, 7, 0, 99},
+          "token list order or duplicates");
+  Require(qfn::ParseTokenIdList("", 100, &error)->empty(), "empty list");
+  for (const char* bad :
+       {"5\nx\n", "5\n100\n", "-1\n", "1 2\n", "5\n+3\n", "1234567890\n"}) {
+    error.clear();
+    Require(!qfn::ParseTokenIdList(bad, 100, &error) && !error.empty(),
+            "a bad line was accepted");
+  }
+  error.clear();
+  Require(!qfn::ParseTokenIdList("1\n2\nzz", 100, &error) &&
+              error.find("line 3") != std::string::npos,
+          "the error names the line");
+}
+
+// With no set the plan is exactly the specials: today's draft head.
+void CheckPlanWithoutSet() {
+  const auto plan = qfn::PlanMtpDraftVocab(1000, 1200, {1190, 1191});
+  Require(plan.rows == std::vector<std::int32_t>{1190, 1191} &&
+              plan.set_ids == 0 && plan.set_rows == 0,
+          "plan without a set changed the table");
+  Require(plan.member[1190] && !plan.member[1189] && !plan.member[5],
+          "membership without a set");
+}
+
+// Set IDs below the prefix cost nothing; IDs above it become static rows in
+// the set's order after the specials; specials and repeats are not doubled.
+void CheckPlanWithSet() {
+  const std::vector<std::int32_t> set{10, 1100, 1190, 1050, 999, 1100, 1199};
+  const auto plan = qfn::PlanMtpDraftVocab(1000, 1200, {1190, 1191}, set);
+  Require(plan.rows == std::vector<std::int32_t>{1190, 1191, 1100, 1050, 1199},
+          "static rows or their order");
+  Require(plan.set_ids == set.size() && plan.set_prefix == 2 &&
+              plan.set_rows == 3 && plan.set_dropped == 0,
+          "plan counts");
+  Require(plan.member[1100] && plan.member[1050] && !plan.member[1060],
+          "membership with a set");
+}
+
+// A set larger than the table leaves the request its reserve, in set order.
+void CheckPlanCapacity() {
+  std::vector<std::int32_t> set;
+  for (std::int32_t id = 2000; id < 4000; ++id)
+    set.push_back(id);
+  const auto plan = qfn::PlanMtpDraftVocab(1000, 5000, {4990, 4991, 4992}, set);
+  const std::size_t room =
+      qfn::kMtpDraftExtraRows - qfn::kMtpDraftRequestReserve - 3;
+  Require(plan.rows.size() == 3 + room && plan.set_rows == room &&
+              plan.set_dropped == set.size() - room,
+          "static rows exceed the table less the reserve");
+  Require(plan.rows[3] == 2000 && plan.rows.back() == 2000 + room - 1 &&
+              !plan.member[2000 + room],
+          "the set's first IDs are the ones kept");
+  Require(qfn::kMtpDraftExtraRows - plan.rows.size() >=
+              qfn::kMtpDraftRequestReserve,
+          "no room left for the request");
+  // A request's table share starts where the static rows end.
+  qfn::MtpDraftVocab vocab(qfn::kMtpDraftExtraRows - plan.rows.size());
+  std::vector<std::int32_t> tokens(300);
+  for (std::size_t i = 0; i < tokens.size(); ++i)
+    tokens[i] = 3000 + static_cast<std::int32_t>(i);
+  std::vector<std::int32_t> added;
+  vocab.CatchUp(
+      tokens,
+      [&](std::int32_t id) {
+        return id < 1000 || (id < 5000 && plan.member[id]);
+      },
+      &added);
+  Require(added.size() == qfn::kMtpDraftRequestReserve,
+          "the request's share is the reserve");
+}
+
 int main() {
   try {
     CheckCommonText();
@@ -110,6 +192,10 @@ int main() {
     CheckCapacity();
     CheckReset();
     CheckEligibility();
+    CheckTokenIdList();
+    CheckPlanWithoutSet();
+    CheckPlanWithSet();
+    CheckPlanCapacity();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;
