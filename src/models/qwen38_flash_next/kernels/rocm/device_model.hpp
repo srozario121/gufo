@@ -115,6 +115,7 @@ public:
   struct HeadTrim {
     DeviceTensor head;                     ///< rows = padded compact rows
     const std::int32_t* inverse{nullptr};  ///< device, vocab entries
+    const std::int32_t* ids{nullptr};      ///< device, compact row -> token ID
     std::uint32_t scored{0};               ///< compact rows that are real
     float threshold{0.0F};                 ///< fallback below this top prob
   };

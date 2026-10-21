@@ -7913,15 +7913,26 @@ void HeadConfidence(const float* compact, std::uint32_t rows,
 // values to int8 with a half scale (quantize_q8_1), an integer dot per block
 // against the Q8_0 weights, and d_w * d_x * sumi added in float. Only the
 // order of the per-block sums differs from the vector kernel.
+//
+// The integer dot is exact, so how it is computed (here four int8 products per
+// instruction) cannot change a result; the float side keeps one fixed order:
+// lane l adds blocks l, l + 16, l + 32, ... in turn, then the sixteen lanes
+// are folded by the same shuffle tree. Every flagged row's logits are
+// therefore the same bits as the kernel this replaced (head_trim_ops_test
+// holds that one as the reference).
 constexpr unsigned kFallbackMaxRows = 64;
 
+// Row r of the quantized activations: `blocks` * 32 int8 values, then (after
+// all `rows` rows' values) one float per block holding the half-rounded scale.
 __global__ void QuantizeFallbackRowsKernel(const float* x,
                                            const std::int32_t* flags,
                                            std::uint32_t cols,
+                                           std::uint32_t rows,
                                            std::uint8_t* xq) {
   const std::uint32_t r = blockIdx.y;
   if (flags[r] == 0)
     return;
+  const std::uint32_t blocks = cols / 32;
   const std::uint32_t j = blockIdx.x;
   const unsigned i = threadIdx.x;
   const float xi = x[static_cast<std::size_t>(r) * cols + j * 32 + i];
@@ -7931,16 +7942,22 @@ __global__ void QuantizeFallbackRowsKernel(const float* x,
   const float d = amax / 127.0F;
   const std::int8_t q = amax == 0.0F ? static_cast<std::int8_t>(0)
                                      : static_cast<std::int8_t>(roundf(xi / d));
-  std::uint8_t* block =
-      xq + (static_cast<std::size_t>(r) * (cols / 32) + j) * 34;
-  reinterpret_cast<std::int8_t*>(block + 2)[i] = q;
-  if (i == 0)
-    *reinterpret_cast<__half*>(block) = __float2half(d);
+  reinterpret_cast<std::int8_t*>(
+      xq)[(static_cast<std::size_t>(r) * blocks + j) * 32 + i] = q;
+  if (i == 0) {
+    auto* scales =
+        reinterpret_cast<float*>(xq + std::size_t{rows} * blocks * 32);
+    scales[static_cast<std::size_t>(r) * blocks + j] =
+        __half2float(__float2half(d));
+  }
 }
 
 // Sixteen weight rows per block, sixteen lanes per row. A block does nothing
 // when no row is flagged, so the launch is the whole cost of a confident step.
+// The flagged rows go through in groups of kFallbackGroup so a block reads
+// each weight block once per group instead of once per flagged row.
 constexpr unsigned kFallbackRowsPerBlock = 16;
+constexpr unsigned kFallbackGroup = 4;
 
 __global__ void FullHeadFallbackKernel(
     const std::uint8_t* w, std::size_t row_bytes, std::uint32_t cols,
@@ -7967,32 +7984,51 @@ __global__ void FullHeadFallbackKernel(
   const std::uint8_t* row =
       w + static_cast<std::size_t>(valid ? v : 0) * row_bytes;
   const std::uint32_t blocks = cols / 32;
-  for (std::int32_t a = 0; a < active_count; ++a) {
-    const std::uint8_t* xrow =
-        xq + static_cast<std::size_t>(active[a]) * blocks * 34;
-    float acc = 0.0F;
+  const auto* scales =
+      reinterpret_cast<const float*>(xq + std::size_t{rows} * blocks * 32);
+  for (std::int32_t g = 0; g < active_count; g += kFallbackGroup) {
+    const std::int32_t group =
+        min<std::int32_t>(kFallbackGroup, active_count - g);
+    float acc[kFallbackGroup] = {0.0F, 0.0F, 0.0F, 0.0F};
     for (std::uint32_t j = lane; j < blocks; j += 16) {
       const std::uint8_t* block = row + static_cast<std::size_t>(j) * 34;
-      const std::uint8_t* xblock = xrow + static_cast<std::size_t>(j) * 34;
+      // 34-byte blocks: the weights are only 2-byte aligned.
       const auto* q = reinterpret_cast<const std::uint16_t*>(block + 2);
-      const auto* u = reinterpret_cast<const std::uint16_t*>(xblock + 2);
-      int sumi = 0;
-      for (int i = 0; i < 16; ++i) {
-        const std::uint16_t wp = q[i];
-        const std::uint16_t xp = u[i];
-        sumi += static_cast<int>(static_cast<std::int8_t>(wp & 0xFFU)) *
-                static_cast<int>(static_cast<std::int8_t>(xp & 0xFFU));
-        sumi += static_cast<int>(static_cast<std::int8_t>(wp >> 8)) *
-                static_cast<int>(static_cast<std::int8_t>(xp >> 8));
-      }
+      int wq[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        wq[i] =
+            static_cast<int>(static_cast<std::uint32_t>(q[2 * i]) |
+                             (static_cast<std::uint32_t>(q[2 * i + 1]) << 16));
       const float dw = __half2float(*reinterpret_cast<const __half*>(block));
-      const float dx = __half2float(*reinterpret_cast<const __half*>(xblock));
-      acc += dw * dx * static_cast<float>(sumi);
+#pragma unroll
+      for (unsigned k = 0; k < kFallbackGroup; ++k) {
+        if (static_cast<std::int32_t>(k) >= group)
+          break;
+        const std::size_t at =
+            static_cast<std::size_t>(active[g + k]) * blocks + j;
+        const auto* xs = reinterpret_cast<const int4*>(xq + at * 32);
+        const int4 lo = xs[0];
+        const int4 hi = xs[1];
+        const int xv[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          sumi = __builtin_amdgcn_sudot4(true, wq[i], true, xv[i], sumi, false);
+        const float dx = scales[at];
+        acc[k] += dw * dx * static_cast<float>(sumi);
+      }
     }
-    for (int offset = 8; offset > 0; offset >>= 1)
-      acc += __shfl_down(acc, offset, 16);
-    if (lane == 0 && valid)
-      out[static_cast<std::size_t>(active[a]) * vocab + v] = acc;
+#pragma unroll
+    for (unsigned k = 0; k < kFallbackGroup; ++k) {
+      if (static_cast<std::int32_t>(k) >= group)
+        break;
+      float sum = acc[k];
+      for (int offset = 8; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset, 16);
+      if (lane == 0 && valid)
+        out[static_cast<std::size_t>(active[g + k]) * vocab + v] = sum;
+    }
   }
 }
 
@@ -8003,13 +8039,33 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
                       hipStream_t stream) {
   auto* xq = static_cast<std::uint8_t*>(scratch);
   hipLaunchKernelGGL(QuantizeFallbackRowsKernel, dim3(cols / 32, rows),
-                     dim3(32), 0, stream, x, flags, cols, xq);
+                     dim3(32), 0, stream, x, flags, cols, rows, xq);
   hipLaunchKernelGGL(
       FullHeadFallbackKernel,
       dim3((vocab + kFallbackRowsPerBlock - 1) / kFallbackRowsPerBlock),
       dim3(kFallbackRowsPerBlock * 16), 0, stream,
       static_cast<const std::uint8_t*>(w), row_bytes, cols, vocab, xq, flags,
       rows, out, counters);
+}
+
+// ---- Draft head on the compact rows ----
+
+__global__ void MaskSuppressedCompactKernel(float* logits,
+                                            const std::uint8_t* flags,
+                                            const std::int32_t* ids,
+                                            std::uint32_t n,
+                                            std::size_t stride) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && flags[ids[i]] != 0)
+    logits[blockIdx.y * stride + i] = -INFINITY;
+}
+
+void MaskSuppressedCompact(float* logits, const std::uint8_t* flags,
+                           const std::int32_t* ids, std::uint32_t n,
+                           std::uint32_t rows, std::size_t stride,
+                           hipStream_t stream) {
+  hipLaunchKernelGGL(MaskSuppressedCompactKernel, dim3(Blocks(n), rows),
+                     dim3(kThreads), 0, stream, logits, flags, ids, n, stride);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
