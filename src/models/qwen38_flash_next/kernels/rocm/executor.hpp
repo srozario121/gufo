@@ -613,7 +613,10 @@ private:
   /// The full-head pass for the rows flagged in head_flags_ (quantize the
   /// activations, read the head, correct the rows of `out`). Shared by
   /// HeadProject and ResolveDeferredHeadRows.
-  void HeadFallbackPass(const float* x, float* out, std::uint32_t rows) const;
+  /// Returns the flags of the rows that got the full matrix (the second
+  /// tier's escalations, or the flagged rows without a second tier).
+  const std::int32_t* HeadFallbackPass(const float* x, float* out,
+                                       std::uint32_t rows) const;
   /// Small-head draft logits: prefix rows, then the table rows with empty
   /// slots at -infinity.
   bool DraftLogits(const Session& session, const float* x, float* logits,
@@ -834,6 +837,9 @@ private:
   /// row, and the counters (rows, fallback rows, full-head passes).
   float* head_compact_{nullptr};
   std::int32_t* head_flags_{nullptr};
+  /// Second tier (--vocab-trim-tier2): the rows that escalated to the full
+  /// matrix; null without the tier.
+  std::int32_t* head_flags2_{nullptr};
   unsigned long long* head_counters_{nullptr};
   /// Timing counters (HeadTimingStats::kCounterCount) then five timestamps;
   /// null unless the head's timing is on. `head_ns_per_tick_` is the clock's.

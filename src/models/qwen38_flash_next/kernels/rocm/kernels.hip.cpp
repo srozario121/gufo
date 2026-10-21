@@ -8298,8 +8298,9 @@ constexpr unsigned kFallbackGroup = 4;
 
 __global__ void FullHeadFallbackKernel(
     const std::uint8_t* w, std::size_t row_bytes, std::uint32_t cols,
-    std::uint32_t vocab, const std::uint8_t* xq, const std::int32_t* flags,
-    std::uint32_t rows, float* out, unsigned long long* counters) {
+    std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
+    const std::uint8_t* xq, const std::int32_t* flags, std::uint32_t rows,
+    float* out, unsigned long long* counters) {
   __shared__ std::int32_t active[kFallbackMaxRows];
   __shared__ std::int32_t active_count;
   if (threadIdx.x == 0) {
@@ -8308,7 +8309,7 @@ __global__ void FullHeadFallbackKernel(
       if (flags[r] != 0)
         active[count++] = static_cast<std::int32_t>(r);
     active_count = count;
-    if (count != 0 && blockIdx.x == 0)
+    if (count != 0 && blockIdx.x == 0 && counters != nullptr)
       atomicAdd(&counters[2], 1ULL);
   }
   __syncthreads();
@@ -8316,8 +8317,8 @@ __global__ void FullHeadFallbackKernel(
     return;
   const unsigned lane = threadIdx.x & 15U;
   const std::uint32_t v =
-      blockIdx.x * kFallbackRowsPerBlock + (threadIdx.x >> 4);
-  const bool valid = v < vocab;
+      begin + blockIdx.x * kFallbackRowsPerBlock + (threadIdx.x >> 4);
+  const bool valid = v < end;
   const std::uint8_t* row =
       w + static_cast<std::size_t>(valid ? v : 0) * row_bytes;
   const std::uint32_t blocks = cols / 32;
@@ -8369,20 +8370,104 @@ __global__ void FullHeadFallbackKernel(
   }
 }
 
+void FullHeadQuantize(const float* x, const std::int32_t* flags,
+                      std::uint32_t cols, std::uint32_t rows, void* scratch,
+                      hipStream_t stream) {
+  hipLaunchKernelGGL(QuantizeFallbackRowsKernel, dim3(cols / 32, rows),
+                     dim3(32), 0, stream, x, flags, cols, rows,
+                     static_cast<std::uint8_t*>(scratch));
+}
+
+void FullHeadRead(const void* w, std::size_t row_bytes, std::uint32_t cols,
+                  std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
+                  const std::int32_t* flags, std::uint32_t rows, float* out,
+                  unsigned long long* counters, const void* scratch,
+                  hipStream_t stream) {
+  if (end <= begin)
+    return;
+  hipLaunchKernelGGL(
+      FullHeadFallbackKernel,
+      dim3((end - begin + kFallbackRowsPerBlock - 1) / kFallbackRowsPerBlock),
+      dim3(kFallbackRowsPerBlock * 16), 0, stream,
+      static_cast<const std::uint8_t*>(w), row_bytes, cols, vocab, begin, end,
+      static_cast<const std::uint8_t*>(scratch), flags, rows, out, counters);
+}
+
 void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
                       std::uint32_t vocab, const float* x,
                       const std::int32_t* flags, std::uint32_t rows, float* out,
                       unsigned long long* counters, void* scratch,
                       hipStream_t stream) {
-  auto* xq = static_cast<std::uint8_t*>(scratch);
-  hipLaunchKernelGGL(QuantizeFallbackRowsKernel, dim3(cols / 32, rows),
-                     dim3(32), 0, stream, x, flags, cols, rows, xq);
-  hipLaunchKernelGGL(
-      FullHeadFallbackKernel,
-      dim3((vocab + kFallbackRowsPerBlock - 1) / kFallbackRowsPerBlock),
-      dim3(kFallbackRowsPerBlock * 16), 0, stream,
-      static_cast<const std::uint8_t*>(w), row_bytes, cols, vocab, xq, flags,
-      rows, out, counters);
+  FullHeadQuantize(x, flags, cols, rows, scratch, stream);
+  FullHeadRead(w, row_bytes, cols, vocab, 0, vocab, flags, rows, out, counters,
+               scratch, stream);
+}
+
+// The second tier of the fallback (--vocab-trim-tier2): a flagged row that was
+// re-scored over the first `tier2_rows` token ids has, as its scored set, those
+// tokens plus the compact set's tokens at or above them (compact rows
+// `tail_begin` .. `scored`; the ids are ascending). The row's logits are
+// already in `out` (the tier-2 values below `tier2_rows`, the expanded compact
+// values elsewhere, minus infinity for the rest), so its top probability is
+// read from `out[0 .. tier2_rows)` and the compact tail. flags_out[r] = 1 when
+// it is still under `threshold` (or not a number): the row goes on to the full
+// matrix. Rows not flagged in flags_in get 0.
+__global__ void HeadTier2ConfidenceKernel(
+    const float* out, std::uint32_t vocab, const float* compact,
+    std::uint32_t stride, std::uint32_t tail_begin, std::uint32_t scored,
+    std::uint32_t tier2_rows, float threshold, const std::int32_t* flags_in,
+    std::int32_t* flags_out) {
+  const std::uint32_t r = blockIdx.x;
+  if (flags_in[r] == 0) {
+    if (threadIdx.x == 0)
+      flags_out[r] = 0;
+    return;
+  }
+  __shared__ float shared[kThreads];
+  const float* low = out + static_cast<std::size_t>(r) * vocab;
+  const float* tail = compact + static_cast<std::size_t>(r) * stride;
+  float maximum = -INFINITY;
+  for (std::uint32_t i = threadIdx.x; i < tier2_rows; i += blockDim.x)
+    maximum = fmaxf(maximum, low[i]);
+  for (std::uint32_t i = tail_begin + threadIdx.x; i < scored; i += blockDim.x)
+    maximum = fmaxf(maximum, tail[i]);
+  shared[threadIdx.x] = maximum;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + step]);
+    __syncthreads();
+  }
+  maximum = shared[0];
+  __syncthreads();
+  float sum = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < tier2_rows; i += blockDim.x)
+    sum += expf(low[i] - maximum);
+  for (std::uint32_t i = tail_begin + threadIdx.x; i < scored; i += blockDim.x)
+    sum += expf(tail[i] - maximum);
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared[threadIdx.x] += shared[threadIdx.x + step];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float probability = 1.0F / shared[0];
+    flags_out[r] = !(probability >= threshold) ? 1 : 0;
+  }
+}
+
+void HeadTier2Confidence(const float* out, std::uint32_t vocab,
+                         const float* compact, std::uint32_t stride,
+                         std::uint32_t tail_begin, std::uint32_t scored,
+                         std::uint32_t tier2_rows, float threshold,
+                         const std::int32_t* flags_in, std::int32_t* flags_out,
+                         std::uint32_t rows, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadTier2ConfidenceKernel, dim3(rows), dim3(kThreads), 0,
+                     stream, out, vocab, compact, stride, tail_begin, scored,
+                     tier2_rows, threshold, flags_in, flags_out);
 }
 
 // ---- Device timing of the trimmed head ----
@@ -8405,6 +8490,7 @@ void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
 
 __global__ void HeadTimingFinishKernel(unsigned long long* timing,
                                        const std::int32_t* flags,
+                                       const std::int32_t* tier1_flags,
                                        std::uint32_t rows, int fallback,
                                        int stage_only) {
   if (threadIdx.x != 0)
@@ -8427,19 +8513,39 @@ __global__ void HeadTimingFinishKernel(unsigned long long* timing,
   } else {
     atomicAdd(&timing[5], now - s[3]);
   }
+  // Phase d starts after the second tier (stamp 5) when there is one.
+  unsigned long long start = s[3];
+  if (tier1_flags != nullptr) {
+    std::uint32_t tier2_rows = 0;
+    std::uint32_t escalated = 0;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      tier2_rows += tier1_flags[r] != 0 ? 1U : 0U;
+      escalated += flags[r] != 0 ? 1U : 0U;
+    }
+    start = s[5];
+    atomicAdd(&timing[kHeadTimingTier2Ticks], s[5] - s[3]);
+    if (tier2_rows != 0) {
+      atomicAdd(&timing[kHeadTimingTier2Calls], 1ULL);
+      atomicAdd(&timing[kHeadTimingTier2Rows],
+                static_cast<unsigned long long>(tier2_rows));
+      atomicAdd(&timing[kHeadTimingEscalated],
+                static_cast<unsigned long long>(escalated));
+    }
+  }
   std::uint32_t flagged = 0;
   for (std::uint32_t r = 0; r < rows; ++r)
     flagged += flags[r] != 0 ? 1U : 0U;
   const std::uint32_t bucket = flagged < 3U ? flagged : 3U;
   atomicAdd(&timing[7 + bucket], 1ULL);
-  atomicAdd(&timing[11 + bucket], now - s[3]);
+  atomicAdd(&timing[11 + bucket], now - start);
 }
 
 void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
                       std::uint32_t rows, bool fallback, hipStream_t stream,
-                      bool stage_only) {
+                      bool stage_only, const std::int32_t* tier1_flags) {
   hipLaunchKernelGGL(HeadTimingFinishKernel, dim3(1), dim3(1), 0, stream,
-                     timing, flags, rows, fallback ? 1 : 0, stage_only ? 1 : 0);
+                     timing, flags, tier1_flags, rows, fallback ? 1 : 0,
+                     stage_only ? 1 : 0);
 }
 
 // ---- Measurement counters of the fallback ----

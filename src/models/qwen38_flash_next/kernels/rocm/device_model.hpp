@@ -122,6 +122,14 @@ public:
     bool counters{
         false};  ///< count what the fallback buys (--vocab-trim-counters)
     bool discard_aware{false};  ///< --vocab-trim-discard-aware
+    /// --vocab-trim-tier2: a flagged row is first re-scored over the first
+    /// `tier2_rows` token ids (0 = off), and goes on to the full matrix only
+    /// if its top probability over those and the compact set is under
+    /// `tier2_threshold`. `tier2_tail` is how many compact rows lie below
+    /// `tier2_rows`.
+    std::uint32_t tier2_rows{0};
+    float tier2_threshold{0.0F};
+    std::uint32_t tier2_tail{0};
   };
   /// Gathers output() rows `ids` (ascending token IDs, `padded_rows` >= their
   /// count) into a compact device copy and keeps `inverse` (one entry per
@@ -142,6 +150,13 @@ public:
   void SetHeadTrimDiscardAware(bool on) noexcept {
     head_trim_.discard_aware = on && head_trim_.threshold > 0.0F;
   }
+  /// Turns the second tier of the fallback on (default off): `rows` leading
+  /// token ids, the tier's threshold (negative: the fallback's own), the
+  /// compact set's ids. Needs SetHeadTrim and a threshold above 0; `rows` must
+  /// be below the vocabulary.
+  [[nodiscard]] bool SetHeadTrimTier2(std::uint32_t rows, float threshold,
+                                      std::span<const std::int32_t> ids,
+                                      std::string* error_msg);
   [[nodiscard]] const HeadTrim* head_trim() const noexcept {
     return head_trim_.head.empty() ? nullptr : &head_trim_;
   }
