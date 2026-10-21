@@ -633,6 +633,38 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
 
+/// Trimmed output head (head_trim.hpp). Copies Q8_0 rows `ids[0..n)` of `src`
+/// (row_bytes apart) to the first n rows of `dst`.
+void GatherRows(const void* src, const std::int32_t* ids, void* dst,
+                std::uint32_t n, std::size_t row_bytes, hipStream_t stream);
+
+/// Compact logits (`rows` rows, `stride` floats apart) to full-vocabulary
+/// logits: out[r][id] = compact[r][inverse[id]], or -infinity where
+/// inverse[id] < 0.
+void ExpandHeadLogits(const float* compact, const std::int32_t* inverse,
+                      float* out, std::uint32_t rows, std::uint32_t vocab,
+                      std::uint32_t stride, hipStream_t stream);
+
+/// flags[r] = 1 when the best probability over the first `scored` compact
+/// logits of row r is below `threshold` (or not a number). counters[0] counts
+/// rows, counters[1] flagged rows.
+void HeadConfidence(const float* compact, std::uint32_t rows,
+                    std::uint32_t scored, std::uint32_t stride, float threshold,
+                    std::int32_t* flags, unsigned long long* counters,
+                    hipStream_t stream);
+
+/// For each row r with flags[r] != 0 (at most 64 rows), recomputes all
+/// `vocab` logits of the Q8_0 head `w` from x[r] (cols floats) into
+/// out[r][0..vocab), with the dense projection's activation quantization
+/// (int8 per 32 values, half scale). Reads the head once for all flagged rows
+/// and does nothing when none is flagged; counters[2] counts the passes that
+/// did. `scratch` holds rows * (cols / 32) * 34 bytes.
+void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
+                      std::uint32_t vocab, const float* x,
+                      const std::int32_t* flags, std::uint32_t rows, float* out,
+                      unsigned long long* counters, void* scratch,
+                      hipStream_t stream);
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_

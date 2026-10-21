@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <initializer_list>
 #include <utility>
 
@@ -350,6 +351,69 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
   draft_output_ = output_;
   draft_output_.rows = prefix_rows;
   draft_specials_ = std::move(specials);
+  return true;
+}
+
+bool DeviceModel::SetHeadTrim(std::span<const std::int32_t> ids,
+                              std::span<const std::int32_t> inverse,
+                              std::uint32_t padded_rows, float threshold,
+                              std::string* error_msg) {
+  const auto fail = [&](const std::string& message) {
+    if (error_msg != nullptr)
+      *error_msg = message;
+    return false;
+  };
+  if (output_.empty() || output_.rows == 0 ||
+      output_.type != core::GgmlType::kQ8_0 ||
+      output_bytes_ % output_.rows != 0)
+    return fail("the trimmed head needs a row-addressable Q8_0 output head");
+  if (ids.empty() || ids.size() > padded_rows || padded_rows >= output_.rows ||
+      inverse.size() != output_.rows)
+    return fail("the trimmed head must leave rows out");
+  if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+    return fail("the trimmed head's fallback threshold must be in [0, 1]");
+  const std::size_t row_bytes = output_bytes_ / output_.rows;
+  const std::size_t head_bytes = std::size_t{padded_rows} * row_bytes;
+  void* head = nullptr;
+  void* id_map = nullptr;
+  void* inverse_map = nullptr;
+  const auto release = [&] {
+    (void)hipFree(head);
+    (void)hipFree(id_map);
+    (void)hipFree(inverse_map);
+  };
+  if (hip::AllocateDevice(&head, head_bytes + kTailMargin) != hipSuccess ||
+      hipMalloc(&id_map, ids.size_bytes()) != hipSuccess ||
+      hipMalloc(&inverse_map, inverse.size_bytes()) != hipSuccess) {
+    release();
+    return fail("trimmed head: device allocation failed");
+  }
+  // Padding rows and the tail stay zero; the confidence kernel never reads
+  // them and the expansion never maps a token to them.
+  if (hipMemset(head, 0, head_bytes + kTailMargin) != hipSuccess ||
+      hipMemcpy(id_map, ids.data(), ids.size_bytes(), hipMemcpyHostToDevice) !=
+          hipSuccess ||
+      hipMemcpy(inverse_map, inverse.data(), inverse.size_bytes(),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    release();
+    return fail("trimmed head: upload failed");
+  }
+  GatherRows(output_.data, static_cast<const std::int32_t*>(id_map), head,
+             static_cast<std::uint32_t>(ids.size()), row_bytes, nullptr);
+  if (hipDeviceSynchronize() != hipSuccess || hipGetLastError() != hipSuccess) {
+    release();
+    return fail("trimmed head: row gather failed");
+  }
+  (void)hipFree(id_map);
+  allocations_.push_back(head);
+  allocations_.push_back(inverse_map);
+  bytes_ += head_bytes + kTailMargin + inverse.size_bytes();
+  head_trim_.head = output_;
+  head_trim_.head.data = head;
+  head_trim_.head.rows = padded_rows;
+  head_trim_.inverse = static_cast<const std::int32_t*>(inverse_map);
+  head_trim_.scored = static_cast<std::uint32_t>(ids.size());
+  head_trim_.threshold = threshold;
   return true;
 }
 

@@ -18,6 +18,7 @@
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/prompt_lookup.hpp"
@@ -71,6 +72,14 @@ struct ModelOptions {
   /// `suppress_value`, and implies `logit_bias`.
   std::string suppress_keep_path;
   float suppress_value = -8.0F;
+  /// Token-ID list (one decimal ID per line) the target output head scores
+  /// (high level of the vocab trim, head_trim.hpp); the special tokens are
+  /// always added. Empty keeps the full head. Excludes the draft-vocabulary
+  /// options: the draft reads the same compact rows.
+  std::string head_trim_set_path;
+  /// Top probability over the scored rows below which a position re-runs the
+  /// full head; 0 never does.
+  float head_trim_threshold = kHeadTrimDefaultThreshold;
 };
 
 class Session;
@@ -104,6 +113,8 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// The target head scores a token subset (ModelOptions::head_trim_set_path).
+  [[nodiscard]] bool HeadTrimmed() const noexcept { return head_trimmed_; }
   /// The server-wide logit bias (vocabulary size and default suppression); null
   /// when `logit_bias` is off. Its presence is what makes a server accept
   /// `logit_bias` in a request.
@@ -143,6 +154,7 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  bool head_trimmed_{false};
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Static rows at the start of every session's draft table: the special
@@ -253,10 +265,14 @@ public:
     /// Of drafted/accepted: proposals copied by prompt lookup.
     std::uint64_t lookup{0};
     std::uint64_t lookup_accepted{0};
+    /// Trimmed head (head_trim.hpp), counted for the whole model since it
+    /// loaded and read afresh by every Statistics() call: target rows scored,
+    /// rows re-run on the full head, full-head passes. Take differences.
+    std::uint64_t head_rows{0};
+    std::uint64_t head_fallbacks{0};
+    std::uint64_t head_full_reads{0};
   };
-  [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
-    return stats_;
-  }
+  [[nodiscard]] const SpeculativeStats& Statistics() const noexcept;
   /// PLE rows gathered by this execution slot since creation; zero without
   /// a PLE table.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
@@ -354,7 +370,7 @@ private:
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   PromptLookup lookup_;
-  SpeculativeStats stats_;
+  mutable SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;

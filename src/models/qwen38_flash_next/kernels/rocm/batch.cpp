@@ -563,7 +563,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       return true;
     static_assert(kMtpDraftExtraRows <= 1024, "GatherDraftLogits is one block");
     if (mixed) {
-      if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+      if (!HeadProject(base.mixed, batch_logits_, n, true, false, error))
         return false;
       MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(vocab), n,
                      vocab);
@@ -598,7 +598,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       }
     }
     if (subset_rows == 0) {
-      if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+      if (!HeadProject(base.mixed, batch_logits_, n, true, false, error))
         return false;
       MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(vocab), n,
                      vocab);
@@ -1102,7 +1102,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     UseScratch(base);
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+           HeadProject(base.mixed, batch_logits_, rows, true, true, error);
   };
   bool ok = false;
   try {

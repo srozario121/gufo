@@ -2771,6 +2771,11 @@ public:
     step.lookup_tokens = stats_after.lookup - stats_before.lookup;
     step.lookup_accepted_tokens =
         stats_after.lookup_accepted - stats_before.lookup_accepted;
+    step.head_trim_rows = stats_after.head_rows - stats_before.head_rows;
+    step.head_trim_fallbacks =
+        stats_after.head_fallbacks - stats_before.head_fallbacks;
+    step.head_trim_full_reads =
+        stats_after.head_full_reads - stats_before.head_full_reads;
     return step;
   }
 
@@ -2863,6 +2868,13 @@ public:
       step.lookup_tokens = stats.lookup - before[i].lookup;
       step.lookup_accepted_tokens =
           stats.lookup_accepted - before[i].lookup_accepted;
+      // The head counters are the model's, so a batched step's rows are
+      // shared by its requests: each one reports the whole step's.
+      step.head_trim_rows = stats.head_rows - before[i].head_rows;
+      step.head_trim_fallbacks =
+          stats.head_fallbacks - before[i].head_fallbacks;
+      step.head_trim_full_reads =
+          stats.head_full_reads - before[i].head_full_reads;
     }
     return steps;
   }
@@ -3161,6 +3173,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .logit_bias = speculative_config.logit_bias,
             .suppress_keep_path = speculative_config.suppress_nonascii_keep,
             .suppress_value = speculative_config.suppress_nonascii_value,
+            .head_trim_set_path = speculative_config.head_trim_set,
+            .head_trim_threshold = speculative_config.head_trim_threshold,
         },
         &load_error);
     if (model == nullptr) {

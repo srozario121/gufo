@@ -598,6 +598,8 @@ void PrintServeHelp(std::string_view program_name,
     bool logit_bias = false;
     std::string suppress_nonascii_keep;
     double suppress_nonascii_value = -8.0;
+    std::string vocab_trim_set;
+    double vocab_trim_fallback_threshold = 0.5;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -708,6 +710,17 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--suppress-nonascii-value", "V",
                      "Logit added to suppressed rows (default: -8)", "Sampling",
                      &suppress_nonascii_value);
+    parser.AddOption("", "--vocab-trim-set", "PATH",
+                     "Token-ID list (one decimal ID per line) the Qwen target "
+                     "output head scores instead of every row; the special "
+                     "tokens are always added. The draft reads the same rows. "
+                     "Excludes --mtp-draft-vocab-prefix and -set",
+                     "Speculative", &vocab_trim_set);
+    parser.AddOption("", "--vocab-trim-fallback-threshold", "P",
+                     "With --vocab-trim-set: re-run the full head for a "
+                     "position whose best probability over the scored rows is "
+                     "below P (default: 0.5; 0 never)",
+                     "Speculative", &vocab_trim_fallback_threshold);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1181,6 +1194,8 @@ int RunServe(std::span<const char* const> args) {
     bool logit_bias = false;
     std::string suppress_nonascii_keep;
     double suppress_nonascii_value = -8.0;
+    std::string vocab_trim_set;
+    double vocab_trim_fallback_threshold = 0.5;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1289,6 +1304,19 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--suppress-nonascii-value", "V",
                          "Logit added to suppressed rows (default: -8)",
                          "Sampling", &suppress_nonascii_value);
+    llm_parser.AddOption(
+        "", "--vocab-trim-set", "PATH",
+        "Token-ID list (one decimal ID per line) the Qwen target output head "
+        "scores instead of every row; the special tokens are always added. "
+        "The draft reads the same rows. Excludes --mtp-draft-vocab-prefix and "
+        "-set",
+        "Speculative", &vocab_trim_set);
+    llm_parser.AddOption(
+        "", "--vocab-trim-fallback-threshold", "P",
+        "With --vocab-trim-set: re-run the full head for a position whose "
+        "best probability over the scored rows is below P (default: 0.5; 0 "
+        "never)",
+        "Speculative", &vocab_trim_fallback_threshold);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1494,6 +1522,21 @@ int RunServe(std::span<const char* const> args) {
                    "suppression value must be finite\n";
       return 2;
     }
+    if (!std::isfinite(vocab_trim_fallback_threshold) ||
+        vocab_trim_fallback_threshold < 0.0 ||
+        vocab_trim_fallback_threshold > 1.0 ||
+        (!vocab_trim_set.empty() &&
+         (speculative_config.backend != server::TextSpeculativeBackend::kMtp ||
+          mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()))) {
+      std::cerr << "Error: --vocab-trim-set needs --speculative mtp "
+                   "(Qwen3.8-Flash-Next) and excludes --mtp-draft-vocab-prefix "
+                   "and --mtp-draft-vocab-set; --vocab-trim-fallback-threshold "
+                   "is in [0, 1]\n";
+      return 2;
+    }
+    speculative_config.head_trim_set = vocab_trim_set;
+    speculative_config.head_trim_threshold =
+        static_cast<float>(vocab_trim_fallback_threshold);
     speculative_config.logit_bias = logit_bias;
     speculative_config.suppress_nonascii_keep = suppress_nonascii_keep;
     speculative_config.suppress_nonascii_value =

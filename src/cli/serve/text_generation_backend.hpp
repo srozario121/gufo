@@ -215,6 +215,11 @@ public:
     std::size_t ngram_dedup_rows{0};
     std::size_t ngram_cache_hits{0};
     std::size_t ngram_disk_reads{0};
+    /// Trimmed target head (head_trim.hpp), summed over the request's steps:
+    /// logit rows scored, rows re-run on the full head, full-head passes.
+    std::size_t head_trim_rows{0};
+    std::size_t head_trim_fallbacks{0};
+    std::size_t head_trim_full_reads{0};
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};

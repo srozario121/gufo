@@ -22,6 +22,7 @@ add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(rope_scaling_oracle
   gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(draft_vocab gufo_core "cpu")
+add_qwen38_flash_next_test(head_trim gufo_core "cpu")
 add_qwen38_flash_next_test(logit_bias_default gufo_core "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 
