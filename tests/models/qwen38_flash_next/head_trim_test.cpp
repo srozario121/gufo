@@ -149,25 +149,34 @@ void CheckTiming() {
   c[8] = 2;    // 1 row
   c[11] = 60;  // d ticks, 0 rows
   c[12] = 300;
-  c[15] = 4;  // discarded rows
-  c[16] = 9;  // deferred rows
+  c[15] = 4;   // discarded rows
+  c[16] = 9;   // deferred rows
+  c[17] = 3;   // tier-2 passes
+  c[18] = 5;   // tier-2 rows
+  c[19] = 70;  // tier-2 ticks
+  c[20] = 2;   // escalated rows
   // 10 ns per tick (a 100 MHz clock).
   const auto s = qfn::HeadTimingStats::FromCounters(c, 10.0);
   Require(s.calls == 10 && s.fallback_calls == 8 && s.a_ns == 1000 &&
               s.b_ns == 200 && s.c_ns == 300 && s.total_ns == 4000 &&
               s.gap_ns == 50 && s.d_calls[0] == 6 && s.d_calls[1] == 2 &&
               s.d_ns[0] == 600 && s.d_ns[1] == 3000 && s.d_ns[2] == 0 &&
-              s.discarded_rows == 4 && s.deferred_rows == 9,
+              s.discarded_rows == 4 && s.deferred_rows == 9 &&
+              s.d2_calls == 3 && s.d2_rows == 5 && s.d2_ns == 700 &&
+              s.escalated_rows == 2,
           "counters convert to nanoseconds");
   auto sum = s;
   sum += s;
   Require(sum.calls == 20 && sum.d_ns[1] == 6000 && sum.total_ns == 8000 &&
-              sum.discarded_rows == 8 && sum.deferred_rows == 18,
+              sum.discarded_rows == 8 && sum.deferred_rows == 18 &&
+              sum.d2_rows == 10 && sum.d2_ns == 1400 && sum.escalated_rows == 4,
           "readings add");
   const auto delta = sum.Since(s);
   Require(delta.calls == 10 && delta.a_ns == 1000 && delta.d_calls[0] == 6 &&
               delta.d_ns[1] == 3000 && delta.gap_ns == 50 &&
-              delta.discarded_rows == 4 && delta.deferred_rows == 9,
+              delta.discarded_rows == 4 && delta.deferred_rows == 9 &&
+              delta.d2_calls == 3 && delta.d2_ns == 700 &&
+              delta.escalated_rows == 2,
           "a later reading minus an earlier one");
   std::size_t fields = 0;
   double a_us = -1;
@@ -179,7 +188,7 @@ void CheckTiming() {
     if (std::string_view(name) == "total_us")
       total_us = value;
   });
-  Require(fields == 5 + 2 * qfn::kHeadTimingBuckets + 4 && a_us == 1.0 &&
+  Require(fields == 5 + 2 * qfn::kHeadTimingBuckets + 8 && a_us == 1.0 &&
               total_us == 4.0,
           "fields are reported in microseconds");
 }
@@ -226,6 +235,35 @@ void CheckDiscardScan() {
               &after) == 0 &&
               after == Flags{0, 1, 0, 0, 0, 1},
           "an unknown argmax and the last row discard nothing");
+}
+
+// The second tier (--vocab-trim-tier2 N): where the compact tail starts, and
+// when a flagged row still needs the full matrix.
+void CheckTier2() {
+  const std::vector<std::int32_t> ids{2, 5, 9, 40, 41, 97, 98, 200};
+  Require(qfn::HeadTrimTier2Tail(ids, 1) == 0 &&
+              qfn::HeadTrimTier2Tail(ids, 2) == 0 &&
+              qfn::HeadTrimTier2Tail(ids, 3) == 1 &&
+              qfn::HeadTrimTier2Tail(ids, 98) == 6 &&
+              qfn::HeadTrimTier2Tail(ids, 99) == 7 &&
+              qfn::HeadTrimTier2Tail(ids, 1000) == 8,
+          "the tail starts at the first compact id at or above N");
+  // Row logits: the first N tokens (tier-2 values) and the compact tail.
+  const std::array<float, 4> flat_low{1.0F, 1.0F, 1.0F, 1.0F};
+  const std::array<float, 2> flat_tail{1.0F, 1.0F};
+  Require(qfn::HeadTrimTier2Escalates(flat_low, flat_tail, 0.5F),
+          "a flat distribution escalates");
+  const std::array<float, 4> sharp_low{9.0F, 1.0F, 1.0F, 1.0F};
+  Require(!qfn::HeadTrimTier2Escalates(sharp_low, flat_tail, 0.5F),
+          "a confident tier-2 row stops there");
+  const std::array<float, 2> sharp_tail{12.0F, 1.0F};
+  Require(!qfn::HeadTrimTier2Escalates(flat_low, sharp_tail, 0.5F),
+          "a confident token in the compact tail also counts");
+  Require(qfn::HeadTrimTier2Escalates(sharp_low, sharp_tail, 0.99F),
+          "the union is renormalised: two big tokens split the mass");
+  const std::array<float, 2> bad{std::numeric_limits<float>::quiet_NaN(), 1.0F};
+  Require(qfn::HeadTrimTier2Escalates(bad, flat_tail, 0.5F),
+          "a NaN logit escalates");
 }
 
 // The fallback's measurement counters: fixed-point mass to a double,
@@ -285,6 +323,7 @@ int main() {
     CheckStats();
     CheckTiming();
     CheckDiscardScan();
+    CheckTier2();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

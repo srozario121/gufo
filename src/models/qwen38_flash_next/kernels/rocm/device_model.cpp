@@ -10,6 +10,7 @@
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -415,6 +416,32 @@ bool DeviceModel::SetHeadTrim(std::span<const std::int32_t> ids,
   head_trim_.ids = static_cast<const std::int32_t*>(id_map);
   head_trim_.scored = static_cast<std::uint32_t>(ids.size());
   head_trim_.threshold = threshold;
+  return true;
+}
+
+bool DeviceModel::SetHeadTrimTier2(std::uint32_t rows, float threshold,
+                                   std::span<const std::int32_t> ids,
+                                   std::string* error_msg) {
+  if (rows == 0)
+    return true;
+  const auto fail = [&](const char* message) {
+    if (error_msg != nullptr)
+      *error_msg = message;
+    return false;
+  };
+  if (head_trim_.head.empty() || head_trim_.threshold <= 0.0F)
+    return fail(
+        "--vocab-trim-tier2 needs the trimmed head and a fallback "
+        "threshold above 0");
+  if (rows >= output_.rows)
+    return fail("--vocab-trim-tier2 must be below the vocabulary size");
+  if (!(threshold <= 1.0F))
+    return fail("--vocab-trim-tier2-threshold is in [0, 1]");
+  head_trim_.tier2_rows = rows;
+  head_trim_.tier2_threshold =
+      threshold < 0.0F ? head_trim_.threshold : threshold;
+  head_trim_.tier2_tail =
+      static_cast<std::uint32_t>(HeadTrimTier2Tail(ids, rows));
   return true;
 }
 

@@ -667,12 +667,41 @@ void HeadChainPolicy(const HeadChains& chains,
 /// out[r][0..vocab), with the dense projection's activation quantization
 /// (int8 per 32 values, half scale). Reads the head once for all flagged rows
 /// and does nothing when none is flagged; counters[2] counts the passes that
-/// did. `scratch` holds rows * (cols / 32) * 36 bytes.
+/// did. `scratch` holds rows * (cols / 32) * 36 bytes. It is
+/// FullHeadQuantize and one FullHeadRead over all rows.
 void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
                       std::uint32_t vocab, const float* x,
                       const std::int32_t* flags, std::uint32_t rows, float* out,
                       unsigned long long* counters, void* scratch,
                       hipStream_t stream);
+/// The two halves of FullHeadFallback. Quantize the activations of the rows
+/// flagged in `flags` into `scratch`; FullHeadRead then computes the logits of
+/// the head rows [begin, end) for the rows flagged in ITS `flags`, which may
+/// be a subset of the quantized ones (a second tier). A row's logits are the
+/// same bits whichever rows share the pass or how the head is split. `counters`
+/// may be null; otherwise counters[2] counts passes that had a flagged row.
+void FullHeadQuantize(const float* x, const std::int32_t* flags,
+                      std::uint32_t cols, std::uint32_t rows, void* scratch,
+                      hipStream_t stream);
+void FullHeadRead(const void* w, std::size_t row_bytes, std::uint32_t cols,
+                  std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
+                  const std::int32_t* flags, std::uint32_t rows, float* out,
+                  unsigned long long* counters, const void* scratch,
+                  hipStream_t stream);
+
+/// Second tier of the fallback (--vocab-trim-tier2). For each row r with
+/// flags_in[r] != 0, whose logits out[r][0..tier2_rows) were just recomputed
+/// by FullHeadRead and whose other scored tokens keep their compact values:
+/// flags_out[r] = 1 when the best probability over out[r][0..tier2_rows) and
+/// the compact logits [tail_begin, scored) (the scored tokens at or above
+/// tier2_rows; compact rows are in ascending token order) is under
+/// `threshold` or not a number, else 0. Rows not flagged in flags_in get 0.
+void HeadTier2Confidence(const float* out, std::uint32_t vocab,
+                         const float* compact, std::uint32_t stride,
+                         std::uint32_t tail_begin, std::uint32_t scored,
+                         std::uint32_t tier2_rows, float threshold,
+                         const std::int32_t* flags_in, std::int32_t* flags_out,
+                         std::uint32_t rows, hipStream_t stream);
 
 /// Device timestamps for HeadProject's phases (--vocab-trim-timing). `timing`
 /// holds `kHeadTimingCounters` counters then five timestamps. The stamp
@@ -682,18 +711,29 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
 /// of the full-head pass to the counters (one atomic add each), so the sums
 /// survive graph replay. Slots: 0 start, 4 right after 0 (the gap floor),
 /// 1 after the compact projection, 2 after the expansion, 3 after the
-/// confidence check. Without `fallback` the call ends after the expansion.
-inline constexpr std::uint32_t kHeadTimingCounters = 17;
+/// confidence check, 5 after the second tier. Without `fallback` the call ends
+/// after the expansion.
+inline constexpr std::uint32_t kHeadTimingCounters = 21;
 inline constexpr std::uint32_t kHeadTimingDiscarded = 15;
 inline constexpr std::uint32_t kHeadTimingDeferred = 16;
+inline constexpr std::uint32_t kHeadTimingTier2Calls = 17;  ///< passes
+inline constexpr std::uint32_t kHeadTimingTier2Rows = 18;   ///< rows re-scored
+inline constexpr std::uint32_t kHeadTimingTier2Ticks = 19;
+inline constexpr std::uint32_t kHeadTimingEscalated = 20;  ///< rows to tier 3
+inline constexpr std::uint32_t kHeadTimingStamps = 6;
 void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
                      hipStream_t stream);
 /// `stage_only` closes a deferred full-head pass run after the call (lazy
 /// chains): slot 3 was stamped just before it, and only the full-head pass'
-/// bucket and the total are added, not the call.
+/// bucket and the total are added, not the call. With the second tier,
+/// stamp 5 follows the tier-2 pass and the confidence check over it:
+/// `tier1_flags` (the rows the tier re-scored) is then given, `flags` are the
+/// rows that went on to the full matrix, phase d starts at stamp 5 and the
+/// tier's time (stamp 3 to 5), passes, rows and escalations are added.
 void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
                       std::uint32_t rows, bool fallback, hipStream_t stream,
-                      bool stage_only = false);
+                      bool stage_only = false,
+                      const std::int32_t* tier1_flags = nullptr);
 
 /// Measurement counters for the fallback (--vocab-trim-counters;
 /// HeadCounterStats). For each row with flags[r] != 0, after the fallback has

@@ -223,6 +223,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     m->device_->SetHeadTrimTiming(options.head_trim_timing);
     m->device_->SetHeadTrimCounters(options.head_trim_counters);
     m->device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
+    if (!m->device_->SetHeadTrimTier2(options.head_trim_tier2_rows,
+                                      options.head_trim_tier2_threshold,
+                                      plan.ids, error_msg))
+      return nullptr;
     m->head_trimmed_ = true;
     std::cerr << "[head-trim] set_ids=" << plan.from_set
               << " special_added=" << plan.added_special
@@ -231,7 +235,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
               << " fallback_threshold=" << options.head_trim_threshold
               << " timing=" << (options.head_trim_timing ? 1 : 0)
               << " counters=" << (options.head_trim_counters ? 1 : 0)
-              << " discard_aware=" << (m->HeadDiscardAware() ? 1 : 0) << '\n';
+              << " discard_aware=" << (m->HeadDiscardAware() ? 1 : 0)
+              << " tier2_rows=" << options.head_trim_tier2_rows
+              << " tier2_threshold="
+              << (m->device_->head_trim()->tier2_rows != 0
+                      ? m->device_->head_trim()->tier2_threshold
+                      : 0.0F)
+              << '\n';
   }
   const std::uint32_t draft_prefix = options.draft_vocab_prefix != 0
                                          ? options.draft_vocab_prefix

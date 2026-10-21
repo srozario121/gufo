@@ -603,6 +603,8 @@ void PrintServeHelp(std::string_view program_name,
     bool vocab_trim_timing = false;
     bool vocab_trim_counters = false;
     bool vocab_trim_discard_aware = false;
+    std::size_t vocab_trim_tier2 = 0;
+    double vocab_trim_tier2_threshold = -1.0;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -738,6 +740,17 @@ void PrintServeHelp(std::string_view program_name,
                    "other chains read a flagged row only when verification "
                    "reaches it. Output unchanged (default: off)",
                    "Speculative", &vocab_trim_discard_aware);
+    parser.AddOption("", "--vocab-trim-tier2", "N",
+                     "With --vocab-trim-set: re-score a flagged position over "
+                     "the first N token ids first, and re-run the full head "
+                     "only if the best probability over those and the scored "
+                     "tokens is still under --vocab-trim-tier2-threshold "
+                     "(default: off)",
+                     "Speculative", &vocab_trim_tier2);
+    parser.AddOption("", "--vocab-trim-tier2-threshold", "P",
+                     "With --vocab-trim-tier2: the second tier's threshold "
+                     "(default: --vocab-trim-fallback-threshold)",
+                     "Speculative", &vocab_trim_tier2_threshold);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1216,6 +1229,8 @@ int RunServe(std::span<const char* const> args) {
     bool vocab_trim_timing = false;
     bool vocab_trim_counters = false;
     bool vocab_trim_discard_aware = false;
+    std::size_t vocab_trim_tier2 = 0;
+    double vocab_trim_tier2_threshold = -1.0;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1353,6 +1368,18 @@ int RunServe(std::span<const char* const> args) {
         "unflagged rejected draft token; other chains read a flagged row only "
         "when verification reaches it. Output unchanged (default: off)",
         "Speculative", &vocab_trim_discard_aware);
+    llm_parser.AddOption(
+        "", "--vocab-trim-tier2", "N",
+        "With --vocab-trim-set: re-score a flagged position over the first N "
+        "token ids first, and re-run the full head only if the best "
+        "probability over those and the scored tokens is still under "
+        "--vocab-trim-tier2-threshold (default: off)",
+        "Speculative", &vocab_trim_tier2);
+    llm_parser.AddOption(
+        "", "--vocab-trim-tier2-threshold", "P",
+        "With --vocab-trim-tier2: the second tier's threshold (default: "
+        "--vocab-trim-fallback-threshold)",
+        "Speculative", &vocab_trim_tier2_threshold);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1565,6 +1592,13 @@ int RunServe(std::span<const char* const> args) {
         (vocab_trim_counters && vocab_trim_set.empty()) ||
         (vocab_trim_discard_aware &&
          (vocab_trim_set.empty() || vocab_trim_fallback_threshold <= 0.0)) ||
+        (vocab_trim_tier2 != 0 &&
+         (vocab_trim_set.empty() || vocab_trim_fallback_threshold <= 0.0 ||
+          vocab_trim_tier2 > 0x7fffffffU)) ||
+        (vocab_trim_tier2_threshold != -1.0 &&
+         (vocab_trim_tier2 == 0 || !std::isfinite(vocab_trim_tier2_threshold) ||
+          vocab_trim_tier2_threshold < 0.0 ||
+          vocab_trim_tier2_threshold > 1.0)) ||
         (!vocab_trim_set.empty() &&
          (speculative_config.backend != server::TextSpeculativeBackend::kMtp ||
           mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()))) {
@@ -1573,8 +1607,10 @@ int RunServe(std::span<const char* const> args) {
                    "and --mtp-draft-vocab-set; --vocab-trim-fallback-threshold "
                    "is in [0, 1]; --vocab-trim-timing and "
                    "--vocab-trim-counters need --vocab-trim-set; "
-                   "--vocab-trim-discard-aware needs it and a fallback "
-                   "threshold above 0\n";
+                   "--vocab-trim-discard-aware and --vocab-trim-tier2 need it "
+                   "and a fallback threshold above 0; "
+                   "--vocab-trim-tier2-threshold needs --vocab-trim-tier2 and "
+                   "is in [0, 1]\n";
       return 2;
     }
     speculative_config.head_trim_set = vocab_trim_set;
@@ -1583,6 +1619,10 @@ int RunServe(std::span<const char* const> args) {
     speculative_config.head_trim_timing = vocab_trim_timing;
     speculative_config.head_trim_counters = vocab_trim_counters;
     speculative_config.head_trim_discard_aware = vocab_trim_discard_aware;
+    speculative_config.head_trim_tier2_rows =
+        static_cast<std::uint32_t>(vocab_trim_tier2);
+    speculative_config.head_trim_tier2_threshold =
+        static_cast<float>(vocab_trim_tier2_threshold);
     speculative_config.logit_bias = logit_bias;
     speculative_config.suppress_nonascii_keep = suppress_nonascii_keep;
     speculative_config.suppress_nonascii_value =

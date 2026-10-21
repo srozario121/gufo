@@ -1167,6 +1167,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->head_compact_ = f32(std::size_t{head_rows} * trim->head.rows);
     e->head_flags_ = Alloc<std::int32_t>(a, head_rows, error_msg);
     e->head_counters_ = Alloc<unsigned long long>(a, 3, error_msg);
+    if (trim->tier2_rows != 0 && (e->head_flags2_ = Alloc<std::int32_t>(
+                                      a, head_rows, error_msg)) == nullptr)
+      return nullptr;
     if (trim->timing) {
       int device = 0;
       int khz = 0;
@@ -1180,8 +1183,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         return nullptr;
       }
       e->head_ns_per_tick_ = 1.0e6 / static_cast<double>(khz);
-      e->head_timing_ =
-          Alloc<unsigned long long>(a, kHeadTimingCounters + 5, error_msg);
+      e->head_timing_ = Alloc<unsigned long long>(
+          a, kHeadTimingCounters + kHeadTimingStamps, error_msg);
       if (e->head_timing_ == nullptr)
         return nullptr;
     }
@@ -1496,6 +1499,8 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
   // captured graphs; none is launched unless --vocab-trim-timing is on.
   const bool timed = head_timing_ != nullptr;
   const bool with_fallback = fallback && trim->threshold > 0.0F;
+  const bool tier2 = with_fallback && trim->tier2_rows != 0;
+  const std::int32_t* final_flags = head_flags_;
   // A chain mode other than "read now" needs the argmax of each row and the
   // chain's policy kernel (--vocab-trim-discard-aware).
   bool chained = false;
@@ -1526,24 +1531,46 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
     }
     if (timed)
       HeadTimingStamp(head_timing_, 3, stream_);
-    HeadFallbackPass(x, out, rows);
+    final_flags = HeadFallbackPass(x, out, rows);
   }
   if (timed)
-    HeadTimingFinish(head_timing_, head_flags_, rows, with_fallback, stream_);
+    HeadTimingFinish(head_timing_, final_flags, rows, with_fallback, stream_,
+                     false, tier2 ? head_flags_ : nullptr);
   // After the timing finish, so the counters' own kernel is not in phase d.
   if (head_ctr_ != nullptr && with_fallback)
     HeadCountFlagged(head_compact_, trim->head.rows, trim->scored, trim->ids,
-                     out, vocab, trim->inverse, head_flags_, head_rowinfo_,
+                     out, vocab, trim->inverse, final_flags, head_rowinfo_,
                      rows, head_ctr_, stream_);
   return Check(hipGetLastError(), "trimmed head", error_msg);
 }
 
-void Executor::HeadFallbackPass(const float* x, float* out,
-                                std::uint32_t rows) const {
+const std::int32_t* Executor::HeadFallbackPass(const float* x, float* out,
+                                               std::uint32_t rows) const {
   const auto& full = model_->output();
-  FullHeadFallback(full.data, model_->output_row_bytes(), full.cols, full.rows,
-                   x, head_flags_, rows, out, head_counters_, head_quantized_,
-                   stream_);
+  const auto* trim = model_->head_trim();
+  const std::uint32_t vocab = full.rows;
+  const std::size_t row_bytes = model_->output_row_bytes();
+  FullHeadQuantize(x, head_flags_, full.cols, rows, head_quantized_, stream_);
+  if (trim->tier2_rows == 0) {
+    FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, vocab, head_flags_,
+                 rows, out, head_counters_, head_quantized_, stream_);
+    return head_flags_;
+  }
+  // Second tier: the first tier2_rows token ids, then the confidence over
+  // them and the compact set's tail decides which rows escalate; the
+  // escalation completes those rows (the tier's values stay).
+  FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, trim->tier2_rows,
+               head_flags_, rows, out, nullptr, head_quantized_, stream_);
+  HeadTier2Confidence(out, vocab, head_compact_, trim->head.rows,
+                      trim->tier2_tail, trim->scored, trim->tier2_rows,
+                      trim->tier2_threshold, head_flags_, head_flags2_, rows,
+                      stream_);
+  if (head_timing_ != nullptr)
+    HeadTimingStamp(head_timing_, 5, stream_);
+  FullHeadRead(full.data, row_bytes, full.cols, vocab, trim->tier2_rows, vocab,
+               head_flags2_, rows, out, head_counters_, head_quantized_,
+               stream_);
+  return head_flags2_;
 }
 
 bool Executor::ResolveDeferredHeadRows(std::uint32_t from, std::uint32_t rows,
@@ -1587,14 +1614,15 @@ bool Executor::ResolveDeferredHeadRows(std::uint32_t from, std::uint32_t rows,
     return false;
   if (timed)
     HeadTimingStamp(head_timing_, 3, stream_);
-  HeadFallbackPass(head_last_x_, head_last_out_, head_last_rows_);
+  const std::int32_t* final_flags =
+      HeadFallbackPass(head_last_x_, head_last_out_, head_last_rows_);
   if (timed)
-    HeadTimingFinish(head_timing_, head_flags_, head_last_rows_, true, stream_,
-                     true);
+    HeadTimingFinish(head_timing_, final_flags, head_last_rows_, true, stream_,
+                     true, trim->tier2_rows != 0 ? head_flags_ : nullptr);
   if (head_ctr_ != nullptr)
     HeadCountFlagged(head_compact_, trim->head.rows, trim->scored, trim->ids,
                      head_last_out_, config().vocab_size, trim->inverse,
-                     head_flags_, head_rowinfo_, head_last_rows_, head_ctr_,
+                     final_flags, head_rowinfo_, head_last_rows_, head_ctr_,
                      stream_);
   for (std::uint32_t i = 0; i < count; ++i) {
     if (!Check(hipMemcpyAsync(
@@ -1628,8 +1656,8 @@ void Executor::RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const {
           : 0;
   if (first + rows > kHeadTrimMaxRows)
     return;
-  HeadRecordChain(head_flags_, head_rowinfo_, first, rows, keep, head_ctr_,
-                  stream_);
+  HeadRecordChain(head_flags2_ != nullptr ? head_flags2_ : head_flags_,
+                  head_rowinfo_, first, rows, keep, head_ctr_, stream_);
 }
 
 HeadCounterStats Executor::HeadCounterStatistics() const {

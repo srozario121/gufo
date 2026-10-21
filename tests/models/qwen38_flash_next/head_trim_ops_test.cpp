@@ -342,9 +342,11 @@ void CheckTiming() {
   Expect(khz > 0, "the device reports a wall clock rate");
   constexpr std::size_t kBytes = 256U << 20;
   auto scratch = Allocate<std::uint8_t>(kBytes);
-  auto timing = Allocate<unsigned long long>(q::kHeadTimingCounters + 5);
+  auto timing = Allocate<unsigned long long>(q::kHeadTimingCounters +
+                                             q::kHeadTimingStamps);
   CheckHip(hipMemset(timing.get(), 0,
-                     (q::kHeadTimingCounters + 5) * sizeof(unsigned long long)),
+                     (q::kHeadTimingCounters + q::kHeadTimingStamps) *
+                         sizeof(unsigned long long)),
            "clear");
   auto flags = Upload(std::vector<std::int32_t>{0, 1, 0, 1, 0});
   hipStream_t stream = nullptr;
@@ -548,6 +550,194 @@ void CheckCounters() {
   CheckHip(hipStreamDestroy(stream), "destroy stream");
 }
 
+// The second tier's timing: stamp 5 splits the fallback into the tier's pass
+// and the full matrix' pass, and the finish kernel counts passes, rows and
+// escalations (also replayed from a graph).
+void CheckTimingTier2() {
+  constexpr std::size_t kBytes = 64U << 20;
+  auto scratch = Allocate<std::uint8_t>(kBytes);
+  auto timing = Allocate<unsigned long long>(q::kHeadTimingCounters +
+                                             q::kHeadTimingStamps);
+  CheckHip(hipMemset(timing.get(), 0,
+                     (q::kHeadTimingCounters + q::kHeadTimingStamps) *
+                         sizeof(unsigned long long)),
+           "clear");
+  auto tier1 = Upload(std::vector<std::int32_t>{0, 1, 0, 1, 0});
+  auto final_flags = Upload(std::vector<std::int32_t>{0, 1, 0, 0, 0});
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "stream");
+  const auto work = [&] {
+    CheckHip(hipMemsetAsync(scratch.get(), 1, kBytes, stream), "work");
+  };
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "begin");
+  q::HeadTimingStamp(timing.get(), 0, stream);
+  q::HeadTimingStamp(timing.get(), 4, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 1, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 2, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 3, stream);
+  work();  // the tier-2 pass
+  q::HeadTimingStamp(timing.get(), 5, stream);
+  work();  // the escalation
+  q::HeadTimingFinish(timing.get(), final_flags.get(), 5, true, stream, false,
+                      tier1.get());
+  CheckHip(hipStreamEndCapture(stream, &graph), "end");
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  constexpr int kReplays = 3;
+  for (int i = 0; i < kReplays; ++i)
+    CheckHip(hipGraphLaunch(exec, stream), "launch");
+  CheckHip(hipStreamSynchronize(stream), "sync");
+  const auto c = Download(timing.get(), q::kHeadTimingCounters);
+  Expect(c[0] == kReplays && c[1] == kReplays, "calls and fallback calls");
+  Expect(c[q::kHeadTimingTier2Calls] == kReplays &&
+             c[q::kHeadTimingTier2Rows] == 2ULL * kReplays &&
+             c[q::kHeadTimingEscalated] == kReplays,
+         "tier-2 passes, rows and escalations");
+  Expect(c[q::kHeadTimingTier2Ticks] > 0, "the tier's pass takes time");
+  Expect(c[7] == 0 && c[8] == kReplays && c[9] == 0,
+         "the escalated rows pick the d bucket");
+  // d spans stamp 5 to the end, d2 stamp 3 to 5, and both are inside the total.
+  Expect(c[11 + 1] > 0 &&
+             c[5] >= c[2] + c[3] + c[4] + c[12] + c[q::kHeadTimingTier2Ticks],
+         "the total spans the phases it contains");
+  CheckHip(hipGraphExecDestroy(exec), "destroy exec");
+  CheckHip(hipGraphDestroy(graph), "destroy graph");
+  CheckHip(hipStreamDestroy(stream), "destroy stream");
+}
+
+// ---- The second tier of the fallback: the head read in two ranges, and the
+// confidence over the union scored set ----
+void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
+                    std::uint32_t tier2_rows, float threshold,
+                    std::uint32_t seed) {
+  constexpr std::uint32_t kRows = 6;
+  Rng rng{seed};
+  const std::uint32_t blocks = cols / 32;
+  const std::size_t row_bytes = std::size_t{blocks} * 34;
+  std::vector<std::uint8_t> weights(row_bytes * vocab);
+  for (std::uint32_t v = 0; v < vocab; ++v)
+    for (std::uint32_t j = 0; j < blocks; ++j) {
+      std::uint8_t* block = weights.data() + v * row_bytes + j * 34;
+      const __half d = __float2half(
+          0.001F + static_cast<float>(rng.Next() % 1000) / 200000.0F);
+      std::memcpy(block, &d, 2);
+      // Small weights: the logits stay flat, so a flagged row is not
+      // confident unless the compact tail makes it so.
+      for (int i = 0; i < 32; ++i)
+        block[2 + i] = static_cast<std::uint8_t>(
+            static_cast<std::int8_t>(static_cast<int>(rng.Next() % 7) - 3));
+    }
+  std::vector<float> x(std::size_t{kRows} * cols);
+  for (auto& value : x)
+    value = static_cast<float>(static_cast<int>(rng.Next() & 0xFFFFU) - 32768) /
+            32768.0F;
+  // The compact set: every third token. Its logits are small and random, with
+  // one large value in the tail (a token at or above tier2_rows) for rows 0
+  // and 3, which therefore stop at the second tier.
+  std::vector<std::int32_t> ids;
+  std::vector<std::int32_t> inverse(vocab, -1);
+  for (std::uint32_t id = 0; id < vocab; id += 3) {
+    inverse[id] = static_cast<std::int32_t>(ids.size());
+    ids.push_back(static_cast<std::int32_t>(id));
+  }
+  const auto scored = static_cast<std::uint32_t>(ids.size());
+  const std::uint32_t stride = scored + 5;
+  const auto tail =
+      static_cast<std::uint32_t>(qfn::HeadTrimTier2Tail(ids, tier2_rows));
+  Expect(tail > 0 && tail < scored, "the test geometry has a tail");
+  std::vector<float> compact(std::size_t{kRows} * stride, -1000.0F);
+  for (std::uint32_t r = 0; r < kRows; ++r)
+    for (std::uint32_t i = 0; i < scored; ++i)
+      compact[r * stride + i] =
+          static_cast<float>(rng.Next() % 1000) / 500.0F - 1.0F;
+  for (const std::uint32_t r : {0U, 3U})
+    compact[r * stride + scored - 1] = 1.0e6F;
+  std::vector<float> expanded(std::size_t{kRows} * vocab);
+  for (std::uint32_t r = 0; r < kRows; ++r)
+    for (std::uint32_t id = 0; id < vocab; ++id)
+      expanded[r * vocab + id] =
+          inverse[id] >= 0 ? compact[r * stride + inverse[id]] : -INFINITY;
+  const std::vector<std::int32_t> flags_in = {1, 0, 1, 1, 0, 1};
+
+  auto d_w = Upload(weights);
+  auto d_x = Upload(x);
+  auto d_compact = Upload(compact);
+  auto d_flags = Upload(flags_in);
+  auto d_flags2 = Upload(std::vector<std::int32_t>(kRows, 9));
+  auto d_out = Upload(expanded);
+  auto d_ref = Upload(expanded);
+  auto d_counters = Allocate<unsigned long long>(3);
+  CheckHip(hipMemset(d_counters.get(), 0, 3 * sizeof(unsigned long long)),
+           "counters");
+  auto d_scratch = Allocate<std::uint8_t>(std::size_t{kRows} * blocks * 36);
+  auto d_ref_scratch = Allocate<std::uint8_t>(std::size_t{kRows} * blocks * 36);
+  auto d_ref_counters = Allocate<unsigned long long>(3);
+  CheckHip(hipMemset(d_ref_counters.get(), 0, 3 * sizeof(unsigned long long)),
+           "counters");
+
+  // The one-pass reference: every flagged row over the whole head.
+  q::FullHeadFallback(d_w.get(), row_bytes, cols, vocab, d_x.get(),
+                      d_flags.get(), kRows, d_ref.get(), d_ref_counters.get(),
+                      d_ref_scratch.get(), nullptr);
+  // The tiers.
+  q::FullHeadQuantize(d_x.get(), d_flags.get(), cols, kRows, d_scratch.get(),
+                      nullptr);
+  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, 0, tier2_rows,
+                  d_flags.get(), kRows, d_out.get(), nullptr, d_scratch.get(),
+                  nullptr);
+  q::HeadTier2Confidence(d_out.get(), vocab, d_compact.get(), stride, tail,
+                         scored, tier2_rows, threshold, d_flags.get(),
+                         d_flags2.get(), kRows, nullptr);
+  CheckHip(hipDeviceSynchronize(), "tier 2");
+  const auto after_tier2 = Download(d_out.get(), expanded.size());
+  const auto flags2 = Download(d_flags2.get(), kRows);
+  std::vector<std::int32_t> expected2(kRows, 0);
+  std::uint32_t escalated = 0;
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    if (flags_in[r] == 0)
+      continue;
+    const std::span<const float> low(
+        after_tier2.data() + std::size_t{r} * vocab, tier2_rows);
+    const std::span<const float> tail_span(
+        compact.data() + std::size_t{r} * stride + tail, scored - tail);
+    expected2[r] =
+        qfn::HeadTrimTier2Escalates(low, tail_span, threshold) ? 1 : 0;
+    escalated += expected2[r] != 0;
+  }
+  Expect(flags2 == expected2, "tier-2 escalation flags against the host");
+  if (threshold == 0.5F)
+    Expect(escalated >= 1 && escalated < 4,
+           "the test rows exercise both outcomes of the second tier");
+  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, tier2_rows, vocab,
+                  d_flags2.get(), kRows, d_out.get(), d_counters.get(),
+                  d_scratch.get(), nullptr);
+  CheckHip(hipDeviceSynchronize(), "escalation");
+  const auto actual = Download(d_out.get(), expanded.size());
+  const auto reference = Download(d_ref.get(), expanded.size());
+  for (std::uint32_t r = 0; r < kRows; ++r)
+    for (std::uint32_t id = 0; id < vocab; ++id) {
+      const auto i = std::size_t{r} * vocab + id;
+      // An escalated row ends exactly as the one-pass fallback leaves it; a
+      // flagged row that stopped keeps the tier's values below tier2_rows and
+      // its expanded compact values above; a row that was not flagged is
+      // untouched.
+      const float want = expected2[r] != 0                     ? reference[i]
+                         : flags_in[r] != 0 && id < tier2_rows ? reference[i]
+                                                               : expanded[i];
+      Expect(std::bit_cast<std::uint32_t>(actual[i]) ==
+                 std::bit_cast<std::uint32_t>(want),
+             "tier row " + std::to_string(r) + " token " + std::to_string(id));
+    }
+  const auto counters = Download(d_counters.get(), 3);
+  Expect(counters[2] == (escalated != 0 ? 1U : 0U),
+         "one full-matrix pass only when a row escalates");
+}
+
 // ---- Discard-aware flagging: the argmax of HeadConfidence and the chain
 // policy kernel against host references (also replayed from a graph) ----
 void CheckChainPolicy(const std::vector<std::uint32_t>& mismatches,
@@ -640,7 +830,8 @@ void CheckChainPolicy(const std::vector<std::uint32_t>& mismatches,
   auto d_argmax = Upload(std::vector<std::int32_t>(kRows, 9));
   auto d_defer = Upload(std::vector<std::int32_t>(kRows, 9));
   auto d_counters = Allocate<unsigned long long>(3);
-  auto d_timing = Allocate<unsigned long long>(q::kHeadTimingCounters + 5);
+  auto d_timing = Allocate<unsigned long long>(q::kHeadTimingCounters +
+                                               q::kHeadTimingStamps);
   hipStream_t stream = nullptr;
   CheckHip(hipStreamCreate(&stream), "stream");
   const auto launch = [&] {
@@ -653,10 +844,10 @@ void CheckChainPolicy(const std::vector<std::uint32_t>& mismatches,
   const auto reset = [&] {
     CheckHip(hipMemset(d_counters.get(), 0, 3 * sizeof(unsigned long long)),
              "counters");
-    CheckHip(
-        hipMemset(d_timing.get(), 0,
-                  (q::kHeadTimingCounters + 5) * sizeof(unsigned long long)),
-        "timing");
+    CheckHip(hipMemset(d_timing.get(), 0,
+                       (q::kHeadTimingCounters + q::kHeadTimingStamps) *
+                           sizeof(unsigned long long)),
+             "timing");
   };
   const auto check = [&](const char* what) {
     CheckHip(hipStreamSynchronize(stream), "sync");
@@ -703,6 +894,11 @@ int main() {
   try {
     CheckTiming();
     CheckCounters();
+    CheckTimingTier2();
+    CheckTier2Read(96, 1003, 300, 0.5F, 31);
+    CheckTier2Read(1056, 517, 100, 0.5F, 32);
+    CheckTier2Read(1056, 517, 100, 0.0001F, 33);  // nothing escalates
+    CheckTier2Read(96, 1003, 300, 1.0F, 34);      // flat rows escalate
     CheckChainPolicy({2}, 21);     // an unflagged rejection ends the chain
     CheckChainPolicy({1, 3}, 22);  // flagged rejections are uncertain
     CheckChainPolicy({0}, 23);     // a rejection at the first row
