@@ -95,6 +95,9 @@ struct ModelOptions {
   /// threshold (--vocab-trim-tier2-threshold; negative = the fallback's).
   std::uint32_t head_trim_tier2_rows = 0;
   float head_trim_tier2_threshold = -1.0F;
+  /// The full pass reads only the rows the compact set does not hold and keeps
+  /// the compact values for the rest (--vocab-trim-fallback-skip-scored).
+  bool head_trim_skip_scored = false;
 };
 
 class Session;

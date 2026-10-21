@@ -708,6 +708,10 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
 /// be a subset of the quantized ones (a second tier). A row's logits are the
 /// same bits whichever rows share the pass or how the head is split. `counters`
 /// may be null; otherwise counters[2] counts passes that had a flagged row.
+/// With `list` (token ids, ascending), [begin, end) indexes the list instead of
+/// the head: only the rows it names are read, and the other tokens of `out`
+/// are left alone (--vocab-trim-fallback-skip-scored: the list holds the
+/// tokens the compact projection did not score).
 void FullHeadQuantize(const float* x, const std::int32_t* flags,
                       std::uint32_t cols, std::uint32_t rows, void* scratch,
                       hipStream_t stream);
@@ -715,7 +719,7 @@ void FullHeadRead(const void* w, std::size_t row_bytes, std::uint32_t cols,
                   std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
                   const std::int32_t* flags, std::uint32_t rows, float* out,
                   unsigned long long* counters, const void* scratch,
-                  hipStream_t stream);
+                  hipStream_t stream, const std::int32_t* list = nullptr);
 
 /// Second tier of the fallback (--vocab-trim-tier2). For each row r with
 /// flags_in[r] != 0, whose logits out[r][0..tier2_rows) were just recomputed
