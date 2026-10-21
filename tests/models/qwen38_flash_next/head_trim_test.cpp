@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -127,6 +128,57 @@ void CheckStats() {
   Require(std::fabs(stats.Rate() - 0.15) < 1e-12, "rate is fallbacks / rows");
 }
 
+// The device timing counters: ticks to nanoseconds, bucketed by flagged rows,
+// differences between readings, and the reported fields.
+void CheckTiming() {
+  Require(qfn::HeadTimingStats::Bucket(0) == 0 &&
+              qfn::HeadTimingStats::Bucket(1) == 1 &&
+              qfn::HeadTimingStats::Bucket(2) == 2 &&
+              qfn::HeadTimingStats::Bucket(3) == 3 &&
+              qfn::HeadTimingStats::Bucket(64) == 3,
+          "three or more flagged rows share the last bucket");
+  unsigned long long c[qfn::HeadTimingStats::kCounterCount]{};
+  c[0] = 10;   // calls
+  c[1] = 8;    // fallback calls
+  c[2] = 100;  // a, ticks
+  c[3] = 20;
+  c[4] = 30;
+  c[5] = 400;  // total
+  c[6] = 5;    // gap
+  c[7] = 6;    // d calls, 0 rows
+  c[8] = 2;    // 1 row
+  c[11] = 60;  // d ticks, 0 rows
+  c[12] = 300;
+  // 10 ns per tick (a 100 MHz clock).
+  const auto s = qfn::HeadTimingStats::FromCounters(c, 10.0);
+  Require(s.calls == 10 && s.fallback_calls == 8 && s.a_ns == 1000 &&
+              s.b_ns == 200 && s.c_ns == 300 && s.total_ns == 4000 &&
+              s.gap_ns == 50 && s.d_calls[0] == 6 && s.d_calls[1] == 2 &&
+              s.d_ns[0] == 600 && s.d_ns[1] == 3000 && s.d_ns[2] == 0,
+          "counters convert to nanoseconds");
+  auto sum = s;
+  sum += s;
+  Require(sum.calls == 20 && sum.d_ns[1] == 6000 && sum.total_ns == 8000,
+          "readings add");
+  const auto delta = sum.Since(s);
+  Require(delta.calls == 10 && delta.a_ns == 1000 && delta.d_calls[0] == 6 &&
+              delta.d_ns[1] == 3000 && delta.gap_ns == 50,
+          "a later reading minus an earlier one");
+  std::size_t fields = 0;
+  double a_us = -1;
+  double total_us = -1;
+  s.ForEachField([&](const char* name, double value) {
+    ++fields;
+    if (std::string_view(name) == "a_us")
+      a_us = value;
+    if (std::string_view(name) == "total_us")
+      total_us = value;
+  });
+  Require(fields == 5 + 2 * qfn::kHeadTimingBuckets + 2 && a_us == 1.0 &&
+              total_us == 4.0,
+          "fields are reported in microseconds");
+}
+
 int main() {
   try {
     CheckPlan();
@@ -135,6 +187,7 @@ int main() {
     CheckFallbackRule();
     CheckExpand();
     CheckStats();
+    CheckTiming();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

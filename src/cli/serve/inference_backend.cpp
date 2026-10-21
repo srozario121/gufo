@@ -3059,6 +3059,8 @@ public:
         stats_after.head_fallbacks - stats_before.head_fallbacks;
     step.head_trim_full_reads =
         stats_after.head_full_reads - stats_before.head_full_reads;
+    step.head_trim_timing =
+        stats_after.head_timing.Since(stats_before.head_timing);
     return step;
   }
 
@@ -3158,6 +3160,7 @@ public:
           stats.head_fallbacks - before[i].head_fallbacks;
       step.head_trim_full_reads =
           stats.head_full_reads - before[i].head_full_reads;
+      step.head_trim_timing = stats.head_timing.Since(before[i].head_timing);
     }
     return steps;
   }
@@ -3426,6 +3429,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .suppress_value = speculative_config.suppress_nonascii_value,
             .head_trim_set_path = speculative_config.head_trim_set,
             .head_trim_threshold = speculative_config.head_trim_threshold,
+            .head_trim_timing = speculative_config.head_trim_timing,
         },
         &load_error);
     if (model == nullptr) {

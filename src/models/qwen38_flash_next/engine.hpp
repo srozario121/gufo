@@ -74,6 +74,8 @@ struct ModelOptions {
   /// Top probability over the scored rows below which a position re-runs the
   /// full head; 0 never does.
   float head_trim_threshold = kHeadTrimDefaultThreshold;
+  /// Time the trimmed head's phases on the device (--vocab-trim-timing).
+  bool head_trim_timing = false;
 };
 
 class Session;
@@ -262,6 +264,8 @@ public:
     std::uint64_t head_rows{0};
     std::uint64_t head_fallbacks{0};
     std::uint64_t head_full_reads{0};
+    /// Device-side phase timing of the trimmed head, when timing is on.
+    HeadTimingStats head_timing{};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept;
 

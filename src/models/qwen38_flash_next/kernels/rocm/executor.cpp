@@ -1167,6 +1167,24 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->head_compact_ = f32(std::size_t{head_rows} * trim->head.rows);
     e->head_flags_ = Alloc<std::int32_t>(a, head_rows, error_msg);
     e->head_counters_ = Alloc<unsigned long long>(a, 3, error_msg);
+    if (trim->timing) {
+      int device = 0;
+      int khz = 0;
+      if (hipGetDevice(&device) != hipSuccess ||
+          hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate,
+                                device) != hipSuccess ||
+          khz <= 0) {
+        AssignError(error_msg,
+                    "--vocab-trim-timing: the device reports no wall clock "
+                    "rate");
+        return nullptr;
+      }
+      e->head_ns_per_tick_ = 1.0e6 / static_cast<double>(khz);
+      e->head_timing_ =
+          Alloc<unsigned long long>(a, kHeadTimingCounters + 5, error_msg);
+      if (e->head_timing_ == nullptr)
+        return nullptr;
+    }
     e->head_quantized_ = Alloc<std::uint8_t>(
         a, std::size_t{head_rows} * (trim->head.cols / 32) * 36, error_msg);
     if (e->head_compact_ == nullptr || e->head_flags_ == nullptr ||
@@ -1450,18 +1468,34 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
     return false;
   }
   const std::uint32_t vocab = full.rows;
+  // Timing stamps are kernels on the stream, so they run (and survive) inside
+  // captured graphs; none is launched unless --vocab-trim-timing is on.
+  const bool timed = head_timing_ != nullptr;
+  const bool with_fallback = fallback && trim->threshold > 0.0F;
+  if (timed) {
+    HeadTimingStamp(head_timing_, 0, stream_);
+    HeadTimingStamp(head_timing_, 4, stream_);
+  }
   if (!(batch ? DenseBatch(trim->head, x, head_compact_, rows, error_msg)
               : Dense(trim->head, x, head_compact_, rows, error_msg)))
     return false;
+  if (timed)
+    HeadTimingStamp(head_timing_, 1, stream_);
   ExpandHeadLogits(head_compact_, trim->inverse, out, rows, vocab,
                    trim->head.rows, stream_);
-  if (fallback && trim->threshold > 0.0F) {
+  if (with_fallback) {
+    if (timed)
+      HeadTimingStamp(head_timing_, 2, stream_);
     HeadConfidence(head_compact_, rows, trim->scored, trim->head.rows,
                    trim->threshold, head_flags_, head_counters_, stream_);
+    if (timed)
+      HeadTimingStamp(head_timing_, 3, stream_);
     FullHeadFallback(full.data, model_->output_row_bytes(), full.cols, vocab, x,
                      head_flags_, rows, out, head_counters_, head_quantized_,
                      stream_);
   }
+  if (timed)
+    HeadTimingFinish(head_timing_, head_flags_, rows, with_fallback, stream_);
   return Check(hipGetLastError(), "trimmed head", error_msg);
 }
 
@@ -1478,6 +1512,18 @@ HeadTrimStats Executor::HeadStatistics() const {
   stats.fallbacks = counters[1];
   stats.full_reads = counters[2];
   return stats;
+}
+
+HeadTimingStats Executor::HeadTimingStatistics() const {
+  if (head_timing_ == nullptr)
+    return {};
+  unsigned long long counters[HeadTimingStats::kCounterCount]{};
+  static_assert(HeadTimingStats::kCounterCount == kHeadTimingCounters);
+  if (hipMemcpyAsync(counters, head_timing_, sizeof(counters),
+                     hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+      hipStreamSynchronize(stream_) != hipSuccess)
+    return {};
+  return HeadTimingStats::FromCounters(counters, head_ns_per_tick_);
 }
 
 bool Executor::DraftLogits(const Session& session, const float* x,

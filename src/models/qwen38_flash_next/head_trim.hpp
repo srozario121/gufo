@@ -143,6 +143,110 @@ struct HeadTrimStats {
   }
 };
 
+/// Device-side timing of the trimmed head (--vocab-trim-timing), in
+/// nanoseconds of the device's constant wall clock, summed over every
+/// HeadProject call since the model loaded. Phases: a the compact projection,
+/// b ExpandHeadLogits, c HeadConfidence, d the full-head fallback (quantize
+/// and read), split by how many rows the call flagged; total spans the start
+/// of (a) to the end of the last phase of the call. Each phase includes the
+/// launch gap before the timestamp kernel that closes it; `gap_ns` sums the
+/// same measure over two timestamp kernels with nothing between them (one per
+/// call), the floor of what an empty phase reads.
+inline constexpr std::size_t kHeadTimingBuckets = 4;  ///< 0, 1, 2, 3+ rows
+struct HeadTimingStats {
+  std::uint64_t calls{0};           ///< HeadProject calls timed
+  std::uint64_t fallback_calls{0};  ///< of those, with the fallback stage
+  std::uint64_t a_ns{0};
+  std::uint64_t b_ns{0};
+  std::uint64_t c_ns{0};
+  std::uint64_t total_ns{0};
+  std::uint64_t gap_ns{0};
+  std::uint64_t d_calls[kHeadTimingBuckets]{};
+  std::uint64_t d_ns[kHeadTimingBuckets]{};
+
+  [[nodiscard]] static constexpr std::size_t Bucket(
+      std::uint32_t flagged) noexcept {
+    return flagged < kHeadTimingBuckets ? flagged : kHeadTimingBuckets - 1;
+  }
+  /// Device counters, in this order: calls,
+  /// fallback_calls, a, b, c, total, gap, d_calls[], d_ticks[]. `ns_per_tick`
+  /// converts the clock's ticks.
+  static constexpr std::size_t kCounterCount = 7 + 2 * kHeadTimingBuckets;
+  [[nodiscard]] static HeadTimingStats FromCounters(
+      const unsigned long long* c, double ns_per_tick) noexcept {
+    const auto ns = [&](std::uint64_t ticks) {
+      return static_cast<std::uint64_t>(
+          static_cast<double>(ticks) * ns_per_tick + 0.5);
+    };
+    HeadTimingStats s;
+    s.calls = c[0];
+    s.fallback_calls = c[1];
+    s.a_ns = ns(c[2]);
+    s.b_ns = ns(c[3]);
+    s.c_ns = ns(c[4]);
+    s.total_ns = ns(c[5]);
+    s.gap_ns = ns(c[6]);
+    for (std::size_t i = 0; i < kHeadTimingBuckets; ++i) {
+      s.d_calls[i] = c[7 + i];
+      s.d_ns[i] = ns(c[7 + kHeadTimingBuckets + i]);
+    }
+    return s;
+  }
+  HeadTimingStats& operator+=(const HeadTimingStats& o) noexcept {
+    calls += o.calls;
+    fallback_calls += o.fallback_calls;
+    a_ns += o.a_ns;
+    b_ns += o.b_ns;
+    c_ns += o.c_ns;
+    total_ns += o.total_ns;
+    gap_ns += o.gap_ns;
+    for (std::size_t i = 0; i < kHeadTimingBuckets; ++i) {
+      d_calls[i] += o.d_calls[i];
+      d_ns[i] += o.d_ns[i];
+    }
+    return *this;
+  }
+  /// Calls f(name, value) for each field, as reported: counts as they are,
+  /// durations in microseconds. The caller adds its own prefix.
+  template<typename F>
+  void ForEachField(F&& f) const {
+    const auto us = [](std::uint64_t ns) {
+      return static_cast<double>(ns) / 1000.0;
+    };
+    static constexpr const char* kUs[kHeadTimingBuckets] = {
+        "d_none_us", "d_one_us", "d_two_us", "d_many_us"};
+    static constexpr const char* kCalls[kHeadTimingBuckets] = {
+        "d_none_calls", "d_one_calls", "d_two_calls", "d_many_calls"};
+    f("calls", static_cast<double>(calls));
+    f("fallback_calls", static_cast<double>(fallback_calls));
+    f("a_us", us(a_ns));
+    f("b_us", us(b_ns));
+    f("c_us", us(c_ns));
+    for (std::size_t i = 0; i < kHeadTimingBuckets; ++i) {
+      f(kUs[i], us(d_ns[i]));
+      f(kCalls[i], static_cast<double>(d_calls[i]));
+    }
+    f("total_us", us(total_ns));
+    f("gap_us", us(gap_ns));
+  }
+  /// This minus an earlier reading of the same counters.
+  [[nodiscard]] HeadTimingStats Since(const HeadTimingStats& o) const noexcept {
+    HeadTimingStats s = *this;
+    s.calls -= o.calls;
+    s.fallback_calls -= o.fallback_calls;
+    s.a_ns -= o.a_ns;
+    s.b_ns -= o.b_ns;
+    s.c_ns -= o.c_ns;
+    s.total_ns -= o.total_ns;
+    s.gap_ns -= o.gap_ns;
+    for (std::size_t i = 0; i < kHeadTimingBuckets; ++i) {
+      s.d_calls[i] -= o.d_calls[i];
+      s.d_ns[i] -= o.d_ns[i];
+    }
+    return s;
+  }
+};
+
 }  // namespace gufo::models::qwen38_flash_next
 
 #endif

@@ -20,6 +20,7 @@
 #include "src/core/text_sampling_defaults.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 
 namespace gufo::server {
 
@@ -214,6 +215,8 @@ public:
     std::size_t head_trim_rows{0};
     std::size_t head_trim_fallbacks{0};
     std::size_t head_trim_full_reads{0};
+    /// Device-side phase times of the trimmed head (--vocab-trim-timing).
+    ::gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};

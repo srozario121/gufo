@@ -2115,6 +2115,14 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
         static_cast<double>(result.head_trim_fallbacks) /
         static_cast<double>(result.head_trim_rows);
   }
+  // --vocab-trim-timing: device-side time per phase of the head projection
+  // (microseconds), summed over the request's steps; see HeadTimingStats.
+  // Reported without the fallback too (then only the projection and the
+  // expansion have time).
+  if (result.head_trim_timing.calls > 0)
+    result.head_trim_timing.ForEachField([&](const char* name, double value) {
+      metrics[std::string("head_trim_t_") + name] = value;
+    });
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

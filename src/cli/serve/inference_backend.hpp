@@ -58,6 +58,8 @@ struct TextSpeculativeConfig {
   /// probability below which a position re-runs the full head (0: never).
   std::string head_trim_set;
   float head_trim_threshold{0.5F};
+  /// Time the trimmed head's phases on the device (--vocab-trim-timing).
+  bool head_trim_timing{false};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };
