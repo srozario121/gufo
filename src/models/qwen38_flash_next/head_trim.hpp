@@ -158,6 +158,33 @@ inline std::uint32_t HeadTrimDiscardScan(std::span<std::int32_t> flags,
   return cleared;
 }
 
+/// Second tier of the fallback (--vocab-trim-tier2 N): a flagged row is
+/// first re-scored over the first N token ids, and its scored set becomes
+/// those tokens plus the compact set's tokens at or above N. This is how many
+/// compact rows (`ids` ascending) lie below N, hence where the compact tail
+/// starts, and how many of the first N tokens are NOT in the compact set.
+[[nodiscard]] inline std::size_t HeadTrimTier2Tail(
+    std::span<const std::int32_t> ids, std::uint32_t tier2_rows) {
+  return static_cast<std::size_t>(
+      std::lower_bound(ids.begin(), ids.end(),
+                       static_cast<std::int32_t>(tier2_rows)) -
+      ids.begin());
+}
+
+/// Whether a flagged row still needs the full matrix after the second tier:
+/// the best probability over the union scored set is under `threshold` (or not
+/// a number). `low` holds the row's logits for the tokens below N (tier-2
+/// values), `tail` the compact logits of the scored tokens at or above N.
+[[nodiscard]] inline bool HeadTrimTier2Escalates(std::span<const float> low,
+                                                 std::span<const float> tail,
+                                                 float threshold) {
+  std::vector<float> union_logits;
+  union_logits.reserve(low.size() + tail.size());
+  union_logits.insert(union_logits.end(), low.begin(), low.end());
+  union_logits.insert(union_logits.end(), tail.begin(), tail.end());
+  return HeadTrimNeedsFallback(HeadTrimTopProbability(union_logits), threshold);
+}
+
 /// Head projections the trimmed target made and how many fell back; read from
 /// the device counters.
 struct HeadTrimStats {
@@ -197,6 +224,15 @@ struct HeadTimingStats {
   /// whose read was deferred until the verification loop reached them.
   std::uint64_t discarded_rows{0};
   std::uint64_t deferred_rows{0};
+  /// Second tier (--vocab-trim-tier2): passes that re-scored flagged rows over
+  /// the first N token ids, the rows they re-scored, their device time (all
+  /// calls with the fallback stage, as phase d counts the calls that flagged
+  /// nothing), and the rows still under the tier's threshold that went on to
+  /// the full matrix.
+  std::uint64_t d2_calls{0};
+  std::uint64_t d2_rows{0};
+  std::uint64_t d2_ns{0};
+  std::uint64_t escalated_rows{0};
 
   [[nodiscard]] static constexpr std::size_t Bucket(
       std::uint32_t flagged) noexcept {
@@ -204,8 +240,9 @@ struct HeadTimingStats {
   }
   /// Device counters, in this order: calls,
   /// fallback_calls, a, b, c, total, gap, d_calls[], d_ticks[], discarded_rows,
-  /// deferred_rows. `ns_per_tick` converts the clock's ticks.
-  static constexpr std::size_t kCounterCount = 7 + 2 * kHeadTimingBuckets + 2;
+  /// deferred_rows, d2_calls, d2_rows, d2_ticks, escalated_rows. `ns_per_tick`
+  /// converts the clock's ticks.
+  static constexpr std::size_t kCounterCount = 7 + 2 * kHeadTimingBuckets + 6;
   [[nodiscard]] static HeadTimingStats FromCounters(
       const unsigned long long* c, double ns_per_tick) noexcept {
     const auto ns = [&](std::uint64_t ticks) {
@@ -226,6 +263,10 @@ struct HeadTimingStats {
     }
     s.discarded_rows = c[7 + 2 * kHeadTimingBuckets];
     s.deferred_rows = c[8 + 2 * kHeadTimingBuckets];
+    s.d2_calls = c[9 + 2 * kHeadTimingBuckets];
+    s.d2_rows = c[10 + 2 * kHeadTimingBuckets];
+    s.d2_ns = ns(c[11 + 2 * kHeadTimingBuckets]);
+    s.escalated_rows = c[12 + 2 * kHeadTimingBuckets];
     return s;
   }
   HeadTimingStats& operator+=(const HeadTimingStats& o) noexcept {
@@ -242,6 +283,10 @@ struct HeadTimingStats {
     }
     discarded_rows += o.discarded_rows;
     deferred_rows += o.deferred_rows;
+    d2_calls += o.d2_calls;
+    d2_rows += o.d2_rows;
+    d2_ns += o.d2_ns;
+    escalated_rows += o.escalated_rows;
     return *this;
   }
   /// Calls f(name, value) for each field, as reported: counts as they are,
@@ -266,6 +311,10 @@ struct HeadTimingStats {
     }
     f("discarded_rows", static_cast<double>(discarded_rows));
     f("deferred_rows", static_cast<double>(deferred_rows));
+    f("d2_calls", static_cast<double>(d2_calls));
+    f("d2_rows", static_cast<double>(d2_rows));
+    f("d2_us", us(d2_ns));
+    f("escalated_rows", static_cast<double>(escalated_rows));
     f("total_us", us(total_ns));
     f("gap_us", us(gap_ns));
   }
@@ -285,6 +334,10 @@ struct HeadTimingStats {
     }
     s.discarded_rows -= o.discarded_rows;
     s.deferred_rows -= o.deferred_rows;
+    s.d2_calls -= o.d2_calls;
+    s.d2_rows -= o.d2_rows;
+    s.d2_ns -= o.d2_ns;
+    s.escalated_rows -= o.escalated_rows;
     return s;
   }
 };

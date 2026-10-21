@@ -89,6 +89,12 @@ struct ModelOptions {
   /// first unflagged rejected draft, sampled chains read a flagged row only
   /// when the verification loop reaches it. Output unchanged.
   bool head_trim_discard_aware = false;
+  /// A flagged row is first re-scored over the first N token ids
+  /// (--vocab-trim-tier2; 0 = off) and goes on to the full matrix only if its
+  /// top probability over those and the scored set is under the tier's
+  /// threshold (--vocab-trim-tier2-threshold; negative = the fallback's).
+  std::uint32_t head_trim_tier2_rows = 0;
+  float head_trim_tier2_threshold = -1.0F;
 };
 
 class Session;
