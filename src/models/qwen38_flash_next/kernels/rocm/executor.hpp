@@ -254,6 +254,9 @@ public:
   /// head, since the executor was created. Zero without a trimmed head.
   /// Waits for the stream.
   [[nodiscard]] HeadTrimStats HeadStatistics() const;
+  /// The trimmed head's device-side phase times (zero unless timing is on).
+  /// Waits for the stream.
+  [[nodiscard]] HeadTimingStats HeadTimingStatistics() const;
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
@@ -802,6 +805,10 @@ private:
   float* head_compact_{nullptr};
   std::int32_t* head_flags_{nullptr};
   unsigned long long* head_counters_{nullptr};
+  /// Timing counters (HeadTimingStats::kCounterCount) then five timestamps;
+  /// null unless the head's timing is on. `head_ns_per_tick_` is the clock's.
+  unsigned long long* head_timing_{nullptr};
+  double head_ns_per_tick_{0.0};
   void* head_quantized_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};

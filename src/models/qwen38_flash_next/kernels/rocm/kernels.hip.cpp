@@ -8294,6 +8294,57 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
       rows, out, counters);
 }
 
+// ---- Device timing of the trimmed head ----
+
+// Counter layout (head_trim.hpp, HeadTimingStats::kCounterCount):
+// 0 calls, 1 fallback calls, 2 a, 3 b, 4 c, 5 total, 6 gap, 7..10 d calls,
+// 11..14 d ticks; the timestamps follow at kHeadTimingCounters.
+__global__ void HeadTimingStampKernel(unsigned long long* timing,
+                                      std::uint32_t slot) {
+  if (threadIdx.x == 0)
+    timing[kHeadTimingCounters + slot] =
+        static_cast<unsigned long long>(wall_clock64());
+}
+
+void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
+                     hipStream_t stream) {
+  hipLaunchKernelGGL(HeadTimingStampKernel, dim3(1), dim3(1), 0, stream, timing,
+                     slot);
+}
+
+__global__ void HeadTimingFinishKernel(unsigned long long* timing,
+                                       const std::int32_t* flags,
+                                       std::uint32_t rows, int fallback) {
+  if (threadIdx.x != 0)
+    return;
+  const unsigned long long now =
+      static_cast<unsigned long long>(wall_clock64());
+  const unsigned long long* s = timing + kHeadTimingCounters;
+  atomicAdd(&timing[0], 1ULL);
+  atomicAdd(&timing[6], s[4] - s[0]);
+  atomicAdd(&timing[2], s[1] - s[4]);
+  atomicAdd(&timing[5], now - s[0]);
+  if (fallback == 0) {
+    atomicAdd(&timing[3], now - s[1]);
+    return;
+  }
+  atomicAdd(&timing[1], 1ULL);
+  atomicAdd(&timing[3], s[2] - s[1]);
+  atomicAdd(&timing[4], s[3] - s[2]);
+  std::uint32_t flagged = 0;
+  for (std::uint32_t r = 0; r < rows; ++r)
+    flagged += flags[r] != 0 ? 1U : 0U;
+  const std::uint32_t bucket = flagged < 3U ? flagged : 3U;
+  atomicAdd(&timing[7 + bucket], 1ULL);
+  atomicAdd(&timing[11 + bucket], now - s[3]);
+}
+
+void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
+                      std::uint32_t rows, bool fallback, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadTimingFinishKernel, dim3(1), dim3(1), 0, stream,
+                     timing, flags, rows, fallback ? 1 : 0);
+}
+
 // ---- Draft head on the compact rows ----
 
 __global__ void MaskSuppressedCompactKernel(float* logits,

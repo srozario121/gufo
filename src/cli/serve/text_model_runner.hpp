@@ -213,6 +213,9 @@ struct TextDecodeStep {
   std::size_t head_trim_rows{0};
   std::size_t head_trim_fallbacks{0};
   std::size_t head_trim_full_reads{0};
+  /// Device-side phase times of the trimmed head during this step
+  /// (--vocab-trim-timing); zero when off.
+  ::gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.

@@ -665,6 +665,21 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
                       unsigned long long* counters, void* scratch,
                       hipStream_t stream);
 
+/// Device timestamps for HeadProject's phases (--vocab-trim-timing). `timing`
+/// holds `kHeadTimingCounters` counters then five timestamps. The stamp
+/// kernels write the device's constant wall clock (wall_clock64) to
+/// timestamp `slot`; the finish kernel, the last in the call, reads the
+/// stamps, adds the phase durations, the call count and the flagged-row bucket
+/// of the full-head pass to the counters (one atomic add each), so the sums
+/// survive graph replay. Slots: 0 start, 4 right after 0 (the gap floor),
+/// 1 after the compact projection, 2 after the expansion, 3 after the
+/// confidence check. Without `fallback` the call ends after the expansion.
+inline constexpr std::uint32_t kHeadTimingCounters = 15;
+void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
+                     hipStream_t stream);
+void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
+                      std::uint32_t rows, bool fallback, hipStream_t stream);
+
 /// The draft head over compact rows: sets logits[r * stride + i] to
 /// -infinity where flags[ids[i]] != 0, for i < n and r < rows (the compact
 /// form of MaskSuppressedLogits).

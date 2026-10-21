@@ -151,6 +151,7 @@ public:
     result.head_trim_rows = head_trim_rows;
     result.head_trim_fallbacks = head_trim_fallbacks;
     result.head_trim_full_reads = head_trim_full_reads;
+    result.head_trim_timing = head_trim_timing;
     if (!result.cache_hit) {
       result.cached_prompt_tokens = 0;
       result.prefill_tokens = result.prompt_tokens;
@@ -224,6 +225,7 @@ public:
   std::size_t head_trim_rows{0};
   std::size_t head_trim_fallbacks{0};
   std::size_t head_trim_full_reads{0};
+  gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
   FinishReason finish_reason{FinishReason::kStop};
   std::string stop_sequence;
   bool block_after_first_piece{false};
@@ -606,6 +608,49 @@ void TestCachedPrefillMetrics() {
              trimmed_metrics->member_size("head_trim_full_reads") == 6 &&
              trimmed_metrics->member_double("head_trim_fallback_rate") == 0.25,
          "Usage reports the trimmed head's rows, fallbacks and rate");
+
+  // --vocab-trim-timing adds the phase sums, in microseconds, and only then.
+  Expect(trimmed_metrics->find("head_trim_t_calls") == nullptr,
+         "Usage omits the head timing when it is off");
+  backend.head_trim_timing.calls = 10;
+  backend.head_trim_timing.fallback_calls = 8;
+  backend.head_trim_timing.a_ns = 500000;
+  backend.head_trim_timing.d_calls[0] = 6;
+  backend.head_trim_timing.d_ns[0] = 120000;
+  backend.head_trim_timing.d_calls[1] = 2;
+  backend.head_trim_timing.d_ns[1] = 6000000;
+  backend.head_trim_timing.total_ns = 7000000;
+  const auto timed = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"x"}]})"),
+      backend);
+  const auto timed_body = gufo::json::parse(timed.body);
+  const auto* timed_usage = timed_body.find("usage");
+  const auto* timed_metrics = timed_usage ? timed_usage->find("gufo") : nullptr;
+  Expect(timed_metrics &&
+             timed_metrics->member_double("head_trim_t_calls") == 10 &&
+             timed_metrics->member_double("head_trim_t_a_us") == 500 &&
+             timed_metrics->member_double("head_trim_t_d_none_us") == 120 &&
+             timed_metrics->member_double("head_trim_t_d_none_calls") == 6 &&
+             timed_metrics->member_double("head_trim_t_d_one_us") == 6000 &&
+             timed_metrics->member_double("head_trim_t_d_one_calls") == 2 &&
+             timed_metrics->member_double("head_trim_t_total_us") == 7000,
+         "Usage reports the head timing in microseconds");
+  // With the fallback off no row is scored on the confidence path, but the
+  // projection still has time to report.
+  backend.head_trim_rows = 0;
+  backend.head_trim_fallbacks = 0;
+  backend.head_trim_full_reads = 0;
+  const auto idle = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"x"}]})"),
+      backend);
+  const auto idle_body = gufo::json::parse(idle.body);
+  const auto* idle_usage = idle_body.find("usage");
+  const auto* idle_metrics = idle_usage ? idle_usage->find("gufo") : nullptr;
+  Expect(idle_metrics && idle_metrics->find("head_trim_rows") == nullptr &&
+             idle_metrics->member_double("head_trim_t_a_us") == 500,
+         "Usage reports the head timing without any fallback rows");
 }
 
 void TestToolCallsAreStructured() {
