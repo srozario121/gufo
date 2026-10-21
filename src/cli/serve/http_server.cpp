@@ -1559,8 +1559,26 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "# TYPE gufo_spec_lookup_accepted_tokens_total counter\n"
       << "gufo_spec_lookup_accepted_tokens_total "
       << detail::TotalLookupAcceptedTokens().load(std::memory_order_relaxed)
-      << "\n"
-      << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
+      << "\n";
+  if (detail::TotalHeadTrimRows().load(std::memory_order_relaxed) > 0)
+    out << "# HELP gufo_head_trim_rows_total Target logit rows scored on the "
+           "trimmed head\n"
+        << "# TYPE gufo_head_trim_rows_total counter\n"
+        << "gufo_head_trim_rows_total "
+        << detail::TotalHeadTrimRows().load(std::memory_order_relaxed) << "\n"
+        << "# HELP gufo_head_trim_fallbacks_total Rows re-run on the full "
+           "head (low confidence)\n"
+        << "# TYPE gufo_head_trim_fallbacks_total counter\n"
+        << "gufo_head_trim_fallbacks_total "
+        << detail::TotalHeadTrimFallbacks().load(std::memory_order_relaxed)
+        << "\n"
+        << "# HELP gufo_head_trim_full_reads_total Full-head passes made for "
+           "fallback rows\n"
+        << "# TYPE gufo_head_trim_full_reads_total counter\n"
+        << "gufo_head_trim_full_reads_total "
+        << detail::TotalHeadTrimFullReads().load(std::memory_order_relaxed)
+        << "\n";
+  out << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
       << "llamacpp:prompt_tokens_seconds "

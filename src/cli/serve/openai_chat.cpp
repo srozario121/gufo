@@ -2104,6 +2104,17 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["cache_shared_prefix_bytes"] = result.cache_shared_prefix_bytes;
   metrics["cache_shared_prefix_ms"] = result.cache_shared_prefix_ms;
   metrics["draft_rounds"] = result.draft_rounds;
+  if (result.head_trim_rows > 0) {
+    // Trimmed target head: rows scored on the compact head, and the rows
+    // (and full-head passes) that fell back to the whole vocabulary. Under
+    // concurrent decoding the counts are the model's, shared by the batch.
+    metrics["head_trim_rows"] = result.head_trim_rows;
+    metrics["head_trim_fallbacks"] = result.head_trim_fallbacks;
+    metrics["head_trim_full_reads"] = result.head_trim_full_reads;
+    metrics["head_trim_fallback_rate"] =
+        static_cast<double>(result.head_trim_fallbacks) /
+        static_cast<double>(result.head_trim_rows);
+  }
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

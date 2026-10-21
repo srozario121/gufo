@@ -189,6 +189,44 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->default_bias_ = std::move(bias);
   }
+  if (!options.head_trim_set_path.empty()) {
+    if (options.draft_vocab_prefix != 0 ||
+        !options.draft_vocab_set_path.empty()) {
+      AssignError(error_msg,
+                  "the trimmed head and the draft vocabulary options exclude "
+                  "each other: the draft reads the trimmed head's rows");
+      return nullptr;
+    }
+    const std::uint32_t vocab = m->device_->output().rows;
+    std::ifstream in(options.head_trim_set_path, std::ios::binary);
+    std::ostringstream text;
+    text << in.rdbuf();
+    if (!in.is_open() || in.bad()) {
+      AssignError(error_msg, "cannot read the trimmed head set file");
+      return nullptr;
+    }
+    std::string parse_error;
+    auto ids = ParseTokenIdList(text.str(), vocab, &parse_error);
+    if (!ids) {
+      AssignError(error_msg, "trimmed head set: " + parse_error);
+      return nullptr;
+    }
+    std::vector<std::int32_t> special;
+    for (std::uint32_t id = 0; id < vocab; ++id)
+      if (m->tokenizer_->IsSpecialToken(id) ||
+          m->tokenizer_->IsStopToken(static_cast<tokenization::TokenId>(id)))
+        special.push_back(static_cast<std::int32_t>(id));
+    const auto plan = PlanHeadTrim(vocab, *ids, special);
+    if (!m->device_->SetHeadTrim(plan.ids, plan.inverse, plan.padded_rows,
+                                 options.head_trim_threshold, error_msg))
+      return nullptr;
+    m->head_trimmed_ = true;
+    std::cerr << "[head-trim] set_ids=" << plan.from_set
+              << " special_added=" << plan.added_special
+              << " rows=" << plan.ids.size() << " padded=" << plan.padded_rows
+              << " of=" << vocab
+              << " fallback_threshold=" << options.head_trim_threshold << '\n';
+  }
   const std::uint32_t draft_prefix = options.draft_vocab_prefix != 0
                                          ? options.draft_vocab_prefix
                                          : kMtpDraftVocab;
@@ -215,7 +253,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     draft_set = std::move(*ids);
   }
-  if (m->mtp_weights_ && m->device_->output().rows > draft_prefix) {
+  if (m->mtp_weights_ && !m->head_trimmed_ &&
+      m->device_->output().rows > draft_prefix) {
     std::vector<std::int32_t> specials;
     for (std::uint32_t id = draft_prefix; id < m->device_->output().rows; ++id)
       if (m->tokenizer_->IsSpecialToken(id))
@@ -645,6 +684,16 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   stats_ = {};
   valid_ = true;
   return true;
+}
+
+const Session::SpeculativeStats& Session::Statistics() const noexcept {
+  if (model_->head_trimmed_) {
+    const auto head = model_->executor_->HeadStatistics();
+    stats_.head_rows = head.rows;
+    stats_.head_fallbacks = head.fallbacks;
+    stats_.head_full_reads = head.full_reads;
+  }
+  return stats_;
 }
 
 SessionSnapshot::SessionSnapshot(std::uint64_t size)

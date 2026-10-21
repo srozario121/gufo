@@ -7811,4 +7811,205 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                                       stream);
 }
 
+// ---- Trimmed output head (head_trim.hpp) ----
+
+__global__ void GatherRowsKernel(const std::uint8_t* src,
+                                 const std::int32_t* ids, std::uint8_t* dst,
+                                 std::size_t row_bytes) {
+  const std::uint8_t* from =
+      src + static_cast<std::size_t>(ids[blockIdx.x]) * row_bytes;
+  std::uint8_t* to = dst + static_cast<std::size_t>(blockIdx.x) * row_bytes;
+  if (row_bytes % 4 == 0) {
+    for (std::size_t i = threadIdx.x; i < row_bytes / 4; i += blockDim.x)
+      reinterpret_cast<std::uint32_t*>(to)[i] =
+          reinterpret_cast<const std::uint32_t*>(from)[i];
+  } else {
+    for (std::size_t i = threadIdx.x; i < row_bytes; i += blockDim.x)
+      to[i] = from[i];
+  }
+}
+
+void GatherRows(const void* src, const std::int32_t* ids, void* dst,
+                std::uint32_t n, std::size_t row_bytes, hipStream_t stream) {
+  if (n == 0)
+    return;
+  hipLaunchKernelGGL(GatherRowsKernel, dim3(n), dim3(kThreads), 0, stream,
+                     static_cast<const std::uint8_t*>(src), ids,
+                     static_cast<std::uint8_t*>(dst), row_bytes);
+}
+
+__global__ void ExpandHeadLogitsKernel(const float* compact,
+                                       const std::int32_t* inverse, float* out,
+                                       std::uint32_t vocab,
+                                       std::uint32_t stride) {
+  const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= vocab)
+    return;
+  const std::int32_t row = inverse[id];
+  out[static_cast<std::size_t>(blockIdx.y) * vocab + id] =
+      row >= 0 ? compact[static_cast<std::size_t>(blockIdx.y) * stride + row]
+               : -INFINITY;
+}
+
+void ExpandHeadLogits(const float* compact, const std::int32_t* inverse,
+                      float* out, std::uint32_t rows, std::uint32_t vocab,
+                      std::uint32_t stride, hipStream_t stream) {
+  hipLaunchKernelGGL(ExpandHeadLogitsKernel, dim3(Blocks(vocab), rows),
+                     dim3(kThreads), 0, stream, compact, inverse, out, vocab,
+                     stride);
+}
+
+__global__ void HeadConfidenceKernel(const float* compact, std::uint32_t n,
+                                     std::uint32_t stride, float threshold,
+                                     std::int32_t* flags,
+                                     unsigned long long* counters) {
+  __shared__ float shared[kThreads];
+  const float* row = compact + static_cast<std::size_t>(blockIdx.x) * stride;
+  float maximum = -INFINITY;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+    maximum = fmaxf(maximum, row[i]);
+  shared[threadIdx.x] = maximum;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + step]);
+    __syncthreads();
+  }
+  maximum = shared[0];
+  __syncthreads();
+  float sum = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+    sum += expf(row[i] - maximum);
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared[threadIdx.x] += shared[threadIdx.x + step];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    // NaN (a NaN logit, or no finite row) is "not confident": it falls back.
+    const float probability = 1.0F / shared[0];
+    const bool fall_back = !(probability >= threshold);
+    flags[blockIdx.x] = fall_back ? 1 : 0;
+    atomicAdd(&counters[0], 1ULL);
+    if (fall_back)
+      atomicAdd(&counters[1], 1ULL);
+  }
+}
+
+void HeadConfidence(const float* compact, std::uint32_t rows,
+                    std::uint32_t scored, std::uint32_t stride, float threshold,
+                    std::int32_t* flags, unsigned long long* counters,
+                    hipStream_t stream) {
+  hipLaunchKernelGGL(HeadConfidenceKernel, dim3(rows), dim3(kThreads), 0,
+                     stream, compact, scored, stride, threshold, flags,
+                     counters);
+}
+
+// The fallback reproduces the dense projection's arithmetic so a re-run row
+// matches what the full head computes there: activations quantized per 32
+// values to int8 with a half scale (quantize_q8_1), an integer dot per block
+// against the Q8_0 weights, and d_w * d_x * sumi added in float. Only the
+// order of the per-block sums differs from the vector kernel.
+constexpr unsigned kFallbackMaxRows = 64;
+
+__global__ void QuantizeFallbackRowsKernel(const float* x,
+                                           const std::int32_t* flags,
+                                           std::uint32_t cols,
+                                           std::uint8_t* xq) {
+  const std::uint32_t r = blockIdx.y;
+  if (flags[r] == 0)
+    return;
+  const std::uint32_t j = blockIdx.x;
+  const unsigned i = threadIdx.x;
+  const float xi = x[static_cast<std::size_t>(r) * cols + j * 32 + i];
+  float amax = fabsf(xi);
+  for (int offset = 16; offset > 0; offset >>= 1)
+    amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+  const float d = amax / 127.0F;
+  const std::int8_t q = amax == 0.0F ? static_cast<std::int8_t>(0)
+                                     : static_cast<std::int8_t>(roundf(xi / d));
+  std::uint8_t* block =
+      xq + (static_cast<std::size_t>(r) * (cols / 32) + j) * 34;
+  reinterpret_cast<std::int8_t*>(block + 2)[i] = q;
+  if (i == 0)
+    *reinterpret_cast<__half*>(block) = __float2half(d);
+}
+
+// Sixteen weight rows per block, sixteen lanes per row. A block does nothing
+// when no row is flagged, so the launch is the whole cost of a confident step.
+constexpr unsigned kFallbackRowsPerBlock = 16;
+
+__global__ void FullHeadFallbackKernel(
+    const std::uint8_t* w, std::size_t row_bytes, std::uint32_t cols,
+    std::uint32_t vocab, const std::uint8_t* xq, const std::int32_t* flags,
+    std::uint32_t rows, float* out, unsigned long long* counters) {
+  __shared__ std::int32_t active[kFallbackMaxRows];
+  __shared__ std::int32_t active_count;
+  if (threadIdx.x == 0) {
+    std::int32_t count = 0;
+    for (std::uint32_t r = 0; r < rows && r < kFallbackMaxRows; ++r)
+      if (flags[r] != 0)
+        active[count++] = static_cast<std::int32_t>(r);
+    active_count = count;
+    if (count != 0 && blockIdx.x == 0)
+      atomicAdd(&counters[2], 1ULL);
+  }
+  __syncthreads();
+  if (active_count == 0)
+    return;
+  const unsigned lane = threadIdx.x & 15U;
+  const std::uint32_t v =
+      blockIdx.x * kFallbackRowsPerBlock + (threadIdx.x >> 4);
+  const bool valid = v < vocab;
+  const std::uint8_t* row =
+      w + static_cast<std::size_t>(valid ? v : 0) * row_bytes;
+  const std::uint32_t blocks = cols / 32;
+  for (std::int32_t a = 0; a < active_count; ++a) {
+    const std::uint8_t* xrow =
+        xq + static_cast<std::size_t>(active[a]) * blocks * 34;
+    float acc = 0.0F;
+    for (std::uint32_t j = lane; j < blocks; j += 16) {
+      const std::uint8_t* block = row + static_cast<std::size_t>(j) * 34;
+      const std::uint8_t* xblock = xrow + static_cast<std::size_t>(j) * 34;
+      const auto* q = reinterpret_cast<const std::uint16_t*>(block + 2);
+      const auto* u = reinterpret_cast<const std::uint16_t*>(xblock + 2);
+      int sumi = 0;
+      for (int i = 0; i < 16; ++i) {
+        const std::uint16_t wp = q[i];
+        const std::uint16_t xp = u[i];
+        sumi += static_cast<int>(static_cast<std::int8_t>(wp & 0xFFU)) *
+                static_cast<int>(static_cast<std::int8_t>(xp & 0xFFU));
+        sumi += static_cast<int>(static_cast<std::int8_t>(wp >> 8)) *
+                static_cast<int>(static_cast<std::int8_t>(xp >> 8));
+      }
+      const float dw = __half2float(*reinterpret_cast<const __half*>(block));
+      const float dx = __half2float(*reinterpret_cast<const __half*>(xblock));
+      acc += dw * dx * static_cast<float>(sumi);
+    }
+    for (int offset = 8; offset > 0; offset >>= 1)
+      acc += __shfl_down(acc, offset, 16);
+    if (lane == 0 && valid)
+      out[static_cast<std::size_t>(active[a]) * vocab + v] = acc;
+  }
+}
+
+void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
+                      std::uint32_t vocab, const float* x,
+                      const std::int32_t* flags, std::uint32_t rows, float* out,
+                      unsigned long long* counters, void* scratch,
+                      hipStream_t stream) {
+  auto* xq = static_cast<std::uint8_t*>(scratch);
+  hipLaunchKernelGGL(QuantizeFallbackRowsKernel, dim3(cols / 32, rows),
+                     dim3(32), 0, stream, x, flags, cols, xq);
+  hipLaunchKernelGGL(
+      FullHeadFallbackKernel,
+      dim3((vocab + kFallbackRowsPerBlock - 1) / kFallbackRowsPerBlock),
+      dim3(kFallbackRowsPerBlock * 16), 0, stream,
+      static_cast<const std::uint8_t*>(w), row_bytes, cols, vocab, xq, flags,
+      rows, out, counters);
+}
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
