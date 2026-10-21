@@ -602,6 +602,7 @@ void PrintServeHelp(std::string_view program_name,
     double vocab_trim_fallback_threshold = 0.5;
     bool vocab_trim_timing = false;
     bool vocab_trim_counters = false;
+    bool vocab_trim_discard_aware = false;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -730,6 +731,13 @@ void PrintServeHelp(std::string_view program_name,
                    "report it in the usage gufo object (head_trim_ctr_*) and "
                    "the generation log; measurement only (default: off)",
                    "Speculative", &vocab_trim_counters);
+    parser.AddFlag("", "--vocab-trim-discard-aware",
+                   "With --vocab-trim-set: do not pay a full-head read for "
+                   "chain rows that cannot be used. Greedy chains drop the "
+                   "flags after the first unflagged rejected draft token; "
+                   "other chains read a flagged row only when verification "
+                   "reaches it. Output unchanged (default: off)",
+                   "Speculative", &vocab_trim_discard_aware);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1207,6 +1215,7 @@ int RunServe(std::span<const char* const> args) {
     double vocab_trim_fallback_threshold = 0.5;
     bool vocab_trim_timing = false;
     bool vocab_trim_counters = false;
+    bool vocab_trim_discard_aware = false;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1337,6 +1346,13 @@ int RunServe(std::span<const char* const> args) {
         "(head_trim_ctr_*) and the generation log; measurement only "
         "(default: off)",
         "Speculative", &vocab_trim_counters);
+    llm_parser.AddFlag(
+        "", "--vocab-trim-discard-aware",
+        "With --vocab-trim-set: do not pay a full-head read for chain rows "
+        "that cannot be used. Greedy chains drop the flags after the first "
+        "unflagged rejected draft token; other chains read a flagged row only "
+        "when verification reaches it. Output unchanged (default: off)",
+        "Speculative", &vocab_trim_discard_aware);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1547,6 +1563,8 @@ int RunServe(std::span<const char* const> args) {
         vocab_trim_fallback_threshold > 1.0 ||
         (vocab_trim_timing && vocab_trim_set.empty()) ||
         (vocab_trim_counters && vocab_trim_set.empty()) ||
+        (vocab_trim_discard_aware &&
+         (vocab_trim_set.empty() || vocab_trim_fallback_threshold <= 0.0)) ||
         (!vocab_trim_set.empty() &&
          (speculative_config.backend != server::TextSpeculativeBackend::kMtp ||
           mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()))) {
@@ -1554,7 +1572,9 @@ int RunServe(std::span<const char* const> args) {
                    "(Qwen3.8-Flash-Next) and excludes --mtp-draft-vocab-prefix "
                    "and --mtp-draft-vocab-set; --vocab-trim-fallback-threshold "
                    "is in [0, 1]; --vocab-trim-timing and "
-                   "--vocab-trim-counters need --vocab-trim-set\n";
+                   "--vocab-trim-counters need --vocab-trim-set; "
+                   "--vocab-trim-discard-aware needs it and a fallback "
+                   "threshold above 0\n";
       return 2;
     }
     speculative_config.head_trim_set = vocab_trim_set;
@@ -1562,6 +1582,7 @@ int RunServe(std::span<const char* const> args) {
         static_cast<float>(vocab_trim_fallback_threshold);
     speculative_config.head_trim_timing = vocab_trim_timing;
     speculative_config.head_trim_counters = vocab_trim_counters;
+    speculative_config.head_trim_discard_aware = vocab_trim_discard_aware;
     speculative_config.logit_bias = logit_bias;
     speculative_config.suppress_nonascii_keep = suppress_nonascii_keep;
     speculative_config.suppress_nonascii_value =

@@ -3435,6 +3435,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .head_trim_threshold = speculative_config.head_trim_threshold,
             .head_trim_timing = speculative_config.head_trim_timing,
             .head_trim_counters = speculative_config.head_trim_counters,
+            .head_trim_discard_aware =
+                speculative_config.head_trim_discard_aware,
         },
         &load_error);
     if (model == nullptr) {

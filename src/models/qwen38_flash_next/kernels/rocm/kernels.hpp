@@ -620,10 +620,47 @@ void ExpandHeadLogits(const float* compact, const std::int32_t* inverse,
 /// flags[r] = 1 when the best probability over the first `scored` compact
 /// logits of row r is below `threshold` (or not a number). counters[0] counts
 /// rows, counters[1] flagged rows.
+///
+/// With `argmax_tokens` (and `ids`, compact row -> token), also writes the
+/// argmax token of the scored rows of each row, -1 when none is finite: the
+/// largest finite logit, the lowest token among equals, as the verification
+/// argmax picks it over the expanded row.
 void HeadConfidence(const float* compact, std::uint32_t rows,
                     std::uint32_t scored, std::uint32_t stride, float threshold,
                     std::int32_t* flags, unsigned long long* counters,
-                    hipStream_t stream);
+                    hipStream_t stream, const std::int32_t* ids = nullptr,
+                    std::int32_t* argmax_tokens = nullptr);
+
+/// How the rows of one verification chain treat their fallback flag
+/// (--vocab-trim-discard-aware).
+inline constexpr std::uint32_t kHeadChainInline = 0;   ///< read now (default)
+inline constexpr std::uint32_t kHeadChainDiscard = 1;  ///< greedy discard rule
+inline constexpr std::uint32_t kHeadChainLazy = 2;     ///< read when needed
+inline constexpr std::uint32_t kHeadChainMaxSegments = 8;
+/// The chains of one head call: segment b covers rows first[b] ..
+/// first[b] + rows[b] - 1 of the call, and tokens[first[b] + j] is the input
+/// token of its row j (so tokens[first[b] + j + 1] is the draft row j is
+/// judged against).
+struct HeadChains {
+  std::uint32_t count{0};
+  std::uint32_t first[kHeadChainMaxSegments]{};
+  std::uint32_t rows[kHeadChainMaxSegments]{};
+  std::uint32_t mode[kHeadChainMaxSegments]{};
+  const std::int32_t* tokens{nullptr};
+};
+
+/// Applies the chains' modes to the flags of HeadConfidence (one thread; the
+/// call has at most 64 rows). kHeadChainDiscard clears the flags after the
+/// first unflagged row whose argmax token differs from its draft token (host
+/// reference: HeadTrimDiscardScan); kHeadChainLazy moves every set flag of
+/// its rows to `defer` and clears it, so the full-head pass skips the row;
+/// `defer[r]` is rewritten for all `total_rows` rows. When `timing` is not
+/// null the cleared and deferred flags are added to its counters
+/// (kHeadTimingDiscarded, kHeadTimingDeferred).
+void HeadChainPolicy(const HeadChains& chains,
+                     const std::int32_t* argmax_tokens, std::int32_t* flags,
+                     std::int32_t* defer, std::uint32_t total_rows,
+                     unsigned long long* timing, hipStream_t stream);
 
 /// For each row r with flags[r] != 0 (at most 64 rows), recomputes all
 /// `vocab` logits of the Q8_0 head `w` from x[r] (cols floats) into
@@ -646,11 +683,17 @@ void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
 /// survive graph replay. Slots: 0 start, 4 right after 0 (the gap floor),
 /// 1 after the compact projection, 2 after the expansion, 3 after the
 /// confidence check. Without `fallback` the call ends after the expansion.
-inline constexpr std::uint32_t kHeadTimingCounters = 15;
+inline constexpr std::uint32_t kHeadTimingCounters = 17;
+inline constexpr std::uint32_t kHeadTimingDiscarded = 15;
+inline constexpr std::uint32_t kHeadTimingDeferred = 16;
 void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
                      hipStream_t stream);
+/// `stage_only` closes a deferred full-head pass run after the call (lazy
+/// chains): slot 3 was stamped just before it, and only the full-head pass'
+/// bucket and the total are added, not the call.
 void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
-                      std::uint32_t rows, bool fallback, hipStream_t stream);
+                      std::uint32_t rows, bool fallback, hipStream_t stream,
+                      bool stage_only = false);
 
 /// Measurement counters for the fallback (--vocab-trim-counters;
 /// HeadCounterStats). For each row with flags[r] != 0, after the fallback has

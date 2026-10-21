@@ -773,6 +773,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
   selected_logits_ = nullptr;
+  head_lazy_ = false;
   DropReadyQ8();
   const Config& c = config();
   if (items.empty() || items.size() > kBatchSessions) {
@@ -1066,9 +1067,29 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
+    HeadChains chains;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      if (!items[i].speculative || items[i].head_mode == kHeadChainInline ||
+          items[i].head_mode > kHeadChainLazy || items[i].tokens.size() < 2 ||
+          items[i].session->Cancelled())
+        continue;
+      chains.first[chains.count] = offsets[i];
+      chains.rows[chains.count] =
+          static_cast<std::uint32_t>(items[i].tokens.size());
+      chains.mode[chains.count] = items[i].head_mode;
+      ++chains.count;
+    }
+    chains.tokens = base.tokens;
+    head_lazy_ = false;
+    for (std::uint32_t b = 0; b < chains.count; ++b)
+      head_lazy_ = head_lazy_ || chains.mode[b] == kHeadChainLazy;
+    head_last_x_ = base.mixed;
+    head_last_out_ = batch_logits_;
+    head_last_rows_ = rows;
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
-           HeadProject(base.mixed, batch_logits_, rows, true, true, error);
+           HeadProject(base.mixed, batch_logits_, rows, true, true, error,
+                       &chains);
   };
   bool ok = false;
   try {
@@ -1106,6 +1127,13 @@ bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
   selected_logits_ =
       batch_logits_ + static_cast<std::size_t>(offset) * config().vocab_size;
   if (logits != nullptr) {
+    // The rows whose full-head read was deferred (lazy chains) come with them.
+    if (head_defer_host_ != nullptr &&
+        !Check(hipMemcpyAsync(head_defer_host_, head_defer_,
+                              std::size_t{batch_rows_} * sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               error))
+      return false;
     if (!Check(hipMemcpyAsync(logits_host_, selected_logits_,
                               count * sizeof(float), hipMemcpyDeviceToHost,
                               stream_),

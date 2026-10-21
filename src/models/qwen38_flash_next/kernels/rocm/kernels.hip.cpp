@@ -7862,21 +7862,51 @@ void ExpandHeadLogits(const float* compact, const std::int32_t* inverse,
 __global__ void HeadConfidenceKernel(const float* compact, std::uint32_t n,
                                      std::uint32_t stride, float threshold,
                                      std::int32_t* flags,
-                                     unsigned long long* counters) {
+                                     unsigned long long* counters,
+                                     const std::int32_t* ids,
+                                     std::int32_t* argmax_tokens) {
   __shared__ float shared[kThreads];
+  __shared__ float shared_best[kThreads];
+  __shared__ std::int32_t shared_index[kThreads];
   const float* row = compact + static_cast<std::size_t>(blockIdx.x) * stride;
+  const bool want_argmax = argmax_tokens != nullptr;
+  constexpr std::int32_t kNone = 0x7fffffff;
   float maximum = -INFINITY;
-  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
-    maximum = fmaxf(maximum, row[i]);
+  float best = -INFINITY;
+  std::int32_t best_index = kNone;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = row[i];
+    maximum = fmaxf(maximum, v);
+    // The verification argmax takes finite values only, strictly greater, so
+    // among equals the lowest index (ascending within one thread's stride).
+    if (want_argmax && isfinite(v) && v > best) {
+      best = v;
+      best_index = static_cast<std::int32_t>(i);
+    }
+  }
   shared[threadIdx.x] = maximum;
+  shared_best[threadIdx.x] = best;
+  shared_index[threadIdx.x] = best_index;
   __syncthreads();
   for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
-    if (threadIdx.x < step)
+    if (threadIdx.x < step) {
       shared[threadIdx.x] =
           fmaxf(shared[threadIdx.x], shared[threadIdx.x + step]);
+      if (want_argmax) {
+        const float other = shared_best[threadIdx.x + step];
+        const std::int32_t other_index = shared_index[threadIdx.x + step];
+        if (other > shared_best[threadIdx.x] ||
+            (other == shared_best[threadIdx.x] &&
+             other_index < shared_index[threadIdx.x])) {
+          shared_best[threadIdx.x] = other;
+          shared_index[threadIdx.x] = other_index;
+        }
+      }
+    }
     __syncthreads();
   }
   maximum = shared[0];
+  const std::int32_t winner = shared_index[0];
   __syncthreads();
   float sum = 0.0F;
   for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
@@ -7896,16 +7926,77 @@ __global__ void HeadConfidenceKernel(const float* compact, std::uint32_t n,
     atomicAdd(&counters[0], 1ULL);
     if (fall_back)
       atomicAdd(&counters[1], 1ULL);
+    if (want_argmax)
+      argmax_tokens[blockIdx.x] = winner == kNone ? -1 : ids[winner];
   }
 }
 
 void HeadConfidence(const float* compact, std::uint32_t rows,
                     std::uint32_t scored, std::uint32_t stride, float threshold,
                     std::int32_t* flags, unsigned long long* counters,
-                    hipStream_t stream) {
+                    hipStream_t stream, const std::int32_t* ids,
+                    std::int32_t* argmax_tokens) {
   hipLaunchKernelGGL(HeadConfidenceKernel, dim3(rows), dim3(kThreads), 0,
                      stream, compact, scored, stride, threshold, flags,
-                     counters);
+                     counters, ids, argmax_tokens);
+}
+
+// One thread applies every chain's mode (head_trim.hpp, HeadTrimDiscardScan
+// is the host reference of the discard rule).
+__global__ void HeadChainPolicyKernel(HeadChains chains,
+                                      const std::int32_t* argmax_tokens,
+                                      std::int32_t* flags, std::int32_t* defer,
+                                      std::uint32_t total_rows,
+                                      unsigned long long* timing) {
+  if (threadIdx.x != 0 || blockIdx.x != 0)
+    return;
+  for (std::uint32_t r = 0; r < total_rows; ++r)
+    defer[r] = 0;
+  unsigned long long discarded = 0;
+  unsigned long long deferred = 0;
+  for (std::uint32_t b = 0; b < chains.count && b < kHeadChainMaxSegments;
+       ++b) {
+    const std::uint32_t first = chains.first[b];
+    const std::uint32_t rows = chains.rows[b];
+    if (first + rows > total_rows)
+      continue;
+    if (chains.mode[b] == kHeadChainDiscard) {
+      for (std::uint32_t j = 0; j + 1 < rows; ++j) {
+        const std::int32_t token = argmax_tokens[first + j];
+        if (flags[first + j] != 0 || token < 0 ||
+            token == chains.tokens[first + j + 1])
+          continue;
+        for (std::uint32_t q = j + 1; q < rows; ++q) {
+          if (flags[first + q] != 0)
+            ++discarded;
+          flags[first + q] = 0;
+        }
+        break;
+      }
+    } else if (chains.mode[b] == kHeadChainLazy) {
+      for (std::uint32_t j = 0; j < rows; ++j) {
+        if (flags[first + j] == 0)
+          continue;
+        defer[first + j] = 1;
+        flags[first + j] = 0;
+        ++deferred;
+      }
+    }
+  }
+  if (timing != nullptr) {
+    if (discarded != 0)
+      atomicAdd(&timing[kHeadTimingDiscarded], discarded);
+    if (deferred != 0)
+      atomicAdd(&timing[kHeadTimingDeferred], deferred);
+  }
+}
+
+void HeadChainPolicy(const HeadChains& chains,
+                     const std::int32_t* argmax_tokens, std::int32_t* flags,
+                     std::int32_t* defer, std::uint32_t total_rows,
+                     unsigned long long* timing, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadChainPolicyKernel, dim3(1), dim3(1), 0, stream, chains,
+                     argmax_tokens, flags, defer, total_rows, timing);
 }
 
 // The fallback reproduces the dense projection's arithmetic so a re-run row
@@ -8068,23 +8159,28 @@ void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
 
 __global__ void HeadTimingFinishKernel(unsigned long long* timing,
                                        const std::int32_t* flags,
-                                       std::uint32_t rows, int fallback) {
+                                       std::uint32_t rows, int fallback,
+                                       int stage_only) {
   if (threadIdx.x != 0)
     return;
   const unsigned long long now =
       static_cast<unsigned long long>(wall_clock64());
   const unsigned long long* s = timing + kHeadTimingCounters;
-  atomicAdd(&timing[0], 1ULL);
-  atomicAdd(&timing[6], s[4] - s[0]);
-  atomicAdd(&timing[2], s[1] - s[4]);
-  atomicAdd(&timing[5], now - s[0]);
-  if (fallback == 0) {
-    atomicAdd(&timing[3], now - s[1]);
-    return;
+  if (stage_only == 0) {
+    atomicAdd(&timing[0], 1ULL);
+    atomicAdd(&timing[6], s[4] - s[0]);
+    atomicAdd(&timing[2], s[1] - s[4]);
+    atomicAdd(&timing[5], now - s[0]);
+    if (fallback == 0) {
+      atomicAdd(&timing[3], now - s[1]);
+      return;
+    }
+    atomicAdd(&timing[1], 1ULL);
+    atomicAdd(&timing[3], s[2] - s[1]);
+    atomicAdd(&timing[4], s[3] - s[2]);
+  } else {
+    atomicAdd(&timing[5], now - s[3]);
   }
-  atomicAdd(&timing[1], 1ULL);
-  atomicAdd(&timing[3], s[2] - s[1]);
-  atomicAdd(&timing[4], s[3] - s[2]);
   std::uint32_t flagged = 0;
   for (std::uint32_t r = 0; r < rows; ++r)
     flagged += flags[r] != 0 ? 1U : 0U;
@@ -8094,9 +8190,10 @@ __global__ void HeadTimingFinishKernel(unsigned long long* timing,
 }
 
 void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
-                      std::uint32_t rows, bool fallback, hipStream_t stream) {
+                      std::uint32_t rows, bool fallback, hipStream_t stream,
+                      bool stage_only) {
   hipLaunchKernelGGL(HeadTimingFinishKernel, dim3(1), dim3(1), 0, stream,
-                     timing, flags, rows, fallback ? 1 : 0);
+                     timing, flags, rows, fallback ? 1 : 0, stage_only ? 1 : 0);
 }
 
 // ---- Measurement counters of the fallback ----
