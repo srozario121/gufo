@@ -118,6 +118,7 @@ public:
     const std::int32_t* ids{nullptr};      ///< device, compact row -> token ID
     std::uint32_t scored{0};               ///< compact rows that are real
     float threshold{0.0F};                 ///< fallback below this top prob
+    bool timing{false};  ///< stamp device timestamps (--vocab-trim-timing)
   };
   /// Gathers output() rows `ids` (ascending token IDs, `padded_rows` >= their
   /// count) into a compact device copy and keeps `inverse` (one entry per
@@ -127,6 +128,8 @@ public:
                                  std::span<const std::int32_t> inverse,
                                  std::uint32_t padded_rows, float threshold,
                                  std::string* error_msg);
+  /// Turns the head's device-side timing on (default off); needs SetHeadTrim.
+  void SetHeadTrimTiming(bool on) noexcept { head_trim_.timing = on; }
   [[nodiscard]] const HeadTrim* head_trim() const noexcept {
     return head_trim_.head.empty() ? nullptr : &head_trim_;
   }

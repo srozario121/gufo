@@ -326,10 +326,77 @@ void CheckCompactDraft(std::uint32_t vocab, std::uint32_t scored,
            "candidate score bits differ");
 }
 
+// The timing stamps: captured in a graph and replayed, they still add one
+// call per replay, a nonzero span for a phase that does work, and the call
+// into the bucket of its flagged-row count.
+void CheckTiming() {
+  int device = 0;
+  int khz = 0;
+  CheckHip(hipGetDevice(&device), "device");
+  CheckHip(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device),
+           "wall clock rate");
+  Expect(khz > 0, "the device reports a wall clock rate");
+  constexpr std::size_t kBytes = 256U << 20;
+  auto scratch = Allocate<std::uint8_t>(kBytes);
+  auto timing = Allocate<unsigned long long>(q::kHeadTimingCounters + 5);
+  CheckHip(hipMemset(timing.get(), 0,
+                     (q::kHeadTimingCounters + 5) * sizeof(unsigned long long)),
+           "clear");
+  auto flags = Upload(std::vector<std::int32_t>{0, 1, 0, 1, 0});
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "stream");
+  const auto work = [&] {
+    CheckHip(hipMemsetAsync(scratch.get(), 1, kBytes, stream), "work");
+  };
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "begin");
+  // A call without the fallback stage, then one with two flagged rows.
+  q::HeadTimingStamp(timing.get(), 0, stream);
+  q::HeadTimingStamp(timing.get(), 4, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 1, stream);
+  work();
+  q::HeadTimingFinish(timing.get(), flags.get(), 5, false, stream);
+  q::HeadTimingStamp(timing.get(), 0, stream);
+  q::HeadTimingStamp(timing.get(), 4, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 1, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 2, stream);
+  work();
+  q::HeadTimingStamp(timing.get(), 3, stream);
+  work();
+  q::HeadTimingFinish(timing.get(), flags.get(), 5, true, stream);
+  CheckHip(hipStreamEndCapture(stream, &graph), "end");
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  constexpr int kReplays = 4;
+  for (int i = 0; i < kReplays; ++i)
+    CheckHip(hipGraphLaunch(exec, stream), "launch");
+  CheckHip(hipStreamSynchronize(stream), "sync");
+  const auto c = Download(timing.get(), q::kHeadTimingCounters);
+  Expect(c[0] == 2 * kReplays, "one call counted per HeadProject call");
+  Expect(c[1] == kReplays, "one fallback call per replay");
+  Expect(c[7] == 0 && c[8] == 0 && c[9] == kReplays && c[10] == 0,
+         "two flagged rows land in the two-row bucket");
+  Expect(c[2] > 0 && c[3] > 0 && c[4] > 0 && c[11 + 2] > 0,
+         "phases that do work take time");
+  Expect(c[5] >= c[2] + c[3] + c[4] + c[13],
+         "the total spans the phases it contains");
+  // 256 MiB of memset is milliseconds, far under a second of clock ticks.
+  Expect(c[3] < static_cast<unsigned long long>(khz) * 1000ULL * kReplays * 4,
+         "a phase is not absurdly long");
+  CheckHip(hipGraphExecDestroy(exec), "destroy exec");
+  CheckHip(hipGraphDestroy(graph), "destroy graph");
+  CheckHip(hipStreamDestroy(stream), "destroy stream");
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckTiming();
     // cols: 4096 is the model's; 96 has fewer blocks than the 16 lanes; 1056
     // leaves lanes with uneven block counts. vocab values are not multiples of
     // the 16 rows a block covers.
