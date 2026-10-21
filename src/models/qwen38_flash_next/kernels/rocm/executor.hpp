@@ -264,6 +264,19 @@ public:
   /// rows whose head call was the latest one, of which `keep` positions were
   /// kept. Stream-ordered, no host wait; a no-op unless counters are on.
   void RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const;
+  /// For a chain run with head_mode kHeadChainLazy (the latest Forward, or
+  /// the latest ForwardBatch with this session's rows selected by
+  /// SelectBatchLogits): called when the verification loop is about to use
+  /// row `from` of the chain's `rows`. If that row's full-head read was
+  /// deferred, runs one pass for it and every deferred row after it and
+  /// copies those rows into `host_rows` (row j at host_rows + j * vocab); a
+  /// later call for one of them finds it done. Exact: each row gets the bits
+  /// an eager pass would have given it. A no-op when row `from` was not
+  /// deferred (or is done). Waits for the stream only when it runs a pass.
+  [[nodiscard]] bool ResolveDeferredHeadRows(std::uint32_t from,
+                                             std::uint32_t rows,
+                                             float* host_rows,
+                                             std::string* error_msg) const;
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
@@ -304,12 +317,16 @@ public:
                              std::uint32_t n_logits, float* logits,
                              ForwardMode mode, std::string* error_msg,
                              PrefillCheckpoint* checkpoint = nullptr,
-                             std::span<const std::int32_t> next = {}) const;
+                             std::span<const std::int32_t> next = {},
+                             std::uint32_t head_mode = kHeadChainInline) const;
 
   struct BatchItem {
     Session* session;
     std::span<const std::int32_t> tokens;
     bool speculative;
+    /// kHeadChain*: how this chain's fallback flags are handled
+    /// (--vocab-trim-discard-aware); ignored for a chain of one token.
+    std::uint32_t head_mode{kHeadChainInline};
   };
   /// Packs independent decode chains for shared projections. Every chain
   /// keeps its own recurrent/KV state and the decode arithmetic (<=8 rows).
@@ -591,7 +608,12 @@ private:
   /// rows whose best probability is under the threshold. Draft heads pass
   /// false: a draft only proposes. `batch` selects DenseBatch.
   bool HeadProject(const float* x, float* out, std::uint32_t rows, bool batch,
-                   bool fallback, std::string* error_msg) const;
+                   bool fallback, std::string* error_msg,
+                   const HeadChains* chains = nullptr) const;
+  /// The full-head pass for the rows flagged in head_flags_ (quantize the
+  /// activations, read the head, correct the rows of `out`). Shared by
+  /// HeadProject and ResolveDeferredHeadRows.
+  void HeadFallbackPass(const float* x, float* out, std::uint32_t rows) const;
   /// Small-head draft logits: prefix rows, then the table rows with empty
   /// slots at -infinity.
   bool DraftLogits(const Session& session, const float* x, float* logits,
@@ -609,7 +631,8 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr,
-                   bool embeddings_ready = false) const;
+                   bool embeddings_ready = false,
+                   std::uint32_t head_mode = kHeadChainInline) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
@@ -821,6 +844,19 @@ private:
   unsigned long long* head_ctr_{nullptr};
   std::int32_t* head_rowinfo_{nullptr};
   void* head_quantized_{nullptr};
+  /// Discard-aware flagging (--vocab-trim-discard-aware): the argmax token of
+  /// each scored row, the flags of rows whose read is deferred (device, and a
+  /// pinned host copy downloaded with the logits), a pinned host staging of
+  /// the flags of a deferred pass, and the latest head call's input and
+  /// output so a deferred pass can run later. Null unless the flag is on.
+  std::int32_t* head_argmax_{nullptr};
+  std::int32_t* head_defer_{nullptr};
+  std::int32_t* head_defer_host_{nullptr};
+  std::int32_t* head_flags_host_{nullptr};
+  mutable bool head_lazy_{false};  ///< the latest forward had lazy chains
+  mutable const float* head_last_x_{nullptr};
+  mutable float* head_last_out_{nullptr};
+  mutable std::uint32_t head_last_rows_{0};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

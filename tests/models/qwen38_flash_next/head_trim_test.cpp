@@ -149,20 +149,25 @@ void CheckTiming() {
   c[8] = 2;    // 1 row
   c[11] = 60;  // d ticks, 0 rows
   c[12] = 300;
+  c[15] = 4;  // discarded rows
+  c[16] = 9;  // deferred rows
   // 10 ns per tick (a 100 MHz clock).
   const auto s = qfn::HeadTimingStats::FromCounters(c, 10.0);
   Require(s.calls == 10 && s.fallback_calls == 8 && s.a_ns == 1000 &&
               s.b_ns == 200 && s.c_ns == 300 && s.total_ns == 4000 &&
               s.gap_ns == 50 && s.d_calls[0] == 6 && s.d_calls[1] == 2 &&
-              s.d_ns[0] == 600 && s.d_ns[1] == 3000 && s.d_ns[2] == 0,
+              s.d_ns[0] == 600 && s.d_ns[1] == 3000 && s.d_ns[2] == 0 &&
+              s.discarded_rows == 4 && s.deferred_rows == 9,
           "counters convert to nanoseconds");
   auto sum = s;
   sum += s;
-  Require(sum.calls == 20 && sum.d_ns[1] == 6000 && sum.total_ns == 8000,
+  Require(sum.calls == 20 && sum.d_ns[1] == 6000 && sum.total_ns == 8000 &&
+              sum.discarded_rows == 8 && sum.deferred_rows == 18,
           "readings add");
   const auto delta = sum.Since(s);
   Require(delta.calls == 10 && delta.a_ns == 1000 && delta.d_calls[0] == 6 &&
-              delta.d_ns[1] == 3000 && delta.gap_ns == 50,
+              delta.d_ns[1] == 3000 && delta.gap_ns == 50 &&
+              delta.discarded_rows == 4 && delta.deferred_rows == 9,
           "a later reading minus an earlier one");
   std::size_t fields = 0;
   double a_us = -1;
@@ -174,9 +179,53 @@ void CheckTiming() {
     if (std::string_view(name) == "total_us")
       total_us = value;
   });
-  Require(fields == 5 + 2 * qfn::kHeadTimingBuckets + 2 && a_us == 1.0 &&
+  Require(fields == 5 + 2 * qfn::kHeadTimingBuckets + 4 && a_us == 1.0 &&
               total_us == 4.0,
           "fields are reported in microseconds");
+}
+
+// The greedy discard rule of discard-aware flagging: rows after the first
+// UNFLAGGED row whose argmax differs from its draft token need no read; a
+// flagged row is uncertain and never ends the chain; the mismatching row
+// itself keeps its flag.
+void CheckDiscardScan() {
+  using Flags = std::array<std::int32_t, 6>;
+  const auto run = [](Flags flags, std::array<std::int32_t, 6> argmax,
+                      std::array<std::int32_t, 6> next, Flags* after) {
+    const auto cleared = qfn::HeadTrimDiscardScan(flags, argmax, next);
+    *after = flags;
+    return cleared;
+  };
+  Flags after{};
+  // All drafts match: nothing is discarded.
+  Require(run({0, 1, 0, 1, 0, 1}, {5, 6, 7, 8, 9, 10}, {5, 6, 7, 8, 9, 10},
+              &after) == 0 &&
+              after == Flags{0, 1, 0, 1, 0, 1},
+          "a chain that is all accepted keeps its flags");
+  // Row 1 is unflagged and rejected: flags after it go, its own stays.
+  Require(run({1, 0, 1, 1, 0, 1}, {5, 6, 7, 8, 9, 10}, {5, 99, 7, 8, 9, 10},
+              &after) == 3 &&
+              after == Flags{1, 0, 0, 0, 0, 0},
+          "rows after an unflagged rejection lose their flags");
+  Require(run({0, 1, 1, 0, 0, 1}, {5, 6, 7, 8, 9, 10}, {99, 6, 7, 8, 9, 10},
+              &after) == 3 &&
+              after == Flags{0, 0, 0, 0, 0, 0},
+          "a rejection at the first row clears everything after it");
+  // A flagged row that disagrees with its draft is uncertain: nothing ends.
+  Require(run({1, 1, 0, 1, 0, 1}, {99, 99, 7, 8, 9, 10}, {5, 6, 7, 8, 9, 10},
+              &after) == 0 &&
+              after == Flags{1, 1, 0, 1, 0, 1},
+          "a flagged row never ends the chain");
+  // The first UNFLAGGED mismatch counts, even after flagged ones.
+  Require(run({1, 0, 0, 1, 1, 0}, {99, 6, 99, 8, 9, 10}, {5, 6, 7, 8, 9, 10},
+              &after) == 2 &&
+              after == Flags{1, 0, 0, 0, 0, 0},
+          "the first unflagged mismatch decides");
+  // No argmax (-1) is not a mismatch we can trust; the last row has no draft.
+  Require(run({0, 1, 0, 0, 0, 1}, {-1, 6, 7, 8, 9, 99}, {5, 6, 7, 8, 9, 10},
+              &after) == 0 &&
+              after == Flags{0, 1, 0, 0, 0, 1},
+          "an unknown argmax and the last row discard nothing");
 }
 
 // The fallback's measurement counters: fixed-point mass to a double,
@@ -235,6 +284,7 @@ int main() {
     CheckExpand();
     CheckStats();
     CheckTiming();
+    CheckDiscardScan();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

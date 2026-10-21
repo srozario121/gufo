@@ -62,6 +62,9 @@ struct TextSpeculativeConfig {
   bool head_trim_timing{false};
   /// Count what the fallback buys (--vocab-trim-counters; measurement only).
   bool head_trim_counters{false};
+  /// Skip full-head reads of chain rows that cannot be used
+  /// (--vocab-trim-discard-aware).
+  bool head_trim_discard_aware{false};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };

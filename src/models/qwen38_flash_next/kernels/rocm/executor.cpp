@@ -1208,6 +1208,23 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       if (e->head_ctr_ == nullptr || e->head_rowinfo_ == nullptr)
         return nullptr;
     }
+    if (trim->discard_aware) {
+      e->head_argmax_ = Alloc<std::int32_t>(a, head_rows, error_msg);
+      e->head_defer_ = Alloc<std::int32_t>(a, head_rows, error_msg);
+      void* defer_host = nullptr;
+      void* flags_host = nullptr;
+      if (e->head_argmax_ == nullptr || e->head_defer_ == nullptr ||
+          !Check(e->host_allocations_.Allocate(
+                     &defer_host, head_rows * sizeof(std::int32_t)),
+                 "pinned deferred head flags", error_msg) ||
+          !Check(e->host_allocations_.Allocate(
+                     &flags_host, head_rows * sizeof(std::int32_t)),
+                 "pinned head flags", error_msg))
+        return nullptr;
+      e->head_defer_host_ = static_cast<std::int32_t*>(defer_host);
+      e->head_flags_host_ = static_cast<std::int32_t*>(flags_host);
+      std::fill_n(e->head_defer_host_, head_rows, 0);
+    }
     e->head_quantized_ = Alloc<std::uint8_t>(
         a, std::size_t{head_rows} * (trim->head.cols / 32) * 36, error_msg);
     if (e->head_compact_ == nullptr || e->head_flags_ == nullptr ||
@@ -1500,8 +1517,8 @@ void Executor::MaskSuppressed(float* logits, std::uint32_t n,
 }
 
 bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
-                           bool batch, bool fallback,
-                           std::string* error_msg) const {
+                           bool batch, bool fallback, std::string* error_msg,
+                           const HeadChains* chains) const {
   const auto& full = model_->output();
   const auto* trim = model_->head_trim();
   if (trim == nullptr)
@@ -1516,6 +1533,12 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
   // captured graphs; none is launched unless --vocab-trim-timing is on.
   const bool timed = head_timing_ != nullptr;
   const bool with_fallback = fallback && trim->threshold > 0.0F;
+  // A chain mode other than "read now" needs the argmax of each row and the
+  // chain's policy kernel (--vocab-trim-discard-aware).
+  bool chained = false;
+  if (with_fallback && chains != nullptr && head_argmax_ != nullptr)
+    for (std::uint32_t b = 0; b < chains->count; ++b)
+      chained = chained || chains->mode[b] != kHeadChainInline;
   if (timed) {
     HeadTimingStamp(head_timing_, 0, stream_);
     HeadTimingStamp(head_timing_, 4, stream_);
@@ -1531,12 +1554,16 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
     if (timed)
       HeadTimingStamp(head_timing_, 2, stream_);
     HeadConfidence(head_compact_, rows, trim->scored, trim->head.rows,
-                   trim->threshold, head_flags_, head_counters_, stream_);
+                   trim->threshold, head_flags_, head_counters_, stream_,
+                   chained ? trim->ids : nullptr,
+                   chained ? head_argmax_ : nullptr);
+    if (chained) {
+      HeadChainPolicy(*chains, head_argmax_, head_flags_, head_defer_, rows,
+                      head_timing_, stream_);
+    }
     if (timed)
       HeadTimingStamp(head_timing_, 3, stream_);
-    FullHeadFallback(full.data, model_->output_row_bytes(), full.cols, vocab, x,
-                     head_flags_, rows, out, head_counters_, head_quantized_,
-                     stream_);
+    HeadFallbackPass(x, out, rows);
   }
   if (timed)
     HeadTimingFinish(head_timing_, head_flags_, rows, with_fallback, stream_);
@@ -1546,6 +1573,84 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
                      out, vocab, trim->inverse, head_flags_, head_rowinfo_,
                      rows, head_ctr_, stream_);
   return Check(hipGetLastError(), "trimmed head", error_msg);
+}
+
+void Executor::HeadFallbackPass(const float* x, float* out,
+                                std::uint32_t rows) const {
+  const auto& full = model_->output();
+  FullHeadFallback(full.data, model_->output_row_bytes(), full.cols, full.rows,
+                   x, head_flags_, rows, out, head_counters_, head_quantized_,
+                   stream_);
+}
+
+bool Executor::ResolveDeferredHeadRows(std::uint32_t from, std::uint32_t rows,
+                                       float* host_rows,
+                                       std::string* error_msg) const {
+  const auto* trim = model_->head_trim();
+  if (trim == nullptr || head_defer_host_ == nullptr || !head_lazy_ ||
+      from >= rows)
+    return true;
+  const std::uint32_t vocab = config().vocab_size;
+  // This session's chain starts where SelectBatchLogits put it.
+  const std::uint32_t first =
+      selected_logits_ != nullptr && batch_logits_ != nullptr
+          ? static_cast<std::uint32_t>((selected_logits_ - batch_logits_) /
+                                       vocab)
+          : 0;
+  if (first + rows > head_last_rows_) {
+    AssignError(error_msg, "deferred head rows outside the last head call");
+    return false;
+  }
+  // Only a deferred row the loop has reached starts a pass; the other rows of
+  // the chain may never be reached.
+  if (head_defer_host_[first + from] == 0)
+    return true;
+  std::uint32_t wanted[kHeadTrimMaxRows];
+  std::uint32_t count = 0;
+  std::fill_n(head_flags_host_, head_last_rows_, 0);
+  for (std::uint32_t j = from; j < rows; ++j) {
+    if (head_defer_host_[first + j] == 0)
+      continue;
+    head_flags_host_[first + j] = 1;
+    wanted[count++] = j;
+  }
+  if (count == 0)
+    return true;
+  const bool timed = head_timing_ != nullptr;
+  if (!Check(hipMemcpyAsync(head_flags_, head_flags_host_,
+                            head_last_rows_ * sizeof(std::int32_t),
+                            hipMemcpyHostToDevice, stream_),
+             "deferred head flags", error_msg))
+    return false;
+  if (timed)
+    HeadTimingStamp(head_timing_, 3, stream_);
+  HeadFallbackPass(head_last_x_, head_last_out_, head_last_rows_);
+  if (timed)
+    HeadTimingFinish(head_timing_, head_flags_, head_last_rows_, true, stream_,
+                     true);
+  if (head_ctr_ != nullptr)
+    HeadCountFlagged(head_compact_, trim->head.rows, trim->scored, trim->ids,
+                     head_last_out_, config().vocab_size, trim->inverse,
+                     head_flags_, head_rowinfo_, head_last_rows_, head_ctr_,
+                     stream_);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (!Check(hipMemcpyAsync(
+                   logits_host_ + std::size_t{i} * vocab,
+                   head_last_out_ + std::size_t{first + wanted[i]} * vocab,
+                   std::size_t{vocab} * sizeof(float), hipMemcpyDeviceToHost,
+                   stream_),
+               "deferred head rows", error_msg))
+      return false;
+  }
+  if (!Check(hipGetLastError(), "deferred head pass", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "deferred head pass", error_msg))
+    return false;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    std::copy_n(logits_host_ + std::size_t{i} * vocab, vocab,
+                host_rows + std::size_t{wanted[i]} * vocab);
+    head_defer_host_[first + wanted[i]] = 0;
+  }
+  return true;
 }
 
 void Executor::RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const {
@@ -3173,7 +3278,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
-                       std::span<const std::int32_t> next) const {
+                       std::span<const std::int32_t> next,
+                       std::uint32_t head_mode) const {
   // Only this call's PLE layer may start the prefetch of `next`.
   struct NextHint {
     std::span<const std::int32_t>& hint;
@@ -3183,6 +3289,16 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     prefetch_next_ = next;
   }
   const bool speculative = mode == ForwardMode::kVerify;
+  // Only a verification chain with several logit rows has rows to discard or
+  // defer, and only when the flag is on.
+  if (!speculative || head_argmax_ == nullptr || n_logits < 2 ||
+      head_mode > kHeadChainLazy)
+    head_mode = kHeadChainInline;
+  // A deferred pass later needs this call's head input and output.
+  head_lazy_ = head_mode == kHeadChainLazy;
+  head_last_x_ = s_.mixed;
+  head_last_out_ = s_.logits;
+  head_last_rows_ = n_logits;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
   DropReadyQ8();
@@ -3292,7 +3408,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{head_mode} << 36);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -3311,7 +3428,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
                        sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg, checkpoint, graph);
+                       first_layer, c.num_layers, error_msg, checkpoint, graph,
+                       head_mode);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
@@ -3349,8 +3467,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t start_pos, std::uint32_t pool_grid,
                            std::uint32_t first_layer, std::uint32_t end_layer,
                            std::string* error_msg,
-                           PrefillCheckpoint* checkpoint,
-                           bool embeddings_ready) const {
+                           PrefillCheckpoint* checkpoint, bool embeddings_ready,
+                           std::uint32_t head_mode) const {
   const Config& c = config();
   if (first_layer == 0) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
@@ -3505,9 +3623,28 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
     const DeviceMixer& head = model_->hc_head();
+    HeadChains chains;
+    if (head_mode != kHeadChainInline) {
+      chains.count = 1;
+      chains.first[0] = 0;
+      chains.rows[0] = n_logits;
+      chains.mode[0] = head_mode;
+      // Row j of the logits is the input token skip + j; the next token is
+      // the draft it is judged against.
+      chains.tokens = s_.tokens + skip;
+    }
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg) ||
-        !HeadProject(s_.mixed, s_.logits, n_logits, false, true, error_msg)) {
+        !HeadProject(s_.mixed, s_.logits, n_logits, false, true, error_msg,
+                     &chains)) {
+      return false;
+    }
+    if (head_mode == kHeadChainLazy && download_logits &&
+        !Check(hipMemcpyAsync(
+                   head_defer_host_, head_defer_,
+                   static_cast<std::size_t>(n_logits) * sizeof(std::int32_t),
+                   hipMemcpyDeviceToHost, stream_),
+               "deferred head flags download", error_msg)) {
       return false;
     }
     if (download_logits &&
