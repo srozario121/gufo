@@ -247,6 +247,13 @@ public:
   /// The trimmed head's device-side phase times (zero unless timing is on).
   /// Waits for the stream.
   [[nodiscard]] HeadTimingStats HeadTimingStatistics() const;
+  /// The fallback's measurement counters (zero unless counters are on).
+  /// Waits for the stream.
+  [[nodiscard]] HeadCounterStats HeadCounterStatistics() const;
+  /// Records one verification round for the counters: the chain of `rows`
+  /// rows whose head call was the latest one, of which `keep` positions were
+  /// kept. Stream-ordered, no host wait; a no-op unless counters are on.
+  void RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const;
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
@@ -775,6 +782,10 @@ private:
   /// null unless the head's timing is on. `head_ns_per_tick_` is the clock's.
   unsigned long long* head_timing_{nullptr};
   double head_ns_per_tick_{0.0};
+  /// Fallback counters (HeadCounterStats::kCounterCount) and one word per row
+  /// saying whether the argmax changed; null unless counters are on.
+  unsigned long long* head_ctr_{nullptr};
+  std::int32_t* head_rowinfo_{nullptr};
   void* head_quantized_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};

@@ -1185,6 +1185,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       if (e->head_timing_ == nullptr)
         return nullptr;
     }
+    if (trim->counters) {
+      e->head_ctr_ = Alloc<unsigned long long>(
+          a, HeadCounterStats::kCounterCount, error_msg);
+      e->head_rowinfo_ = Alloc<std::int32_t>(a, head_rows, error_msg);
+      if (e->head_ctr_ == nullptr || e->head_rowinfo_ == nullptr)
+        return nullptr;
+    }
     e->head_quantized_ = Alloc<std::uint8_t>(
         a, std::size_t{head_rows} * (trim->head.cols / 32) * 36, error_msg);
     if (e->head_compact_ == nullptr || e->head_flags_ == nullptr ||
@@ -1496,7 +1503,39 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
   }
   if (timed)
     HeadTimingFinish(head_timing_, head_flags_, rows, with_fallback, stream_);
+  // After the timing finish, so the counters' own kernel is not in phase d.
+  if (head_ctr_ != nullptr && with_fallback)
+    HeadCountFlagged(head_compact_, trim->head.rows, trim->scored, trim->ids,
+                     out, vocab, trim->inverse, head_flags_, head_rowinfo_,
+                     rows, head_ctr_, stream_);
   return Check(hipGetLastError(), "trimmed head", error_msg);
+}
+
+void Executor::RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const {
+  if (head_ctr_ == nullptr || rows == 0)
+    return;
+  // A batched decode's head call carried every session's rows; this session's
+  // chain starts where SelectBatchLogits put it.
+  const std::uint32_t first =
+      selected_logits_ != nullptr && batch_logits_ != nullptr
+          ? static_cast<std::uint32_t>((selected_logits_ - batch_logits_) /
+                                       config().vocab_size)
+          : 0;
+  if (first + rows > kHeadTrimMaxRows)
+    return;
+  HeadRecordChain(head_flags_, head_rowinfo_, first, rows, keep, head_ctr_,
+                  stream_);
+}
+
+HeadCounterStats Executor::HeadCounterStatistics() const {
+  if (head_ctr_ == nullptr)
+    return {};
+  unsigned long long counters[HeadCounterStats::kCounterCount]{};
+  if (hipMemcpyAsync(counters, head_ctr_, sizeof(counters),
+                     hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+      hipStreamSynchronize(stream_) != hipSuccess)
+    return {};
+  return HeadCounterStats::FromCounters(counters);
 }
 
 HeadTrimStats Executor::HeadStatistics() const {

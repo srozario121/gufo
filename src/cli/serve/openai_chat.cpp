@@ -2123,6 +2123,12 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
     result.head_trim_timing.ForEachField([&](const char* name, double value) {
       metrics[std::string("head_trim_t_") + name] = value;
     });
+  // --vocab-trim-counters: what the fallback bought (HeadCounterStats).
+  if (result.head_trim_counters.flagged > 0 ||
+      result.head_trim_counters.chains > 0)
+    result.head_trim_counters.ForEachField([&](const char* name, double value) {
+      metrics[std::string("head_trim_ctr_") + name] = value;
+    });
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

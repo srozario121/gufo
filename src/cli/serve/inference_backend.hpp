@@ -60,6 +60,8 @@ struct TextSpeculativeConfig {
   float head_trim_threshold{0.5F};
   /// Time the trimmed head's phases on the device (--vocab-trim-timing).
   bool head_trim_timing{false};
+  /// Count what the fallback buys (--vocab-trim-counters; measurement only).
+  bool head_trim_counters{false};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };

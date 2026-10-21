@@ -179,8 +179,55 @@ void CheckTiming() {
           "fields are reported in microseconds");
 }
 
+// The fallback's measurement counters: fixed-point mass to a double,
+// differences, sums and the reported field names.
+void CheckCounters() {
+  unsigned long long c[qfn::HeadCounterStats::kCounterCount]{};
+  c[0] = 10;
+  c[1] = 3;
+  c[2] = 3ULL << 31;  // 1.5 in 2^-32 units
+  c[3] = 4;
+  c[4] = 2;
+  c[5] = 7;
+  c[6] = 40;
+  c[7] = 9;
+  c[8] = 5;
+  c[9] = 1;
+  c[10] = 2;
+  const auto s = qfn::HeadCounterStats::FromCounters(c);
+  Require(s.flagged == 10 && s.argmax_changed == 3 && s.mass_sum == 1.5 &&
+              s.mass_over_005 == 4 && s.mass_over_02 == 2 && s.chains == 7 &&
+              s.chain_rows == 40 && s.chain_flagged == 9 &&
+              s.discarded_flagged == 5 && s.used_changed == 1 &&
+              s.discarded_changed == 2,
+          "counters convert");
+  auto sum = s;
+  sum += s;
+  Require(
+      sum.flagged == 20 && sum.mass_sum == 3.0 && sum.discarded_flagged == 10,
+      "readings add");
+  const auto delta = sum.Since(s);
+  Require(delta.flagged == 10 && delta.mass_sum == 1.5 &&
+              delta.discarded_changed == 2,
+          "a later reading minus an earlier one");
+  std::size_t fields = 0;
+  double mass = -1;
+  double over = -1;
+  s.ForEachField([&](const char* name, double value) {
+    ++fields;
+    if (std::string_view(name) == "mass_sum")
+      mass = value;
+    if (std::string_view(name) == "mass_over_0p05")
+      over = value;
+  });
+  Require(fields == qfn::HeadCounterStats::kCounterCount && mass == 1.5 &&
+              over == 4,
+          "one reported field per counter");
+}
+
 int main() {
   try {
+    CheckCounters();
     CheckPlan();
     CheckEmpty();
     CheckTopProbability();

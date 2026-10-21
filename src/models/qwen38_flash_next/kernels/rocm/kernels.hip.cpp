@@ -8099,6 +8099,154 @@ void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
                      timing, flags, rows, fallback ? 1 : 0);
 }
 
+// ---- Measurement counters of the fallback ----
+
+// Counter layout (head_trim.hpp, HeadCounterStats::kCounterCount):
+// 0 flagged, 1 argmax changed, 2 mass (fixed point 2^-32), 3 mass > 0.05,
+// 4 mass > 0.2, 5 chains, 6 chain rows, 7 chain flagged, 8 discarded flagged,
+// 9 used changed, 10 discarded changed.
+//
+// Argmax: the largest value, the lowest index among equals (a NaN never wins).
+__device__ inline void ArgmaxMerge(float& value, std::int32_t& index,
+                                   float other_value,
+                                   std::int32_t other_index) {
+  if (other_value > value || (other_value == value && other_index < index)) {
+    value = other_value;
+    index = other_index;
+  }
+}
+
+__global__ void HeadCountFlaggedKernel(
+    const float* compact, std::uint32_t stride, std::uint32_t scored,
+    const std::int32_t* ids, const float* out, std::uint32_t vocab,
+    const std::int32_t* inverse, const std::int32_t* flags,
+    std::int32_t* rowinfo, unsigned long long* counters) {
+  const std::uint32_t r = blockIdx.x;
+  if (flags[r] == 0) {
+    if (threadIdx.x == 0)
+      rowinfo[r] = 0;
+    return;
+  }
+  __shared__ float shared_value[kThreads];
+  __shared__ std::int32_t shared_index[kThreads];
+  const float* crow = compact + static_cast<std::size_t>(r) * stride;
+  const float* frow = out + static_cast<std::size_t>(r) * vocab;
+  constexpr std::int32_t kNone = 0x7fffffff;
+  const auto block_argmax = [&](const float* row, std::uint32_t n, float& best,
+                                std::int32_t& best_index) {
+    float value = -INFINITY;
+    std::int32_t index = kNone;
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+      ArgmaxMerge(value, index, row[i], static_cast<std::int32_t>(i));
+    shared_value[threadIdx.x] = value;
+    shared_index[threadIdx.x] = index;
+    __syncthreads();
+    for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+      if (threadIdx.x < step)
+        ArgmaxMerge(shared_value[threadIdx.x], shared_index[threadIdx.x],
+                    shared_value[threadIdx.x + step],
+                    shared_index[threadIdx.x + step]);
+      __syncthreads();
+    }
+    best = shared_value[0];
+    best_index = shared_index[0];
+    __syncthreads();
+  };
+  float scored_value = 0.0F;
+  float full_value = 0.0F;
+  std::int32_t scored_index = kNone;
+  std::int32_t full_index = kNone;
+  block_argmax(crow, scored, scored_value, scored_index);
+  block_argmax(frow, vocab, full_value, full_index);
+  // Softmax mass of the unscored tokens at temperature 1.
+  const float maximum = full_value;
+  float all = 0.0F;
+  float unscored = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const float e = expf(frow[i] - maximum);
+    all += e;
+    if (inverse[i] < 0)
+      unscored += e;
+  }
+  shared_value[threadIdx.x] = all;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared_value[threadIdx.x] += shared_value[threadIdx.x + step];
+    __syncthreads();
+  }
+  const float total = shared_value[0];
+  __syncthreads();
+  shared_value[threadIdx.x] = unscored;
+  __syncthreads();
+  for (unsigned step = kThreads / 2; step > 0; step >>= 1) {
+    if (threadIdx.x < step)
+      shared_value[threadIdx.x] += shared_value[threadIdx.x + step];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const std::int32_t scored_token =
+        scored_index == kNone ? -1 : ids[scored_index];
+    const bool changed = scored_token != full_index;
+    const float mass = shared_value[0] / total;
+    rowinfo[r] = changed ? 1 : 0;
+    atomicAdd(&counters[0], 1ULL);
+    if (changed)
+      atomicAdd(&counters[1], 1ULL);
+    if (mass >= 0.0F && mass <= 1.0F) {
+      atomicAdd(&counters[2], static_cast<unsigned long long>(
+                                  static_cast<double>(mass) * 4294967296.0));
+      if (mass > 0.05F)
+        atomicAdd(&counters[3], 1ULL);
+      if (mass > 0.2F)
+        atomicAdd(&counters[4], 1ULL);
+    }
+  }
+}
+
+void HeadCountFlagged(const float* compact, std::uint32_t stride,
+                      std::uint32_t scored, const std::int32_t* ids,
+                      const float* out, std::uint32_t vocab,
+                      const std::int32_t* inverse, const std::int32_t* flags,
+                      std::int32_t* rowinfo, std::uint32_t rows,
+                      unsigned long long* counters, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadCountFlaggedKernel, dim3(rows), dim3(kThreads), 0,
+                     stream, compact, stride, scored, ids, out, vocab, inverse,
+                     flags, rowinfo, counters);
+}
+
+__global__ void HeadRecordChainKernel(const std::int32_t* flags,
+                                      const std::int32_t* rowinfo,
+                                      std::uint32_t first, std::uint32_t rows,
+                                      std::uint32_t keep,
+                                      unsigned long long* counters) {
+  if (threadIdx.x != 0)
+    return;
+  atomicAdd(&counters[5], 1ULL);
+  atomicAdd(&counters[6], static_cast<unsigned long long>(rows));
+  for (std::uint32_t r = 0; r < rows; ++r) {
+    if (flags[first + r] == 0)
+      continue;
+    const bool changed = rowinfo[first + r] != 0;
+    atomicAdd(&counters[7], 1ULL);
+    if (r >= keep) {
+      atomicAdd(&counters[8], 1ULL);
+      if (changed)
+        atomicAdd(&counters[10], 1ULL);
+    } else if (changed) {
+      atomicAdd(&counters[9], 1ULL);
+    }
+  }
+}
+
+void HeadRecordChain(const std::int32_t* flags, const std::int32_t* rowinfo,
+                     std::uint32_t first, std::uint32_t rows,
+                     std::uint32_t keep, unsigned long long* counters,
+                     hipStream_t stream) {
+  hipLaunchKernelGGL(HeadRecordChainKernel, dim3(1), dim3(1), 0, stream, flags,
+                     rowinfo, first, rows, keep, counters);
+}
+
 // ---- Draft head on the compact rows ----
 
 __global__ void MaskSuppressedCompactKernel(float* logits,

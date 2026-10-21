@@ -652,6 +652,28 @@ void HeadTimingStamp(unsigned long long* timing, std::uint32_t slot,
 void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
                       std::uint32_t rows, bool fallback, hipStream_t stream);
 
+/// Measurement counters for the fallback (--vocab-trim-counters;
+/// HeadCounterStats). For each row with flags[r] != 0, after the fallback has
+/// replaced `out` row r (`vocab` logits): whether the argmax over the full row
+/// differs from the argmax over the first `scored` compact logits of that row
+/// (`ids` maps a compact row to its token), the softmax mass of the tokens with
+/// inverse[id] < 0, and the thresholds that mass passes. rowinfo[r] = 1 when
+/// the argmax changed, else 0. counters[0..4] are added to.
+void HeadCountFlagged(const float* compact, std::uint32_t stride,
+                      std::uint32_t scored, const std::int32_t* ids,
+                      const float* out, std::uint32_t vocab,
+                      const std::int32_t* inverse, const std::int32_t* flags,
+                      std::int32_t* rowinfo, std::uint32_t rows,
+                      unsigned long long* counters, hipStream_t stream);
+
+/// One verification round (a chain of `rows` rows starting at row `first` of
+/// the last head call): of the flagged rows, how many sit at or past the
+/// `keep` kept positions. counters[5..10] are added to.
+void HeadRecordChain(const std::int32_t* flags, const std::int32_t* rowinfo,
+                     std::uint32_t first, std::uint32_t rows,
+                     std::uint32_t keep, unsigned long long* counters,
+                     hipStream_t stream);
+
 /// The draft head over compact rows: sets logits[r * stride + i] to
 /// -infinity where flags[ids[i]] != 0, for i < n and r < rows (the compact
 /// form of MaskSuppressedLogits).

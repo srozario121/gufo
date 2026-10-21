@@ -601,6 +601,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string vocab_trim_set;
     double vocab_trim_fallback_threshold = 0.5;
     bool vocab_trim_timing = false;
+    bool vocab_trim_counters = false;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -722,6 +723,13 @@ void PrintServeHelp(std::string_view program_name,
                    "on the device and report them in the usage gufo object "
                    "(head_trim_t_*) and the generation log (default: off)",
                    "Speculative", &vocab_trim_timing);
+    parser.AddFlag("", "--vocab-trim-counters",
+                   "With --vocab-trim-set: count what the full-head fallback "
+                   "buys (rows whose argmax it changes, the unscored "
+                   "probability mass, rows past the accepted prefix) and "
+                   "report it in the usage gufo object (head_trim_ctr_*) and "
+                   "the generation log; measurement only (default: off)",
+                   "Speculative", &vocab_trim_counters);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1198,6 +1206,7 @@ int RunServe(std::span<const char* const> args) {
     std::string vocab_trim_set;
     double vocab_trim_fallback_threshold = 0.5;
     bool vocab_trim_timing = false;
+    bool vocab_trim_counters = false;
     std::string vision_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
@@ -1320,6 +1329,14 @@ int RunServe(std::span<const char* const> args) {
         "device and report them in the usage gufo object (head_trim_t_*) and "
         "the generation log (default: off)",
         "Speculative", &vocab_trim_timing);
+    llm_parser.AddFlag(
+        "", "--vocab-trim-counters",
+        "With --vocab-trim-set: count what the full-head fallback buys (rows "
+        "whose argmax it changes, the unscored probability mass, rows past "
+        "the accepted prefix) and report it in the usage gufo object "
+        "(head_trim_ctr_*) and the generation log; measurement only "
+        "(default: off)",
+        "Speculative", &vocab_trim_counters);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1529,19 +1546,22 @@ int RunServe(std::span<const char* const> args) {
         vocab_trim_fallback_threshold < 0.0 ||
         vocab_trim_fallback_threshold > 1.0 ||
         (vocab_trim_timing && vocab_trim_set.empty()) ||
+        (vocab_trim_counters && vocab_trim_set.empty()) ||
         (!vocab_trim_set.empty() &&
          (speculative_config.backend != server::TextSpeculativeBackend::kMtp ||
           mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()))) {
       std::cerr << "Error: --vocab-trim-set needs --speculative mtp "
                    "(Qwen3.8-Flash-Next) and excludes --mtp-draft-vocab-prefix "
                    "and --mtp-draft-vocab-set; --vocab-trim-fallback-threshold "
-                   "is in [0, 1]; --vocab-trim-timing needs --vocab-trim-set\n";
+                   "is in [0, 1]; --vocab-trim-timing and "
+                   "--vocab-trim-counters need --vocab-trim-set\n";
       return 2;
     }
     speculative_config.head_trim_set = vocab_trim_set;
     speculative_config.head_trim_threshold =
         static_cast<float>(vocab_trim_fallback_threshold);
     speculative_config.head_trim_timing = vocab_trim_timing;
+    speculative_config.head_trim_counters = vocab_trim_counters;
     speculative_config.logit_bias = logit_bias;
     speculative_config.suppress_nonascii_keep = suppress_nonascii_keep;
     speculative_config.suppress_nonascii_value =
