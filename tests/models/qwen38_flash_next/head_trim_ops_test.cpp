@@ -614,7 +614,7 @@ void CheckTimingTier2() {
 // confidence over the union scored set ----
 void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
                     std::uint32_t tier2_rows, float threshold,
-                    std::uint32_t seed) {
+                    std::uint32_t seed, bool skip_scored = false) {
   constexpr std::uint32_t kRows = 6;
   Rng rng{seed};
   const std::uint32_t blocks = cols / 32;
@@ -685,11 +685,18 @@ void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
                       d_flags.get(), kRows, d_ref.get(), d_ref_counters.get(),
                       d_ref_scratch.get(), nullptr);
   // The tiers.
+  // With skip-scored the passes read only the unscored head rows, so the
+  // second tier's range is the unscored tokens below tier2_rows.
+  const auto unscored = qfn::HeadTrimUnscoredIds(inverse);
+  auto d_unscored = Upload(unscored);
+  const std::int32_t* list = skip_scored ? d_unscored.get() : nullptr;
+  const std::uint32_t below = skip_scored ? tier2_rows - tail : tier2_rows;
+  const std::uint32_t total =
+      skip_scored ? static_cast<std::uint32_t>(unscored.size()) : vocab;
   q::FullHeadQuantize(d_x.get(), d_flags.get(), cols, kRows, d_scratch.get(),
                       nullptr);
-  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, 0, tier2_rows,
-                  d_flags.get(), kRows, d_out.get(), nullptr, d_scratch.get(),
-                  nullptr);
+  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, 0, below, d_flags.get(),
+                  kRows, d_out.get(), nullptr, d_scratch.get(), nullptr, list);
   q::HeadTier2Confidence(d_out.get(), vocab, d_compact.get(), stride, tail,
                          scored, tier2_rows, threshold, d_flags.get(),
                          d_flags2.get(), kRows, nullptr);
@@ -713,9 +720,9 @@ void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
   if (threshold == 0.5F)
     Expect(escalated >= 1 && escalated < 4,
            "the test rows exercise both outcomes of the second tier");
-  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, tier2_rows, vocab,
+  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, below, total,
                   d_flags2.get(), kRows, d_out.get(), d_counters.get(),
-                  d_scratch.get(), nullptr);
+                  d_scratch.get(), nullptr, list);
   CheckHip(hipDeviceSynchronize(), "escalation");
   const auto actual = Download(d_out.get(), expanded.size());
   const auto reference = Download(d_ref.get(), expanded.size());
@@ -726,7 +733,8 @@ void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
       // flagged row that stopped keeps the tier's values below tier2_rows and
       // its expanded compact values above; a row that was not flagged is
       // untouched.
-      const float want = expected2[r] != 0                     ? reference[i]
+      const float want = skip_scored && inverse[id] >= 0       ? expanded[i]
+                         : expected2[r] != 0                   ? reference[i]
                          : flags_in[r] != 0 && id < tier2_rows ? reference[i]
                                                                : expanded[i];
       Expect(std::bit_cast<std::uint32_t>(actual[i]) ==
@@ -736,6 +744,78 @@ void CheckTier2Read(std::uint32_t cols, std::uint32_t vocab,
   const auto counters = Download(d_counters.get(), 3);
   Expect(counters[2] == (escalated != 0 ? 1U : 0U),
          "one full-matrix pass only when a row escalates");
+}
+
+// ---- Skipping the scored rows: one pass over the unscored head rows only;
+// the scored tokens keep their compact values ----
+void CheckSkipScored(std::uint32_t cols, std::uint32_t vocab,
+                     std::uint32_t seed) {
+  constexpr std::uint32_t kRows = 4;
+  Rng rng{seed};
+  const std::uint32_t blocks = cols / 32;
+  const std::size_t row_bytes = std::size_t{blocks} * 34;
+  std::vector<std::uint8_t> weights(row_bytes * vocab);
+  for (auto& byte : weights)
+    byte = static_cast<std::uint8_t>(rng.Next() & 0x7FU);
+  for (std::uint32_t v = 0; v < vocab; ++v)
+    for (std::uint32_t j = 0; j < blocks; ++j) {
+      const __half d = __float2half(
+          0.001F + static_cast<float>(rng.Next() % 1000) / 200000.0F);
+      std::memcpy(weights.data() + v * row_bytes + j * 34, &d, 2);
+    }
+  std::vector<float> x(std::size_t{kRows} * cols);
+  for (auto& value : x)
+    value = static_cast<float>(static_cast<int>(rng.Next() & 0xFFFFU) - 32768) /
+            32768.0F;
+  std::vector<std::int32_t> inverse(vocab, -1);
+  std::int32_t n = 0;
+  for (std::uint32_t id = 0; id < vocab; ++id)
+    if (rng.Next() % 5 == 0)
+      inverse[id] = n++;
+  const auto unscored = qfn::HeadTrimUnscoredIds(inverse);
+  Expect(unscored.size() + static_cast<std::size_t>(n) == vocab,
+         "scored and unscored partition the vocabulary");
+  const std::vector<float> sentinel(std::size_t{kRows} * vocab, 7.5F);
+  const std::vector<std::int32_t> flags = {1, 0, 1, 1};
+  auto d_w = Upload(weights);
+  auto d_x = Upload(x);
+  auto d_flags = Upload(flags);
+  auto d_list = Upload(unscored);
+  auto d_out = Upload(sentinel);
+  auto d_ref = Upload(sentinel);
+  auto d_counters = Allocate<unsigned long long>(3);
+  auto d_ref_counters = Allocate<unsigned long long>(3);
+  CheckHip(hipMemset(d_counters.get(), 0, 3 * sizeof(unsigned long long)),
+           "counters");
+  CheckHip(hipMemset(d_ref_counters.get(), 0, 3 * sizeof(unsigned long long)),
+           "counters");
+  auto d_scratch = Allocate<std::uint8_t>(std::size_t{kRows} * blocks * 36);
+  auto d_ref_scratch = Allocate<std::uint8_t>(std::size_t{kRows} * blocks * 36);
+  q::FullHeadFallback(d_w.get(), row_bytes, cols, vocab, d_x.get(),
+                      d_flags.get(), kRows, d_ref.get(), d_ref_counters.get(),
+                      d_ref_scratch.get(), nullptr);
+  q::FullHeadQuantize(d_x.get(), d_flags.get(), cols, kRows, d_scratch.get(),
+                      nullptr);
+  q::FullHeadRead(d_w.get(), row_bytes, cols, vocab, 0,
+                  static_cast<std::uint32_t>(unscored.size()), d_flags.get(),
+                  kRows, d_out.get(), d_counters.get(), d_scratch.get(),
+                  nullptr, d_list.get());
+  CheckHip(hipDeviceSynchronize(), "skip-scored");
+  const auto actual = Download(d_out.get(), sentinel.size());
+  const auto reference = Download(d_ref.get(), sentinel.size());
+  for (std::uint32_t r = 0; r < kRows; ++r)
+    for (std::uint32_t id = 0; id < vocab; ++id) {
+      const auto i = std::size_t{r} * vocab + id;
+      // Unscored tokens of a flagged row: the full pass' bits; everything
+      // else: untouched.
+      const float want =
+          flags[r] != 0 && inverse[id] < 0 ? reference[i] : sentinel[i];
+      Expect(std::bit_cast<std::uint32_t>(actual[i]) ==
+                 std::bit_cast<std::uint32_t>(want),
+             "skip-scored row " + std::to_string(r) + " token " +
+                 std::to_string(id));
+    }
+  Expect(Download(d_counters.get(), 3)[2] == 1, "one pass");
 }
 
 // ---- Discard-aware flagging: the argmax of HeadConfidence and the chain
@@ -899,6 +979,11 @@ int main() {
     CheckTier2Read(1056, 517, 100, 0.5F, 32);
     CheckTier2Read(1056, 517, 100, 0.0001F, 33);  // nothing escalates
     CheckTier2Read(96, 1003, 300, 1.0F, 34);      // flat rows escalate
+    CheckTier2Read(96, 1003, 300, 0.5F, 35, true);
+    CheckTier2Read(1056, 517, 100, 0.5F, 36, true);
+    CheckTier2Read(1056, 517, 100, 0.0001F, 37, true);
+    CheckSkipScored(96, 1003, 41);
+    CheckSkipScored(1056, 2049, 42);
     CheckChainPolicy({2}, 21);     // an unflagged rejection ends the chain
     CheckChainPolicy({1, 3}, 22);  // flagged rejections are uncertain
     CheckChainPolicy({0}, 23);     // a rejection at the first row

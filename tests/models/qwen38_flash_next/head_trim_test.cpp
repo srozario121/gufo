@@ -266,6 +266,17 @@ void CheckTier2() {
           "a NaN logit escalates");
 }
 
+// The unscored ids of the skip-scored pass: the complement of the compact set.
+void CheckUnscored() {
+  const auto plan = qfn::PlanHeadTrim(10, std::vector<std::int32_t>{1, 4, 5, 9},
+                                      std::vector<std::int32_t>{0});
+  const auto unscored = qfn::HeadTrimUnscoredIds(plan.inverse);
+  const std::vector<std::int32_t> want{2, 3, 6, 7, 8};
+  Require(unscored == want, "the unscored ids are the set's complement");
+  Require(unscored.size() + plan.ids.size() == 10,
+          "scored and unscored partition the vocabulary");
+}
+
 // The fallback's measurement counters: fixed-point mass to a double,
 // differences, sums and the reported field names.
 void CheckCounters() {
@@ -324,6 +335,7 @@ int main() {
     CheckTiming();
     CheckDiscardScan();
     CheckTier2();
+    CheckUnscored();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

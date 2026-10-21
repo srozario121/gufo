@@ -130,6 +130,12 @@ public:
     std::uint32_t tier2_rows{0};
     float tier2_threshold{0.0F};
     std::uint32_t tier2_tail{0};
+    /// --vocab-trim-fallback-skip-scored: the full pass reads only the
+    /// `n_unscored` head rows the compact set does not hold (`unscored`, ids
+    /// ascending, device) and keeps the compact values of the scored ones.
+    bool skip_scored{false};
+    const std::int32_t* unscored{nullptr};
+    std::uint32_t n_unscored{0};
   };
   /// Gathers output() rows `ids` (ascending token IDs, `padded_rows` >= their
   /// count) into a compact device copy and keeps `inverse` (one entry per
@@ -157,6 +163,10 @@ public:
   [[nodiscard]] bool SetHeadTrimTier2(std::uint32_t rows, float threshold,
                                       std::span<const std::int32_t> ids,
                                       std::string* error_msg);
+  /// Turns on skipping the scored rows in the full pass (default off); needs
+  /// SetHeadTrim. `inverse` is the same map SetHeadTrim took.
+  [[nodiscard]] bool SetHeadTrimSkipScored(
+      bool on, std::span<const std::int32_t> inverse, std::string* error_msg);
   [[nodiscard]] const HeadTrim* head_trim() const noexcept {
     return head_trim_.head.empty() ? nullptr : &head_trim_;
   }

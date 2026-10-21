@@ -68,6 +68,9 @@ struct TextSpeculativeConfig {
   /// Second tier of the fallback (--vocab-trim-tier2, -tier2-threshold).
   std::uint32_t head_trim_tier2_rows{0};
   float head_trim_tier2_threshold{-1.0F};
+  /// The full pass skips the rows the compact set scored
+  /// (--vocab-trim-fallback-skip-scored).
+  bool head_trim_skip_scored{false};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };
