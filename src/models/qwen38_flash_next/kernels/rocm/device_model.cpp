@@ -404,14 +404,15 @@ bool DeviceModel::SetHeadTrim(std::span<const std::int32_t> ids,
     release();
     return fail("trimmed head: row gather failed");
   }
-  (void)hipFree(id_map);
   allocations_.push_back(head);
+  allocations_.push_back(id_map);
   allocations_.push_back(inverse_map);
-  bytes_ += head_bytes + kTailMargin + inverse.size_bytes();
+  bytes_ += head_bytes + kTailMargin + ids.size_bytes() + inverse.size_bytes();
   head_trim_.head = output_;
   head_trim_.head.data = head;
   head_trim_.head.rows = padded_rows;
   head_trim_.inverse = static_cast<const std::int32_t*>(inverse_map);
+  head_trim_.ids = static_cast<const std::int32_t*>(id_map);
   head_trim_.scored = static_cast<std::uint32_t>(ids.size());
   head_trim_.threshold = threshold;
   return true;

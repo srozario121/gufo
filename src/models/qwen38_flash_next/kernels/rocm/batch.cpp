@@ -536,10 +536,18 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                                                  items[i].output.draft_subset)
                   ? a++
                   : b++;
+  // Under the trimmed head no row is a draft-subset row (the two exclude each
+  // other), and the draft reads the compact rows: its candidates and argmax run
+  // over the scored rows and the winners map back to token IDs.
+  const auto* trim = subset_rows == 0 ? model_->head_trim() : nullptr;
   const auto rows_of = [&](std::uint32_t i) {
-    return static_cast<std::uint32_t>(slot[i] < subset_rows ? kSmall : vocab);
+    return static_cast<std::uint32_t>(trim != nullptr         ? trim->scored
+                                      : slot[i] < subset_rows ? kSmall
+                                                              : vocab);
   };
   const auto logits_of = [&](std::uint32_t i) {
+    if (trim != nullptr)
+      return head_compact_ + std::size_t{slot[i]} * trim->head.rows;
     if (mixed)
       return batch_logits_ + slot[i] * vocab;
     return slot[i] < subset_rows ? batch_logits_ + slot[i] * kSmall
@@ -597,7 +605,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                         kMtpDraftExtraRows, stream_);
       }
     }
-    if (subset_rows == 0) {
+    if (trim != nullptr) {
+      if (!DenseBatch(trim->head, base.mixed, head_compact_, n, error))
+        return false;
+      MaskSuppressedCompact(head_compact_, trim->ids, trim->scored, n,
+                            trim->head.rows);
+    } else if (subset_rows == 0) {
       if (!HeadProject(base.mixed, batch_logits_, n, true, false, error))
         return false;
       MaskSuppressed(batch_logits_, static_cast<std::uint32_t>(vocab), n,
@@ -607,14 +620,18 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!items[i].session->CheckCancellation(nullptr))
         continue;
       const auto rows = rows_of(i);
-      const std::int32_t* table =
-          slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
+      const std::int32_t* table = trim != nullptr ? trim->ids
+                                  : slot[i] < subset_rows
+                                      ? items[i].session->mtp_.draft_ids
+                                      : nullptr;
+      const auto remap_from =
+          trim != nullptr ? 0U : static_cast<std::uint32_t>(prefix);
       const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
-                        static_cast<std::uint32_t>(prefix), table, stream_);
+                        remap_from, table, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
                                   s_.mtp_token, sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
@@ -625,8 +642,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       MtpTopCandidates(logits_of(i), s_.mtp_ids, s_.mtp_scratch_ids,
                        s_.mtp_scores, rows, stream_);
       if (table != nullptr)
-        RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count),
-                      static_cast<std::uint32_t>(prefix), table, stream_);
+        RemapDraftIds(s_.mtp_ids, static_cast<std::uint32_t>(count), remap_from,
+                      table, stream_);
       if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),

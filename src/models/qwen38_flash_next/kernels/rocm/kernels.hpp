@@ -658,12 +658,20 @@ void HeadConfidence(const float* compact, std::uint32_t rows,
 /// out[r][0..vocab), with the dense projection's activation quantization
 /// (int8 per 32 values, half scale). Reads the head once for all flagged rows
 /// and does nothing when none is flagged; counters[2] counts the passes that
-/// did. `scratch` holds rows * (cols / 32) * 34 bytes.
+/// did. `scratch` holds rows * (cols / 32) * 36 bytes.
 void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,
                       std::uint32_t vocab, const float* x,
                       const std::int32_t* flags, std::uint32_t rows, float* out,
                       unsigned long long* counters, void* scratch,
                       hipStream_t stream);
+
+/// The draft head over compact rows: sets logits[r * stride + i] to
+/// -infinity where flags[ids[i]] != 0, for i < n and r < rows (the compact
+/// form of MaskSuppressedLogits).
+void MaskSuppressedCompact(float* logits, const std::uint8_t* flags,
+                           const std::int32_t* ids, std::uint32_t n,
+                           std::uint32_t rows, std::size_t stride,
+                           hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

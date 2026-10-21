@@ -570,6 +570,10 @@ private:
   /// no-op unless the model has a suppression set.
   void MaskSuppressed(float* logits, std::uint32_t n, std::uint32_t rows = 1,
                       std::size_t stride = 0) const noexcept;
+  /// The same for the trimmed head's compact rows: row i is token ids[i].
+  void MaskSuppressedCompact(float* logits, const std::int32_t* ids,
+                             std::uint32_t n, std::uint32_t rows = 1,
+                             std::size_t stride = 0) const noexcept;
   /// The output head over `rows` rows of x (x[r] is cols floats), written as
   /// full-vocabulary logits: out[r * vocab + id]. With the trimmed head
   /// (head_trim.hpp) only the scored tokens are projected and every other
