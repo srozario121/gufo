@@ -3440,6 +3440,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .head_trim_tier2_rows = speculative_config.head_trim_tier2_rows,
             .head_trim_tier2_threshold =
                 speculative_config.head_trim_tier2_threshold,
+            .head_trim_skip_scored = speculative_config.head_trim_skip_scored,
         },
         &load_error);
     if (model == nullptr) {

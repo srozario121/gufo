@@ -1550,26 +1550,35 @@ const std::int32_t* Executor::HeadFallbackPass(const float* x, float* out,
   const auto* trim = model_->head_trim();
   const std::uint32_t vocab = full.rows;
   const std::size_t row_bytes = model_->output_row_bytes();
+  // The head rows the full pass reads: all of them, or (skip-scored) only
+  // those the compact set does not hold, named by `list`. Index ranges are
+  // over that sequence; `below` is how many of its entries are token ids under
+  // the second tier's N.
+  const std::int32_t* list = trim->skip_scored ? trim->unscored : nullptr;
+  const std::uint32_t total = trim->skip_scored ? trim->n_unscored : vocab;
+  const std::uint32_t below = trim->skip_scored
+                                  ? trim->tier2_rows - trim->tier2_tail
+                                  : trim->tier2_rows;
   FullHeadQuantize(x, head_flags_, full.cols, rows, head_quantized_, stream_);
   if (trim->tier2_rows == 0) {
-    FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, vocab, head_flags_,
-                 rows, out, head_counters_, head_quantized_, stream_);
+    FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, total, head_flags_,
+                 rows, out, head_counters_, head_quantized_, stream_, list);
     return head_flags_;
   }
   // Second tier: the first tier2_rows token ids, then the confidence over
   // them and the compact set's tail decides which rows escalate; the
   // escalation completes those rows (the tier's values stay).
-  FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, trim->tier2_rows,
-               head_flags_, rows, out, nullptr, head_quantized_, stream_);
+  FullHeadRead(full.data, row_bytes, full.cols, vocab, 0, below, head_flags_,
+               rows, out, nullptr, head_quantized_, stream_, list);
   HeadTier2Confidence(out, vocab, head_compact_, trim->head.rows,
                       trim->tier2_tail, trim->scored, trim->tier2_rows,
                       trim->tier2_threshold, head_flags_, head_flags2_, rows,
                       stream_);
   if (head_timing_ != nullptr)
     HeadTimingStamp(head_timing_, 5, stream_);
-  FullHeadRead(full.data, row_bytes, full.cols, vocab, trim->tier2_rows, vocab,
+  FullHeadRead(full.data, row_bytes, full.cols, vocab, below, total,
                head_flags2_, rows, out, head_counters_, head_quantized_,
-               stream_);
+               stream_, list);
   return head_flags2_;
 }
 

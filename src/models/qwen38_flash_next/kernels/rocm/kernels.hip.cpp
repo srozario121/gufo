@@ -8053,8 +8053,8 @@ constexpr unsigned kFallbackGroup = 4;
 __global__ void FullHeadFallbackKernel(
     const std::uint8_t* w, std::size_t row_bytes, std::uint32_t cols,
     std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
-    const std::uint8_t* xq, const std::int32_t* flags, std::uint32_t rows,
-    float* out, unsigned long long* counters) {
+    const std::int32_t* list, const std::uint8_t* xq, const std::int32_t* flags,
+    std::uint32_t rows, float* out, unsigned long long* counters) {
   __shared__ std::int32_t active[kFallbackMaxRows];
   __shared__ std::int32_t active_count;
   if (threadIdx.x == 0) {
@@ -8070,9 +8070,11 @@ __global__ void FullHeadFallbackKernel(
   if (active_count == 0)
     return;
   const unsigned lane = threadIdx.x & 15U;
-  const std::uint32_t v =
+  const std::uint32_t at =
       begin + blockIdx.x * kFallbackRowsPerBlock + (threadIdx.x >> 4);
-  const bool valid = v < end;
+  const bool valid = at < end;
+  // With a list the pass reads only the head rows it names, in order.
+  const std::uint32_t v = valid && list != nullptr ? list[at] : at;
   const std::uint8_t* row =
       w + static_cast<std::size_t>(valid ? v : 0) * row_bytes;
   const std::uint32_t blocks = cols / 32;
@@ -8136,7 +8138,7 @@ void FullHeadRead(const void* w, std::size_t row_bytes, std::uint32_t cols,
                   std::uint32_t vocab, std::uint32_t begin, std::uint32_t end,
                   const std::int32_t* flags, std::uint32_t rows, float* out,
                   unsigned long long* counters, const void* scratch,
-                  hipStream_t stream) {
+                  hipStream_t stream, const std::int32_t* list) {
   if (end <= begin)
     return;
   hipLaunchKernelGGL(
@@ -8144,7 +8146,8 @@ void FullHeadRead(const void* w, std::size_t row_bytes, std::uint32_t cols,
       dim3((end - begin + kFallbackRowsPerBlock - 1) / kFallbackRowsPerBlock),
       dim3(kFallbackRowsPerBlock * 16), 0, stream,
       static_cast<const std::uint8_t*>(w), row_bytes, cols, vocab, begin, end,
-      static_cast<const std::uint8_t*>(scratch), flags, rows, out, counters);
+      list, static_cast<const std::uint8_t*>(scratch), flags, rows, out,
+      counters);
 }
 
 void FullHeadFallback(const void* w, std::size_t row_bytes, std::uint32_t cols,

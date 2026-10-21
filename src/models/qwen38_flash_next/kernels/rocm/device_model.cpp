@@ -419,6 +419,36 @@ bool DeviceModel::SetHeadTrim(std::span<const std::int32_t> ids,
   return true;
 }
 
+bool DeviceModel::SetHeadTrimSkipScored(bool on,
+                                        std::span<const std::int32_t> inverse,
+                                        std::string* error_msg) {
+  if (!on)
+    return true;
+  const auto fail = [&](const char* message) {
+    if (error_msg != nullptr)
+      *error_msg = message;
+    return false;
+  };
+  if (head_trim_.head.empty() || inverse.size() != output_.rows)
+    return fail("--vocab-trim-fallback-skip-scored needs the trimmed head");
+  const auto unscored = HeadTrimUnscoredIds(inverse);
+  void* list = nullptr;
+  if (unscored.empty() ||
+      hipMalloc(&list, unscored.size() * sizeof(std::int32_t)) != hipSuccess)
+    return fail("skip-scored: device allocation failed");
+  if (hipMemcpy(list, unscored.data(), unscored.size() * sizeof(std::int32_t),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    (void)hipFree(list);
+    return fail("skip-scored: upload failed");
+  }
+  allocations_.push_back(list);
+  bytes_ += unscored.size() * sizeof(std::int32_t);
+  head_trim_.skip_scored = true;
+  head_trim_.unscored = static_cast<const std::int32_t*>(list);
+  head_trim_.n_unscored = static_cast<std::uint32_t>(unscored.size());
+  return true;
+}
+
 bool DeviceModel::SetHeadTrimTier2(std::uint32_t rows, float threshold,
                                    std::span<const std::int32_t> ids,
                                    std::string* error_msg) {

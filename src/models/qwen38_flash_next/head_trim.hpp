@@ -158,6 +158,18 @@ inline std::uint32_t HeadTrimDiscardScan(std::span<std::int32_t> flags,
   return cleared;
 }
 
+/// The token ids NOT in the compact set, ascending (--vocab-trim-fallback-
+/// skip-scored): the head rows the full pass still has to read, because the
+/// compact projection already scored the others.
+[[nodiscard]] inline std::vector<std::int32_t> HeadTrimUnscoredIds(
+    std::span<const std::int32_t> inverse) {
+  std::vector<std::int32_t> unscored;
+  for (std::size_t id = 0; id < inverse.size(); ++id)
+    if (inverse[id] < 0)
+      unscored.push_back(static_cast<std::int32_t>(id));
+  return unscored;
+}
+
 /// Second tier of the fallback (--vocab-trim-tier2 N): a flagged row is
 /// first re-scored over the first N token ids, and its scored set becomes
 /// those tokens plus the compact set's tokens at or above N. This is how many

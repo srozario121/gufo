@@ -225,7 +225,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     m->device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
     if (!m->device_->SetHeadTrimTier2(options.head_trim_tier2_rows,
                                       options.head_trim_tier2_threshold,
-                                      plan.ids, error_msg))
+                                      plan.ids, error_msg) ||
+        !m->device_->SetHeadTrimSkipScored(options.head_trim_skip_scored,
+                                           plan.inverse, error_msg))
       return nullptr;
     m->head_trimmed_ = true;
     std::cerr << "[head-trim] set_ids=" << plan.from_set
@@ -236,6 +238,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
               << " timing=" << (options.head_trim_timing ? 1 : 0)
               << " counters=" << (options.head_trim_counters ? 1 : 0)
               << " discard_aware=" << (m->HeadDiscardAware() ? 1 : 0)
+              << " skip_scored=" << (options.head_trim_skip_scored ? 1 : 0)
               << " tier2_rows=" << options.head_trim_tier2_rows
               << " tier2_threshold="
               << (m->device_->head_trim()->tier2_rows != 0
