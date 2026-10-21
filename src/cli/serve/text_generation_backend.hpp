@@ -223,6 +223,8 @@ public:
     std::size_t head_trim_full_reads{0};
     /// Device-side phase times of the trimmed head (--vocab-trim-timing).
     ::gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
+    /// What the fallback bought (--vocab-trim-counters).
+    ::gufo::models::qwen38_flash_next::HeadCounterStats head_trim_counters{};
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};

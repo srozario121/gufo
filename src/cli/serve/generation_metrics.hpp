@@ -211,6 +211,11 @@ inline std::string GenerationLogDetails(
     result.head_trim_timing.ForEachField([&](const char* name, double value) {
       out << " head_trim_t_" << name << '=' << value;
     });
+  if (result.head_trim_counters.flagged > 0 ||
+      result.head_trim_counters.chains > 0)
+    result.head_trim_counters.ForEachField([&](const char* name, double value) {
+      out << " head_trim_ctr_" << name << '=' << value;
+    });
   if (result.lookup_tokens > 0)
     out << " lookup_accepted=" << result.lookup_accepted_tokens
         << " lookup_proposed=" << result.lookup_tokens;

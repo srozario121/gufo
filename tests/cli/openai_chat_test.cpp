@@ -152,6 +152,7 @@ public:
     result.head_trim_fallbacks = head_trim_fallbacks;
     result.head_trim_full_reads = head_trim_full_reads;
     result.head_trim_timing = head_trim_timing;
+    result.head_trim_counters = head_trim_counters;
     if (!result.cache_hit) {
       result.cached_prompt_tokens = 0;
       result.prefill_tokens = result.prompt_tokens;
@@ -226,6 +227,7 @@ public:
   std::size_t head_trim_fallbacks{0};
   std::size_t head_trim_full_reads{0};
   gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
+  gufo::models::qwen38_flash_next::HeadCounterStats head_trim_counters{};
   FinishReason finish_reason{FinishReason::kStop};
   std::string stop_sequence;
   bool block_after_first_piece{false};
@@ -651,6 +653,34 @@ void TestCachedPrefillMetrics() {
   Expect(idle_metrics && idle_metrics->find("head_trim_rows") == nullptr &&
              idle_metrics->member_double("head_trim_t_a_us") == 500,
          "Usage reports the head timing without any fallback rows");
+
+  // --vocab-trim-counters adds the fallback counters, and only then.
+  Expect(idle_metrics->find("head_trim_ctr_flagged") == nullptr,
+         "Usage omits the fallback counters when they are off");
+  backend.head_trim_counters.flagged = 12;
+  backend.head_trim_counters.argmax_changed = 3;
+  backend.head_trim_counters.mass_sum = 1.25;
+  backend.head_trim_counters.mass_over_005 = 4;
+  backend.head_trim_counters.chains = 5;
+  backend.head_trim_counters.discarded_flagged = 6;
+  const auto counted = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"x"}]})"),
+      backend);
+  const auto counted_body = gufo::json::parse(counted.body);
+  const auto* counted_usage = counted_body.find("usage");
+  const auto* counted_metrics =
+      counted_usage ? counted_usage->find("gufo") : nullptr;
+  Expect(
+      counted_metrics &&
+          counted_metrics->member_double("head_trim_ctr_flagged") == 12 &&
+          counted_metrics->member_double("head_trim_ctr_argmax_changed") == 3 &&
+          counted_metrics->member_double("head_trim_ctr_mass_sum") == 1.25 &&
+          counted_metrics->member_double("head_trim_ctr_mass_over_0p05") == 4 &&
+          counted_metrics->member_double("head_trim_ctr_chains") == 5 &&
+          counted_metrics->member_double("head_trim_ctr_discarded_flagged") ==
+              6,
+      "Usage reports the fallback counters");
 }
 
 void TestToolCallsAreStructured() {

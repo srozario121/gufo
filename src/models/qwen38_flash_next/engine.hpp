@@ -82,6 +82,8 @@ struct ModelOptions {
   float head_trim_threshold = kHeadTrimDefaultThreshold;
   /// Time the trimmed head's phases on the device (--vocab-trim-timing).
   bool head_trim_timing = false;
+  /// Count what the fallback buys (--vocab-trim-counters); measurement only.
+  bool head_trim_counters = false;
 };
 
 class Session;
@@ -275,6 +277,8 @@ public:
     std::uint64_t head_full_reads{0};
     /// Device-side phase timing of the trimmed head, when timing is on.
     HeadTimingStats head_timing{};
+    /// Fallback measurement counters, when counters are on.
+    HeadCounterStats head_counters{};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept;
   /// PLE rows gathered by this execution slot since creation; zero without
