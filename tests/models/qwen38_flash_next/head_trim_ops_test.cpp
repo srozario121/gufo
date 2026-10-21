@@ -1,6 +1,8 @@
 // GPU checks for the trimmed output head's kernels (head_trim.hpp):
 //  - the full-head fallback gives, for every flagged row, the same bits as the
 //    scalar kernel it replaced (the reference below is that kernel, verbatim);
+//  - the fallback's measurement counters match a host reference (also replayed
+//    from a graph);
 //  - the draft head's compact candidates and argmax, with the IDs mapped back,
 //    equal the full-vocabulary kernels run over the expanded row.
 #include <hip/hip_fp16.h>
@@ -392,11 +394,164 @@ void CheckTiming() {
   CheckHip(hipStreamDestroy(stream), "destroy stream");
 }
 
+// The fallback's measurement counters against a host reference: rows whose
+// argmax changes, the unscored softmax mass and its thresholds, and the
+// verification round's flagged rows past the kept prefix. Run twice on the
+// stream and once through a graph, so the sums are additive and replay-safe.
+void CheckCounters() {
+  constexpr std::uint32_t kVocab = 1003;
+  constexpr std::uint32_t kRows = 6;
+  constexpr std::uint32_t kStride = 512;
+  std::vector<std::int32_t> inverse(kVocab, -1);
+  std::vector<std::int32_t> ids;
+  for (std::uint32_t id = 0; id < kVocab; id += 3) {
+    inverse[id] = static_cast<std::int32_t>(ids.size());
+    ids.push_back(static_cast<std::int32_t>(id));
+  }
+  const auto scored = static_cast<std::uint32_t>(ids.size());
+  Expect(scored <= kStride, "test geometry");
+  Rng rng{77};
+  std::vector<float> compact(std::size_t{kRows} * kStride, -1000.0F);
+  std::vector<float> full(std::size_t{kRows} * kVocab);
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    for (std::uint32_t i = 0; i < scored; ++i)
+      compact[r * kStride + i] = static_cast<float>(rng.Next() % 1000) / 250.0F;
+    for (std::uint32_t id = 0; id < kVocab; ++id)
+      full[r * kVocab + id] = static_cast<float>(rng.Next() % 1000) / 250.0F;
+  }
+  // Row 1: the full head agrees (the compact winner is the full winner).
+  // Row 2: an unscored token wins. Row 3: flagged, an unscored token wins by a
+  // wide margin (mass above 0.2). Row 4: the compact argmax tie goes to the
+  // lowest token, and the full head keeps it. Row 5 is flagged, agrees.
+  const auto compact_argmax = [&](std::uint32_t r) {
+    std::uint32_t best = 0;
+    for (std::uint32_t i = 1; i < scored; ++i)
+      if (compact[r * kStride + i] > compact[r * kStride + best])
+        best = i;
+    return best;
+  };
+  for (const std::uint32_t r : {1U, 5U}) {
+    const auto token = static_cast<std::uint32_t>(ids[compact_argmax(r)]);
+    full[r * kVocab + token] = 50.0F;
+  }
+  full[2 * kVocab + 1] = 50.0F;  // token 1 is unscored
+  full[3 * kVocab + 2] = 60.0F;  // token 2 is unscored
+  compact[4 * kStride + 7] = compact[4 * kStride + 2] = 40.0F;  // tie
+  full[4 * kVocab + static_cast<std::uint32_t>(ids[2])] = 55.0F;
+  std::vector<std::int32_t> flags = {0, 1, 1, 1, 1, 1};
+
+  auto d_compact = Upload(compact);
+  auto d_full = Upload(full);
+  auto d_ids = Upload(ids);
+  auto d_inverse = Upload(inverse);
+  auto d_flags = Upload(flags);
+  auto d_rowinfo = Upload(std::vector<std::int32_t>(kRows, 9));
+  auto d_counters = Allocate<unsigned long long>(q::kHeadTimingCounters);
+  CheckHip(hipMemset(d_counters.get(), 0,
+                     q::kHeadTimingCounters * sizeof(unsigned long long)),
+           "clear");
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "stream");
+
+  // Host reference.
+  std::uint64_t changed = 0, over_005 = 0, over_02 = 0, flagged = 0;
+  double mass_sum = 0.0;
+  std::vector<int> row_changed(kRows, 0);
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    if (flags[r] == 0)
+      continue;
+    ++flagged;
+    const auto scored_token =
+        static_cast<std::uint32_t>(ids[compact_argmax(r)]);
+    std::uint32_t full_token = 0;
+    for (std::uint32_t id = 1; id < kVocab; ++id)
+      if (full[r * kVocab + id] > full[r * kVocab + full_token])
+        full_token = id;
+    if (scored_token != full_token) {
+      ++changed;
+      row_changed[r] = 1;
+    }
+    double all = 0.0, unscored = 0.0;
+    const double maximum = full[r * kVocab + full_token];
+    for (std::uint32_t id = 0; id < kVocab; ++id) {
+      const double e = std::exp(full[r * kVocab + id] - maximum);
+      all += e;
+      if (inverse[id] < 0)
+        unscored += e;
+    }
+    mass_sum += unscored / all;
+    over_005 += unscored / all > 0.05;
+    over_02 += unscored / all > 0.2;
+  }
+  Expect(changed >= 2 && changed < flagged,
+         "the test rows exercise both cases");
+
+  const auto launch = [&] {
+    q::HeadCountFlagged(d_compact.get(), kStride, scored, d_ids.get(),
+                        d_full.get(), kVocab, d_inverse.get(), d_flags.get(),
+                        d_rowinfo.get(), kRows, d_counters.get(), stream);
+    // Rounds over rows 0..5 keeping 3, and over rows 1..4 (first = 1)
+    // keeping 1.
+    q::HeadRecordChain(d_flags.get(), d_rowinfo.get(), 0, kRows, 3,
+                       d_counters.get(), stream);
+    q::HeadRecordChain(d_flags.get(), d_rowinfo.get(), 1, 4, 1,
+                       d_counters.get(), stream);
+  };
+  launch();
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "begin");
+  launch();
+  CheckHip(hipStreamEndCapture(stream, &graph), "end");
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  CheckHip(hipGraphLaunch(exec, stream), "launch");
+  CheckHip(hipStreamSynchronize(stream), "sync");
+  const auto c = Download(d_counters.get(), 11);
+  const auto rowinfo = Download(d_rowinfo.get(), kRows);
+  for (std::uint32_t r = 0; r < kRows; ++r)
+    Expect(rowinfo[r] == row_changed[r], "row info is 1 for a changed argmax");
+  Expect(c[0] == 2 * flagged && c[1] == 2 * changed, "flagged and changed");
+  Expect(c[3] == 2 * over_005 && c[4] == 2 * over_02, "mass thresholds");
+  const double mass = static_cast<double>(c[2]) / 4294967296.0;
+  Expect(std::fabs(mass - 2 * mass_sum) < 1e-4,
+         "mass sum " + std::to_string(mass) + " against " +
+             std::to_string(2 * mass_sum));
+  // Round 1: all rows, keep 3: rows 3..5 are discarded. Round 2: rows 1..4,
+  // keep 1: relative rows 1..3 (rows 2..4) are discarded.
+  std::uint64_t chain_flagged = 0, discarded = 0, used_changed = 0,
+                discarded_changed = 0;
+  const auto round = [&](std::uint32_t first, std::uint32_t rows,
+                         std::uint32_t keep) {
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      if (flags[first + r] == 0)
+        continue;
+      ++chain_flagged;
+      if (r >= keep) {
+        ++discarded;
+        discarded_changed += row_changed[first + r];
+      } else {
+        used_changed += row_changed[first + r];
+      }
+    }
+  };
+  round(0, kRows, 3);
+  round(1, 4, 1);
+  Expect(c[5] == 4 && c[6] == 2 * (kRows + 4), "rounds and rows");
+  Expect(c[7] == 2 * chain_flagged && c[8] == 2 * discarded &&
+             c[9] == 2 * used_changed && c[10] == 2 * discarded_changed,
+         "chain counters");
+  CheckHip(hipGraphExecDestroy(exec), "destroy exec");
+  CheckHip(hipGraphDestroy(graph), "destroy graph");
+  CheckHip(hipStreamDestroy(stream), "destroy stream");
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckTiming();
+    CheckCounters();
     // cols: 4096 is the model's; 96 has fewer blocks than the 16 lanes; 1056
     // leaves lanes with uneven block counts. vocab values are not multiples of
     // the 16 rows a block covers.

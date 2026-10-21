@@ -247,6 +247,98 @@ struct HeadTimingStats {
   }
 };
 
+/// Measurement counters of the fallback (--vocab-trim-counters), summed over
+/// every flagged row since the model loaded. They ask what the full-head
+/// reads buy: `argmax_changed` counts flagged rows whose greedy argmax over
+/// the full head differs from the argmax over the scored rows; `mass_sum`
+/// is the softmax mass (temperature 1, over the whole vocabulary after the
+/// fallback) of the tokens that were not scored, summed over flagged rows,
+/// with the number of rows above 0.05 and above 0.2. The `chain_*` fields come
+/// from the verification loop (one record per speculative round): flagged
+/// rows at or past the number of kept tokens were discarded unused.
+struct HeadCounterStats {
+  std::uint64_t flagged{0};         ///< flagged rows examined
+  std::uint64_t argmax_changed{0};  ///< of those, full argmax != scored argmax
+  double mass_sum{0.0};             ///< unscored softmax mass, summed
+  std::uint64_t mass_over_005{0};
+  std::uint64_t mass_over_02{0};
+  std::uint64_t chains{0};             ///< verification rounds recorded
+  std::uint64_t chain_rows{0};         ///< verification rows in those rounds
+  std::uint64_t chain_flagged{0};      ///< flagged rows among them
+  std::uint64_t discarded_flagged{0};  ///< flagged rows past the kept prefix
+  std::uint64_t used_changed{0};       ///< argmax-changing flagged rows kept
+  std::uint64_t discarded_changed{0};  ///< argmax-changing rows discarded
+
+  /// The mass is accumulated on the device as fixed point, 2^-32 units.
+  static constexpr double kMassScale = 4294967296.0;
+  /// Device counters, in this order: flagged, argmax_changed, mass (fixed
+  /// point), mass_over_005, mass_over_02, chains, chain_rows, chain_flagged,
+  /// discarded_flagged, used_changed, discarded_changed.
+  static constexpr std::size_t kCounterCount = 11;
+  [[nodiscard]] static HeadCounterStats FromCounters(
+      const unsigned long long* c) noexcept {
+    HeadCounterStats s;
+    s.flagged = c[0];
+    s.argmax_changed = c[1];
+    s.mass_sum = static_cast<double>(c[2]) / kMassScale;
+    s.mass_over_005 = c[3];
+    s.mass_over_02 = c[4];
+    s.chains = c[5];
+    s.chain_rows = c[6];
+    s.chain_flagged = c[7];
+    s.discarded_flagged = c[8];
+    s.used_changed = c[9];
+    s.discarded_changed = c[10];
+    return s;
+  }
+  HeadCounterStats& operator+=(const HeadCounterStats& o) noexcept {
+    flagged += o.flagged;
+    argmax_changed += o.argmax_changed;
+    mass_sum += o.mass_sum;
+    mass_over_005 += o.mass_over_005;
+    mass_over_02 += o.mass_over_02;
+    chains += o.chains;
+    chain_rows += o.chain_rows;
+    chain_flagged += o.chain_flagged;
+    discarded_flagged += o.discarded_flagged;
+    used_changed += o.used_changed;
+    discarded_changed += o.discarded_changed;
+    return *this;
+  }
+  /// This minus an earlier reading of the same counters.
+  [[nodiscard]] HeadCounterStats Since(
+      const HeadCounterStats& o) const noexcept {
+    HeadCounterStats s = *this;
+    s.flagged -= o.flagged;
+    s.argmax_changed -= o.argmax_changed;
+    s.mass_sum -= o.mass_sum;
+    s.mass_over_005 -= o.mass_over_005;
+    s.mass_over_02 -= o.mass_over_02;
+    s.chains -= o.chains;
+    s.chain_rows -= o.chain_rows;
+    s.chain_flagged -= o.chain_flagged;
+    s.discarded_flagged -= o.discarded_flagged;
+    s.used_changed -= o.used_changed;
+    s.discarded_changed -= o.discarded_changed;
+    return s;
+  }
+  /// Calls f(name, value) for each field; the caller adds its prefix.
+  template<typename F>
+  void ForEachField(F&& f) const {
+    f("flagged", static_cast<double>(flagged));
+    f("argmax_changed", static_cast<double>(argmax_changed));
+    f("mass_sum", mass_sum);
+    f("mass_over_0p05", static_cast<double>(mass_over_005));
+    f("mass_over_0p2", static_cast<double>(mass_over_02));
+    f("chains", static_cast<double>(chains));
+    f("chain_rows", static_cast<double>(chain_rows));
+    f("chain_flagged", static_cast<double>(chain_flagged));
+    f("discarded_flagged", static_cast<double>(discarded_flagged));
+    f("used_changed", static_cast<double>(used_changed));
+    f("discarded_changed", static_cast<double>(discarded_changed));
+  }
+};
+
 }  // namespace gufo::models::qwen38_flash_next
 
 #endif
