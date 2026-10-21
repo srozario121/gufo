@@ -21,9 +21,11 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
+namespace qfn = gufo::models::qwen38_flash_next;
 namespace {
 
 void CheckHip(hipError_t error, const char* operation) {
@@ -546,12 +548,165 @@ void CheckCounters() {
   CheckHip(hipStreamDestroy(stream), "destroy stream");
 }
 
+// ---- Discard-aware flagging: the argmax of HeadConfidence and the chain
+// policy kernel against host references (also replayed from a graph) ----
+void CheckChainPolicy(const std::vector<std::uint32_t>& mismatches,
+                      std::uint32_t seed) {
+  constexpr std::uint32_t kRows = 12;
+  constexpr std::uint32_t kStride = 320;
+  constexpr std::uint32_t kScored = 257;
+  constexpr float kThreshold = 0.5F;
+  std::vector<std::int32_t> ids(kScored);
+  for (std::uint32_t i = 0; i < kScored; ++i)
+    ids[i] = static_cast<std::int32_t>(5 * i + 2);
+  // C confident (unflagged), S spread (flagged), N no finite value, T a tie
+  // between two confident maxima (the lowest token must win).
+  const std::string kinds = "CSCSSSCSCCNT";
+  Rng rng{seed};
+  std::vector<float> compact(std::size_t{kRows} * kStride, -1000.0F);
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    float* row = compact.data() + std::size_t{r} * kStride;
+    for (std::uint32_t i = 0; i < kScored; ++i)
+      row[i] = static_cast<float>(rng.Next() % 1000) / 1000.0F;
+    if (kinds[r] == 'C')
+      row[rng.Next() % kScored] = 30.0F;
+    if (kinds[r] == 'T') {
+      row[200] = 40.0F;
+      row[31] = 40.0F;
+      row[90] = 40.0F;
+    }
+    if (kinds[r] == 'N')
+      for (std::uint32_t i = 0; i < kScored; ++i)
+        row[i] = -INFINITY;
+  }
+  // Host references: flags, argmax tokens (finite values only, the lowest
+  // index among equals).
+  std::vector<std::int32_t> flags(kRows, 0);
+  std::vector<std::int32_t> argmax(kRows, -1);
+  for (std::uint32_t r = 0; r < kRows; ++r) {
+    const std::span<const float> row(compact.data() + std::size_t{r} * kStride,
+                                     kScored);
+    flags[r] =
+        qfn::HeadTrimNeedsFallback(qfn::HeadTrimTopProbability(row), kThreshold)
+            ? 1
+            : 0;
+    float best = -INFINITY;
+    for (std::uint32_t i = 0; i < kScored; ++i)
+      if (std::isfinite(row[i]) && row[i] > best) {
+        best = row[i];
+        argmax[r] = ids[i];
+      }
+  }
+  Expect(flags[0] == 0 && flags[1] == 1 && flags[10] == 1 && argmax[10] == -1 &&
+             argmax[11] == ids[31],
+         "the test rows exercise confident, spread, empty and tied rows");
+  // Chain tokens: row j's draft is tokens[j + 1] (a chain starts at row 0 and
+  // at row 5; the segments are rows 0..4 discard and 5..8 lazy).
+  std::vector<std::int32_t> tokens(kRows + 1, 0);
+  for (std::uint32_t j = 0; j < kRows; ++j)
+    tokens[j + 1] = argmax[j] >= 0 ? argmax[j] : 7;
+  for (const auto row : mismatches)
+    tokens[row + 1] = 123457;
+
+  q::HeadChains chains;
+  chains.count = 2;
+  chains.first[0] = 0;
+  chains.rows[0] = 5;
+  chains.mode[0] = q::kHeadChainDiscard;
+  chains.first[1] = 5;
+  chains.rows[1] = 4;
+  chains.mode[1] = q::kHeadChainLazy;
+  auto d_tokens = Upload(tokens);
+  chains.tokens = d_tokens.get();
+
+  // Expected flags and deferred flags after the policy.
+  std::vector<std::int32_t> expected = flags;
+  std::vector<std::int32_t> expected_defer(kRows, 0);
+  const auto cleared = qfn::HeadTrimDiscardScan(
+      std::span<std::int32_t>(expected.data(), 5),
+      std::span<const std::int32_t>(argmax.data(), 5),
+      std::span<const std::int32_t>(tokens.data() + 1, 5));
+  std::uint64_t deferred = 0;
+  for (std::uint32_t r = 5; r < 9; ++r)
+    if (expected[r] != 0) {
+      expected_defer[r] = 1;
+      expected[r] = 0;
+      ++deferred;
+    }
+
+  auto d_compact = Upload(compact);
+  auto d_ids = Upload(ids);
+  auto d_flags = Upload(std::vector<std::int32_t>(kRows, 9));
+  auto d_argmax = Upload(std::vector<std::int32_t>(kRows, 9));
+  auto d_defer = Upload(std::vector<std::int32_t>(kRows, 9));
+  auto d_counters = Allocate<unsigned long long>(3);
+  auto d_timing = Allocate<unsigned long long>(q::kHeadTimingCounters + 5);
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "stream");
+  const auto launch = [&] {
+    q::HeadConfidence(d_compact.get(), kRows, kScored, kStride, kThreshold,
+                      d_flags.get(), d_counters.get(), stream, d_ids.get(),
+                      d_argmax.get());
+    q::HeadChainPolicy(chains, d_argmax.get(), d_flags.get(), d_defer.get(),
+                       kRows, d_timing.get(), stream);
+  };
+  const auto reset = [&] {
+    CheckHip(hipMemset(d_counters.get(), 0, 3 * sizeof(unsigned long long)),
+             "counters");
+    CheckHip(
+        hipMemset(d_timing.get(), 0,
+                  (q::kHeadTimingCounters + 5) * sizeof(unsigned long long)),
+        "timing");
+  };
+  const auto check = [&](const char* what) {
+    CheckHip(hipStreamSynchronize(stream), "sync");
+    const auto got_flags = Download(d_flags.get(), kRows);
+    const auto got_argmax = Download(d_argmax.get(), kRows);
+    const auto got_defer = Download(d_defer.get(), kRows);
+    const auto counters = Download(d_counters.get(), 2);
+    const auto timing = Download(d_timing.get(), q::kHeadTimingCounters);
+    Expect(got_argmax == argmax, std::string(what) + ": argmax tokens");
+    Expect(got_flags == expected, std::string(what) + ": flags after policy");
+    Expect(got_defer == expected_defer, std::string(what) + ": deferred flags");
+    Expect(timing[q::kHeadTimingDiscarded] == cleared &&
+               timing[q::kHeadTimingDeferred] == deferred,
+           std::string(what) + ": discarded and deferred counts");
+    // The confidence counters count the flags HeadConfidence set, before the
+    // policy.
+    std::uint64_t first_level = 0;
+    for (const auto f : flags)
+      first_level += f != 0;
+    Expect(counters[0] == kRows && counters[1] == first_level,
+           std::string(what) + ": rows and flagged counters");
+  };
+  reset();
+  launch();
+  check("eager");
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "begin");
+  launch();
+  CheckHip(hipStreamEndCapture(stream, &graph), "end");
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  reset();
+  CheckHip(hipGraphLaunch(exec, stream), "launch");
+  check("graph");
+  CheckHip(hipGraphExecDestroy(exec), "destroy exec");
+  CheckHip(hipGraphDestroy(graph), "destroy graph");
+  CheckHip(hipStreamDestroy(stream), "destroy stream");
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckTiming();
     CheckCounters();
+    CheckChainPolicy({2}, 21);     // an unflagged rejection ends the chain
+    CheckChainPolicy({1, 3}, 22);  // flagged rejections are uncertain
+    CheckChainPolicy({0}, 23);     // a rejection at the first row
+    CheckChainPolicy({}, 24);      // all drafts match
     // cols: 4096 is the model's; 96 has fewer blocks than the 16 lanes; 1056
     // leaves lanes with uneven block counts. vocab values are not multiples of
     // the 16 rows a block covers.

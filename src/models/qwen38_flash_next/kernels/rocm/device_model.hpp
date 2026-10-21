@@ -121,6 +121,7 @@ public:
     bool timing{false};  ///< stamp device timestamps (--vocab-trim-timing)
     bool counters{
         false};  ///< count what the fallback buys (--vocab-trim-counters)
+    bool discard_aware{false};  ///< --vocab-trim-discard-aware
   };
   /// Gathers output() rows `ids` (ascending token IDs, `padded_rows` >= their
   /// count) into a compact device copy and keeps `inverse` (one entry per
@@ -135,6 +136,12 @@ public:
   /// Turns the fallback's measurement counters on (default off); needs
   /// SetHeadTrim.
   void SetHeadTrimCounters(bool on) noexcept { head_trim_.counters = on; }
+  /// Discard-aware flagging (--vocab-trim-discard-aware; default off): chains
+  /// do not pay a full-head read for rows that cannot be used. Needs
+  /// SetHeadTrim and a threshold above 0.
+  void SetHeadTrimDiscardAware(bool on) noexcept {
+    head_trim_.discard_aware = on && head_trim_.threshold > 0.0F;
+  }
   [[nodiscard]] const HeadTrim* head_trim() const noexcept {
     return head_trim_.head.empty() ? nullptr : &head_trim_;
   }

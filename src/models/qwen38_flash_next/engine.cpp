@@ -230,6 +230,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       return nullptr;
     m->device_->SetHeadTrimTiming(options.head_trim_timing);
     m->device_->SetHeadTrimCounters(options.head_trim_counters);
+    m->device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
     m->head_trimmed_ = true;
     std::cerr << "[head-trim] set_ids=" << plan.from_set
               << " special_added=" << plan.added_special
@@ -237,7 +238,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
               << " of=" << vocab
               << " fallback_threshold=" << options.head_trim_threshold
               << " timing=" << (options.head_trim_timing ? 1 : 0)
-              << " counters=" << (options.head_trim_counters ? 1 : 0) << '\n';
+              << " counters=" << (options.head_trim_counters ? 1 : 0)
+              << " discard_aware=" << (m->HeadDiscardAware() ? 1 : 0) << '\n';
   }
   const std::uint32_t draft_prefix = options.draft_vocab_prefix != 0
                                          ? options.draft_vocab_prefix
@@ -729,6 +731,11 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   return true;
 }
 
+bool Model::HeadDiscardAware() const noexcept {
+  return head_trimmed_ && device_->head_trim() != nullptr &&
+         device_->head_trim()->discard_aware;
+}
+
 const Session::SpeculativeStats& Session::Statistics() const noexcept {
   if (model_->head_trimmed_) {
     const auto head = model_->executor_->HeadStatistics();
@@ -1026,6 +1033,8 @@ struct Session::PendingDecode {
   bool sampled{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
+  /// rocm::kHeadChain*: how the trimmed head treats this chain's flagged rows.
+  std::uint32_t head_mode{rocm::kHeadChainInline};
   std::size_t width{0};
   /// The chain stops after a proposal below its gate (GateStops).
   bool gated{false};
@@ -1209,6 +1218,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->sampled = sampled;
   pending->gpu_greedy = gpu_greedy;
   pending->gpu_verification = gpu_verification;
+  // Discard-aware flagging. A greedy chain judged on the raw argmax may drop
+  // the flags after the first unflagged rejection only if nothing else
+  // changes which token a row selects: no penalties, bias, grammar or
+  // reasoning budget (can_use_unmodified_argmax). Any other chain verifies on
+  // the host and reads a flagged row when the loop reaches it.
+  if (model_->HeadDiscardAware())
+    pending->head_mode = gpu_verification
+                             ? (sampler.config().can_use_unmodified_argmax()
+                                    ? rocm::kHeadChainDiscard
+                                    : rocm::kHeadChainInline)
+                             : rocm::kHeadChainLazy;
   if (!gpu_verification &&
       verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
@@ -1339,6 +1359,16 @@ bool Session::FinishDecode(const DecodeRequest& request,
       return false;
     }
   }
+  // Lazy chains (discard-aware flagging): the rows flagged for the full head
+  // were left at their scored-rows values. When the loop reaches a flagged
+  // row, one pass reads the full head for that row and every flagged row after
+  // it, so a chain cut short never pays for the rows it did not reach. Each
+  // row gets the bits an eager pass would have given it.
+  const auto ensure_row = [&](std::uint32_t row) {
+    return pending.head_mode != rocm::kHeadChainLazy ||
+           exec.ResolveDeferredHeadRows(row, k, verify_logits_.data(),
+                                        error_msg);
+  };
   while (keep < k) {
     if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
@@ -1368,6 +1398,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
       ++keep;
       continue;
     }
+    if (!ensure_row(keep - 1))
+      return false;
     if (sampled) {
       if (gpu_verification && !cpu_rows && sampler.NeedsConstraintMask() &&
           !download_remaining(keep - 1))
@@ -1409,9 +1441,16 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
+  if ((!gpu_verification || cpu_rows) && !ensure_row(keep - 1))
+    return false;
   if (sampler.config().logprobs) {
     const auto rows = keep - 1 + (stop_token ? 1 : 0);
     std::vector<float> raw(rows * vocab);
+    // Lazy chains: a deferred row must get its full-head pass before its
+    // logprobs are read from the device.
+    for (std::uint32_t i = 0; i < rows; ++i)
+      if (!ensure_row(i))
+        return false;
     if (rows && !exec.ReadVerificationRows(0, raw, error_msg))
       return false;
     for (std::uint32_t i = 1; i < keep; ++i)
@@ -1504,7 +1543,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
           *session_, pending.chain, pending.chain.size(), logits,
           pending.speculative ? rocm::Executor::ForwardMode::kVerify
                               : rocm::Executor::ForwardMode::kDecode,
-          error_msg)) {
+          error_msg, nullptr, {}, pending.head_mode)) {
     return false;
   }
   const bool ok = FinishDecode(request, pending, error_msg);
@@ -1778,7 +1817,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     const auto& r = requests[i];
     if (!r.session->session_->Cancelled() && !pending[i].chain.empty()) {
       items.push_back({r.session->session_.get(), pending[i].chain,
-                       pending[i].speculative});
+                       pending[i].speculative, pending[i].head_mode});
     }
   }
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))

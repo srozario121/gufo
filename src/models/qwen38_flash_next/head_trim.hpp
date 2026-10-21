@@ -129,6 +129,35 @@ inline void HeadTrimExpand(std::span<const float> scored,
   }
 }
 
+/// Discard-aware flagging (--vocab-trim-discard-aware), greedy form. One
+/// verification chain of `flags.size()` rows: row j predicts the token after
+/// chain token j, and is accepted iff its argmax equals chain token j + 1;
+/// the rows after the first rejected one are never used. `argmax[j]` is the
+/// argmax token of row j over the scored rows (-1 when it has none), `next[j]`
+/// the draft token row j is judged against (chain token j + 1; the last row
+/// has none). A flagged row is uncertain, so only an UNFLAGGED row whose
+/// argmax differs from its draft token ends the chain: the flags of every row
+/// after it are cleared (the mismatching row itself is the correction row and
+/// keeps its flag). Returns how many set flags were cleared. The device
+/// kernel (HeadChainPolicy, mode kHeadChainDiscard) does the same.
+inline std::uint32_t HeadTrimDiscardScan(std::span<std::int32_t> flags,
+                                         std::span<const std::int32_t> argmax,
+                                         std::span<const std::int32_t> next) {
+  std::uint32_t cleared = 0;
+  const std::size_t rows = flags.size();
+  for (std::size_t j = 0; j + 1 < rows; ++j) {
+    if (flags[j] != 0 || argmax[j] < 0 || argmax[j] == next[j])
+      continue;
+    for (std::size_t q = j + 1; q < rows; ++q) {
+      if (flags[q] != 0)
+        ++cleared;
+      flags[q] = 0;
+    }
+    break;
+  }
+  return cleared;
+}
+
 /// Head projections the trimmed target made and how many fell back; read from
 /// the device counters.
 struct HeadTrimStats {
@@ -163,15 +192,20 @@ struct HeadTimingStats {
   std::uint64_t gap_ns{0};
   std::uint64_t d_calls[kHeadTimingBuckets]{};
   std::uint64_t d_ns[kHeadTimingBuckets]{};
+  /// Discard-aware flagging (--vocab-trim-discard-aware): flagged rows the
+  /// greedy rule dropped without a read, and flagged rows of sampled chains
+  /// whose read was deferred until the verification loop reached them.
+  std::uint64_t discarded_rows{0};
+  std::uint64_t deferred_rows{0};
 
   [[nodiscard]] static constexpr std::size_t Bucket(
       std::uint32_t flagged) noexcept {
     return flagged < kHeadTimingBuckets ? flagged : kHeadTimingBuckets - 1;
   }
   /// Device counters, in this order: calls,
-  /// fallback_calls, a, b, c, total, gap, d_calls[], d_ticks[]. `ns_per_tick`
-  /// converts the clock's ticks.
-  static constexpr std::size_t kCounterCount = 7 + 2 * kHeadTimingBuckets;
+  /// fallback_calls, a, b, c, total, gap, d_calls[], d_ticks[], discarded_rows,
+  /// deferred_rows. `ns_per_tick` converts the clock's ticks.
+  static constexpr std::size_t kCounterCount = 7 + 2 * kHeadTimingBuckets + 2;
   [[nodiscard]] static HeadTimingStats FromCounters(
       const unsigned long long* c, double ns_per_tick) noexcept {
     const auto ns = [&](std::uint64_t ticks) {
@@ -190,6 +224,8 @@ struct HeadTimingStats {
       s.d_calls[i] = c[7 + i];
       s.d_ns[i] = ns(c[7 + kHeadTimingBuckets + i]);
     }
+    s.discarded_rows = c[7 + 2 * kHeadTimingBuckets];
+    s.deferred_rows = c[8 + 2 * kHeadTimingBuckets];
     return s;
   }
   HeadTimingStats& operator+=(const HeadTimingStats& o) noexcept {
@@ -204,6 +240,8 @@ struct HeadTimingStats {
       d_calls[i] += o.d_calls[i];
       d_ns[i] += o.d_ns[i];
     }
+    discarded_rows += o.discarded_rows;
+    deferred_rows += o.deferred_rows;
     return *this;
   }
   /// Calls f(name, value) for each field, as reported: counts as they are,
@@ -226,6 +264,8 @@ struct HeadTimingStats {
       f(kUs[i], us(d_ns[i]));
       f(kCalls[i], static_cast<double>(d_calls[i]));
     }
+    f("discarded_rows", static_cast<double>(discarded_rows));
+    f("deferred_rows", static_cast<double>(deferred_rows));
     f("total_us", us(total_ns));
     f("gap_us", us(gap_ns));
   }
@@ -243,6 +283,8 @@ struct HeadTimingStats {
       s.d_calls[i] -= o.d_calls[i];
       s.d_ns[i] -= o.d_ns[i];
     }
+    s.discarded_rows -= o.discarded_rows;
+    s.deferred_rows -= o.deferred_rows;
     return s;
   }
 };
