@@ -217,6 +217,11 @@ struct TextDecodeStep {
   /// Of draft_tokens: proposals copied from the context (prompt lookup).
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
+  /// Trimmed target head (head_trim.hpp): logit rows scored, rows re-run on
+  /// the full head, and full-head passes during this step.
+  std::size_t head_trim_rows{0};
+  std::size_t head_trim_fallbacks{0};
+  std::size_t head_trim_full_reads{0};
   bool stop{false};
   std::optional<sampling::TokenLogprobs> terminal_logprobs;
   /// Execution actually used for this request, including model-owned subgroup

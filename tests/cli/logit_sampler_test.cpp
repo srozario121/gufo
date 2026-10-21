@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
 namespace {
@@ -115,6 +116,57 @@ void TestLogitBias() {
   const auto by_helper = gufo::sampling::BuildDistribution(logits, built);
   Expect(by_helper.probability(2) > by_helper.probability(1) * 10.0,
          "BuildDistribution applies the bias");
+}
+
+// The trimmed head expands its compact logits to the full row with -infinity
+// for every token it does not score. Selection, penalties and logit_bias then
+// work on token IDs as they do on a full row, and a token outside the set is
+// never chosen, greedy or sampled.
+void TestTrimmedHeadRows() {
+  namespace qfn = gufo::models::qwen38_flash_next;
+  using gufo::sampling::SamplerState;
+  // A SYNTHETIC vocabulary of 12 tokens; the head scores IDs 2, 3, 7 and 9.
+  const std::array<std::int32_t, 4> set = {9, 2, 7, 3};
+  const auto plan = qfn::PlanHeadTrim(12, set, {});
+  const std::array<float, 4> compact = {1.0F, 4.0F, 2.0F, 3.0F};  // 2, 3, 7, 9
+  std::array<float, 12> full{};
+  qfn::HeadTrimExpand(compact, plan.inverse, full);
+  SamplerState greedy;
+  Expect(greedy.Sample(full) == 3, "greedy picks the best scored token ID");
+
+  gufo::sampling::SamplingConfig config;
+  config.temperature = 1.0F;
+  for (int draw = 0; draw < 200; ++draw) {
+    SamplerState sampled(config, std::span<const gufo::sampling::TokenId>{});
+    const auto token = sampled.Sample(full);
+    Expect(token == 2 || token == 3 || token == 7 || token == 9,
+           "a sampled token is always one the head scores");
+  }
+
+  // logit_bias is by token ID and moves the winner among the scored rows.
+  auto dense = std::make_shared<std::vector<float>>(12, 0.0F);
+  (*dense)[3] = -8.0F;
+  auto bias = std::make_shared<gufo::sampling::LogitBias>();
+  bias->vocab = 12;
+  bias->defaults = dense;
+  gufo::sampling::SamplingConfig biased;
+  biased.logit_bias = bias;
+  SamplerState moved(biased);
+  Expect(moved.Sample(full) == 9, "a bias on a scored ID moves the winner");
+
+  // A repetition-style penalty on a token the head does not score is harmless.
+  gufo::sampling::SamplingConfig penalized;
+  penalized.presence_penalty = 10.0F;
+  SamplerState with_penalty(penalized,
+                            std::array<gufo::sampling::TokenId, 1>{5});
+  with_penalty.Accept(5);
+  Expect(with_penalty.Sample(full) == 3,
+         "a penalty on an unscored token changes nothing");
+  SamplerState penalized_winner(penalized,
+                                std::array<gufo::sampling::TokenId, 1>{3});
+  penalized_winner.Accept(3);
+  Expect(penalized_winner.Sample(full) == 9,
+         "a penalty on the scored winner hands over to the next scored token");
 }
 
 void TestExternalArgmaxRequiresAppliedPenalties() {
@@ -706,6 +758,7 @@ int main() {
   }
   Expect(sub_float_resolution, "uniform must exceed float resolution");
   TestLogitBias();
+  TestTrimmedHeadRows();
   TestCanonicalTargetDistribution();
   TestResponsePenaltyScope();
   TestGreedySelectsFiniteArgmaxWithoutAdvancingRng();

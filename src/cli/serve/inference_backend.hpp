@@ -53,6 +53,11 @@ struct TextSpeculativeConfig {
   bool logit_bias{false};
   std::string suppress_nonascii_keep;
   float suppress_nonascii_value{-8.0F};
+  /// Token-ID list the Qwen target output head scores (vocab trim, high
+  /// level); empty keeps the full head. The fallback threshold is the top
+  /// probability below which a position re-runs the full head (0: never).
+  std::string head_trim_set;
+  float head_trim_threshold{0.5F};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };

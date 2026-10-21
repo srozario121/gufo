@@ -1,0 +1,143 @@
+#include "src/models/qwen38_flash_next/head_trim.hpp"
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+namespace qfn = gufo::models::qwen38_flash_next;
+
+namespace {
+
+void Require(bool condition, const char* message) {
+  if (!condition)
+    throw std::runtime_error(message);
+}
+
+constexpr float kInf = std::numeric_limits<float>::infinity();
+
+}  // namespace
+
+// The set is sorted, deduplicated and clipped to the vocabulary; the special
+// tokens join it; the compact copy is padded to a whole tile.
+void CheckPlan() {
+  // A SYNTHETIC vocabulary of 1000 tokens, test data only.
+  const std::vector<std::int32_t> set{500, 3, 3, -1, 1000, 77, 5000};
+  const std::vector<std::int32_t> special{999, 77, 998};
+  const auto plan = qfn::PlanHeadTrim(1000, set, special);
+  Require(plan.from_set == 3, "distinct in-range set IDs");
+  Require(plan.added_special == 2, "special tokens the set lacks");
+  Require((plan.ids == std::vector<std::int32_t>{3, 77, 500, 998, 999}),
+          "ascending compact rows");
+  Require(plan.inverse.size() == 1000, "one inverse entry per token");
+  for (std::size_t row = 0; row < plan.ids.size(); ++row)
+    Require(plan.inverse[static_cast<std::size_t>(plan.ids[row])] ==
+                static_cast<std::int32_t>(row),
+            "inverse maps back to the compact row");
+  Require(plan.inverse[4] == -1 && plan.inverse[0] == -1, "unscored rows");
+  Require(plan.padded_rows == qfn::kHeadTrimRowAlign, "padded to a tile");
+
+  std::vector<std::int32_t> many;
+  for (std::int32_t id = 0; id < 600; ++id)
+    many.push_back(id * 3);
+  const auto wide = qfn::PlanHeadTrim(2000, many, {});
+  Require(wide.ids.size() == 600 && wide.padded_rows == 768,
+          "600 rows pad to 768");
+  const auto exact = qfn::PlanHeadTrim(
+      2000, std::vector<std::int32_t>(many.begin(), many.begin() + 512), {});
+  Require(exact.padded_rows == 512, "a whole tile adds no padding");
+}
+
+// An empty set plus no specials is an empty plan; the device refuses it.
+void CheckEmpty() {
+  const auto plan = qfn::PlanHeadTrim(10, {}, {});
+  Require(plan.ids.empty() && plan.padded_rows == 0, "empty plan");
+}
+
+// The top probability is 1 / sum(exp(x - max)); NaN when it is undefined.
+void CheckTopProbability() {
+  const std::array<float, 3> flat{1.0F, 1.0F, 1.0F};
+  Require(std::fabs(qfn::HeadTrimTopProbability(flat) - 1.0F / 3.0F) < 1e-6F,
+          "uniform logits");
+  const std::array<float, 2> sharp{20.0F, 0.0F};
+  Require(qfn::HeadTrimTopProbability(sharp) > 0.999999F, "one clear winner");
+  const std::array<float, 2> half{3.0F, 3.0F};
+  Require(std::fabs(qfn::HeadTrimTopProbability(half) - 0.5F) < 1e-6F,
+          "two equal rows");
+  const std::array<float, 2> nan{1.0F, std::nanf("")};
+  Require(std::isnan(qfn::HeadTrimTopProbability(nan)), "a NaN logit");
+  const std::array<float, 2> none{-kInf, -kInf};
+  Require(std::isnan(qfn::HeadTrimTopProbability(none)), "no finite row");
+}
+
+// The rule: fall back below the threshold or when the probability is not a
+// number; a threshold of 0 never falls back; the threshold itself is confident.
+void CheckFallbackRule() {
+  Require(qfn::kHeadTrimDefaultThreshold == 0.5F, "default threshold");
+  Require(qfn::HeadTrimNeedsFallback(0.49F, 0.5F), "just below");
+  Require(!qfn::HeadTrimNeedsFallback(0.5F, 0.5F), "at the threshold");
+  Require(!qfn::HeadTrimNeedsFallback(0.99F, 0.5F), "confident");
+  Require(qfn::HeadTrimNeedsFallback(std::nanf(""), 0.5F), "NaN falls back");
+  Require(!qfn::HeadTrimNeedsFallback(0.0F, 0.0F) &&
+              !qfn::HeadTrimNeedsFallback(std::nanf(""), 0.0F),
+          "threshold 0 turns the fallback off");
+  Require(qfn::HeadTrimNeedsFallback(0.999F, 1.0F), "threshold 1");
+  // Two scored rows at 0.6 / 0.4 renormalised: confident at 0.5, not at 0.9.
+  const std::array<float, 2> rows{std::log(0.6F), std::log(0.4F)};
+  const float top = qfn::HeadTrimTopProbability(rows);
+  Require(!qfn::HeadTrimNeedsFallback(top, 0.5F) &&
+              qfn::HeadTrimNeedsFallback(top, 0.9F),
+          "the same position under two thresholds");
+}
+
+// Expansion keeps scored values at their token IDs and everything else at
+// -infinity; the argmax of the expansion is the compact argmax mapped back.
+void CheckExpand() {
+  const std::vector<std::int32_t> set{4, 9, 2};
+  const auto plan = qfn::PlanHeadTrim(12, set, {});
+  // compact rows are tokens 2, 4, 9
+  const std::array<float, 3> compact{0.5F, 7.0F, 3.0F};
+  std::array<float, 12> full{};
+  qfn::HeadTrimExpand(compact, plan.inverse, full);
+  std::size_t best = 0;
+  for (std::size_t id = 0; id < full.size(); ++id) {
+    const bool scored = id == 2 || id == 4 || id == 9;
+    Require(scored ? std::isfinite(full[id]) : full[id] == -kInf,
+            "only scored tokens are finite");
+    if (full[id] > full[best])
+      best = id;
+  }
+  Require(best == 4 && full[4] == 7.0F && full[2] == 0.5F && full[9] == 3.0F,
+          "values land on their token IDs");
+  // A token outside the set that the full head would prefer cannot win here;
+  // the fallback exists for it.
+  Require(full[11] == -kInf, "an unscored token cannot win");
+}
+
+// The counters' rate.
+void CheckStats() {
+  qfn::HeadTrimStats stats;
+  Require(stats.Rate() == 0.0, "no rows, no rate");
+  stats.rows = 200;
+  stats.fallbacks = 30;
+  stats.full_reads = 12;
+  Require(std::fabs(stats.Rate() - 0.15) < 1e-12, "rate is fallbacks / rows");
+}
+
+int main() {
+  try {
+    CheckPlan();
+    CheckEmpty();
+    CheckTopProbability();
+    CheckFallbackRule();
+    CheckExpand();
+    CheckStats();
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << '\n';
+    return 1;
+  }
+  return 0;
+}

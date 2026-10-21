@@ -64,6 +64,18 @@ inline std::atomic<std::uint64_t>& TotalLookupAcceptedTokens() {
   static std::atomic<std::uint64_t> count{0};
   return count;
 }
+inline std::atomic<std::uint64_t>& TotalHeadTrimRows() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TotalHeadTrimFallbacks() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TotalHeadTrimFullReads() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
 inline std::atomic<double>& LastPromptSpeed() {
   static std::atomic<double> val{0.0};
   return val;
@@ -124,6 +136,12 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
                                         std::memory_order_relaxed);
   detail::TotalLookupAcceptedTokens().fetch_add(result.lookup_accepted_tokens,
                                                 std::memory_order_relaxed);
+  detail::TotalHeadTrimRows().fetch_add(result.head_trim_rows,
+                                        std::memory_order_relaxed);
+  detail::TotalHeadTrimFallbacks().fetch_add(result.head_trim_fallbacks,
+                                             std::memory_order_relaxed);
+  detail::TotalHeadTrimFullReads().fetch_add(result.head_trim_full_reads,
+                                             std::memory_order_relaxed);
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
@@ -185,6 +203,10 @@ inline std::string GenerationLogDetails(
   if (result.draft_tokens > 0)
     out << " acceptance_pct="
         << 100.0 * result.draft_accepted_tokens / result.draft_tokens;
+  if (result.head_trim_rows > 0)
+    out << " head_trim_rows=" << result.head_trim_rows
+        << " head_trim_fallbacks=" << result.head_trim_fallbacks
+        << " head_trim_full_reads=" << result.head_trim_full_reads;
   if (result.lookup_tokens > 0)
     out << " lookup_accepted=" << result.lookup_accepted_tokens
         << " lookup_proposed=" << result.lookup_tokens;
