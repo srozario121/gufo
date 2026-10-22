@@ -2,11 +2,14 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_HEAD_TRIM_HPP_
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace gufo::models::qwen38_flash_next {
@@ -445,6 +448,115 @@ struct HeadCounterStats {
     f("discarded_changed", static_cast<double>(discarded_changed));
   }
 };
+
+/// Row log of the trimmed head (--vocab-trim-rowlog; measurement only): one
+/// record per HeadProject call, by call site, in device counters that survive
+/// graph replay. Per site: calls, rows scored, the sum of the decoding
+/// sessions the call served, rows flagged by the confidence check and rows
+/// still flagged after the chain policy (the rows that start a full read),
+/// then a histogram of rows per call (0..64) and of sessions per call (0..8).
+/// After the sites come the verification rounds the loop recorded: rounds,
+/// chain rows, and rows kept (the accepted prefix).
+enum HeadRowSite : std::uint32_t {
+  kRowSiteDecodeBatch = 0,  ///< ForwardBatch: one call for all sessions
+  kRowSitePrefill = 1,      ///< Forward, prefill chunks (last n_logits rows)
+  kRowSiteVerify = 2,       ///< Forward, one session's verification chain
+  kRowSiteDecodeOne = 3,    ///< Forward, a plain decode step
+  kRowSiteCheckpoint = 4,   ///< prefill checkpoint logits
+  kRowSiteCount = 5,
+};
+inline constexpr std::uint32_t kRowLogMaxRows = 64;
+inline constexpr std::uint32_t kRowLogMaxSessions = 8;
+inline constexpr std::uint32_t kRowLogCalls = 0;
+inline constexpr std::uint32_t kRowLogRows = 1;
+inline constexpr std::uint32_t kRowLogSessions = 2;
+inline constexpr std::uint32_t kRowLogFlagged = 3;
+inline constexpr std::uint32_t kRowLogFlaggedFinal = 4;
+inline constexpr std::uint32_t kRowLogRowHist = 5;
+inline constexpr std::uint32_t kRowLogSessionHist =
+    kRowLogRowHist + kRowLogMaxRows + 1;
+inline constexpr std::uint32_t kRowLogSiteWords =
+    kRowLogSessionHist + kRowLogMaxSessions + 1;
+inline constexpr std::uint32_t kRowLogChainRounds =
+    kRowSiteCount * kRowLogSiteWords;
+inline constexpr std::uint32_t kRowLogChainRows = kRowLogChainRounds + 1;
+inline constexpr std::uint32_t kRowLogChainKept = kRowLogChainRounds + 2;
+inline constexpr std::uint32_t kRowLogWords = kRowLogChainRounds + 3;
+
+struct HeadRowLogStats {
+  std::array<std::uint64_t, kRowLogWords> w{};
+
+  static constexpr const char* SiteName(std::uint32_t site) noexcept {
+    constexpr const char* names[kRowSiteCount] = {
+        "decode_batch", "prefill", "verify", "decode_one", "checkpoint"};
+    return site < kRowSiteCount ? names[site] : "unknown";
+  }
+  [[nodiscard]] static HeadRowLogStats FromCounters(
+      const unsigned long long* c) noexcept {
+    HeadRowLogStats s;
+    for (std::uint32_t i = 0; i < kRowLogWords; ++i)
+      s.w[i] = c[i];
+    return s;
+  }
+  [[nodiscard]] std::uint64_t Site(std::uint32_t site,
+                                   std::uint32_t word) const noexcept {
+    return w[site * kRowLogSiteWords + word];
+  }
+  [[nodiscard]] bool Any() const noexcept {
+    for (const auto v : w)
+      if (v != 0)
+        return true;
+    return false;
+  }
+  HeadRowLogStats& operator+=(const HeadRowLogStats& o) noexcept {
+    for (std::uint32_t i = 0; i < kRowLogWords; ++i)
+      w[i] += o.w[i];
+    return *this;
+  }
+  [[nodiscard]] HeadRowLogStats Since(const HeadRowLogStats& o) const noexcept {
+    HeadRowLogStats s = *this;
+    for (std::uint32_t i = 0; i < kRowLogWords; ++i)
+      s.w[i] -= o.w[i];
+    return s;
+  }
+  /// Calls f(name, value) for each nonzero field; the caller adds a prefix.
+  template<typename F>
+  void ForEachField(F&& f) const {
+    static constexpr const char* kNames[] = {"calls", "rows", "sessions",
+                                             "flagged", "flagged_final"};
+    for (std::uint32_t site = 0; site < kRowSiteCount; ++site) {
+      const std::string base = std::string(SiteName(site)) + "_";
+      for (std::uint32_t k = 0; k < 5; ++k)
+        if (const auto v = Site(site, k))
+          f((base + kNames[k]).c_str(), static_cast<double>(v));
+      for (std::uint32_t r = 0; r <= kRowLogMaxRows; ++r)
+        if (const auto v = Site(site, kRowLogRowHist + r))
+          f((base + "rows_" + std::to_string(r)).c_str(),
+            static_cast<double>(v));
+      for (std::uint32_t n = 0; n <= kRowLogMaxSessions; ++n)
+        if (const auto v = Site(site, kRowLogSessionHist + n))
+          f((base + "sess_" + std::to_string(n)).c_str(),
+            static_cast<double>(v));
+    }
+    f("chain_rounds", static_cast<double>(w[kRowLogChainRounds]));
+    f("chain_rows", static_cast<double>(w[kRowLogChainRows]));
+    f("chain_kept", static_cast<double>(w[kRowLogChainKept]));
+  }
+};
+
+/// The model's absolute row log as of the latest Statistics() call, for the
+/// server's /metrics (which sees every call, prefill included, and counts each
+/// once). Written by the engine thread, read by the metrics handler.
+inline std::array<std::atomic<std::uint64_t>, kRowLogWords>&
+PublishedRowLog() noexcept {
+  static std::array<std::atomic<std::uint64_t>, kRowLogWords> published{};
+  return published;
+}
+inline void PublishRowLog(const HeadRowLogStats& s) noexcept {
+  auto& p = PublishedRowLog();
+  for (std::uint32_t i = 0; i < kRowLogWords; ++i)
+    p[i].store(s.w[i], std::memory_order_relaxed);
+}
 
 }  // namespace gufo::models::qwen38_flash_next
 

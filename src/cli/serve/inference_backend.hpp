@@ -71,6 +71,10 @@ struct TextSpeculativeConfig {
   /// The full pass skips the rows the compact set scored
   /// (--vocab-trim-fallback-skip-scored).
   bool head_trim_skip_scored{false};
+  /// Log the rows of every head call by call site (--vocab-trim-rowlog).
+  bool head_trim_rowlog{false};
+  /// Report a batched step's head statistics once (--vocab-trim-count-once).
+  bool head_trim_count_once{false};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };
