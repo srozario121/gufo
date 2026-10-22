@@ -8568,6 +8568,60 @@ __device__ inline void ArgmaxMerge(float& value, std::int32_t& index,
   }
 }
 
+__global__ void HeadRowLogCallKernel(unsigned long long* log,
+                                     std::uint32_t site, std::uint32_t rows,
+                                     std::uint32_t sessions) {
+  if (threadIdx.x != 0)
+    return;
+  unsigned long long* s = log + site * kRowLogSiteWords;
+  atomicAdd(&s[kRowLogCalls], 1ULL);
+  atomicAdd(&s[kRowLogRows], static_cast<unsigned long long>(rows));
+  atomicAdd(&s[kRowLogSessions], static_cast<unsigned long long>(sessions));
+  atomicAdd(&s[kRowLogRowHist + min(rows, kRowLogMaxRows)], 1ULL);
+  atomicAdd(&s[kRowLogSessionHist + min(sessions, kRowLogMaxSessions)], 1ULL);
+}
+
+void HeadRowLogCall(unsigned long long* log, std::uint32_t site,
+                    std::uint32_t rows, std::uint32_t sessions,
+                    hipStream_t stream) {
+  hipLaunchKernelGGL(HeadRowLogCallKernel, dim3(1), dim3(1), 0, stream, log,
+                     site, rows, sessions);
+}
+
+__global__ void HeadRowLogFlagsKernel(unsigned long long* log,
+                                      std::uint32_t site, std::uint32_t word,
+                                      const std::int32_t* flags,
+                                      std::uint32_t rows) {
+  if (threadIdx.x != 0)
+    return;
+  unsigned long long n = 0;
+  for (std::uint32_t r = 0; r < rows; ++r)
+    n += flags[r] != 0 ? 1 : 0;
+  atomicAdd(&log[site * kRowLogSiteWords + word], n);
+}
+
+void HeadRowLogFlags(unsigned long long* log, std::uint32_t site,
+                     std::uint32_t word, const std::int32_t* flags,
+                     std::uint32_t rows, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadRowLogFlagsKernel, dim3(1), dim3(1), 0, stream, log,
+                     site, word, flags, rows);
+}
+
+__global__ void HeadRowLogChainKernel(unsigned long long* log,
+                                      std::uint32_t rows, std::uint32_t keep) {
+  if (threadIdx.x != 0)
+    return;
+  atomicAdd(&log[kRowLogChainRounds], 1ULL);
+  atomicAdd(&log[kRowLogChainRows], static_cast<unsigned long long>(rows));
+  atomicAdd(&log[kRowLogChainKept], static_cast<unsigned long long>(keep));
+}
+
+void HeadRowLogChain(unsigned long long* log, std::uint32_t rows,
+                     std::uint32_t keep, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadRowLogChainKernel, dim3(1), dim3(1), 0, stream, log,
+                     rows, keep);
+}
+
 __global__ void HeadCountFlaggedKernel(
     const float* compact, std::uint32_t stride, std::uint32_t scored,
     const std::int32_t* ids, const float* out, std::uint32_t vocab,

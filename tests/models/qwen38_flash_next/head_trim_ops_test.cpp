@@ -968,10 +968,57 @@ void CheckChainPolicy(const std::vector<std::uint32_t>& mismatches,
   CheckHip(hipStreamDestroy(stream), "destroy stream");
 }
 
+// The row log: calls, rows, sessions, flagged rows and the chain record, from
+// a captured graph replayed three times.
+void CheckRowLog() {
+  auto log = Upload(std::vector<unsigned long long>(qfn::kRowLogWords, 0));
+  auto flags = Upload(std::vector<std::int32_t>{1, 0, 1, 1, 0, 0, 0, 0, 1});
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreate(&stream), "stream");
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), "begin");
+  q::HeadRowLogCall(log.get(), qfn::kRowSiteDecodeBatch, 9, 3, stream);
+  q::HeadRowLogFlags(log.get(), qfn::kRowSiteDecodeBatch, qfn::kRowLogFlagged,
+                     flags.get(), 9, stream);
+  q::HeadRowLogFlags(log.get(), qfn::kRowSiteDecodeBatch,
+                     qfn::kRowLogFlaggedFinal, flags.get(), 4, stream);
+  q::HeadRowLogCall(log.get(), qfn::kRowSiteVerify, 4, 1, stream);
+  q::HeadRowLogChain(log.get(), 4, 2, stream);
+  CheckHip(hipStreamEndCapture(stream, &graph), "end");
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  for (int i = 0; i < 3; ++i)
+    CheckHip(hipGraphLaunch(exec, stream), "launch");
+  CheckHip(hipStreamSynchronize(stream), "sync");
+  const auto raw = Download(log.get(), qfn::kRowLogWords);
+  const auto s = qfn::HeadRowLogStats::FromCounters(raw.data());
+  Expect(s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogCalls) == 3 &&
+             s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogRows) == 27 &&
+             s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogSessions) == 9,
+         "row log: calls, rows, sessions");
+  Expect(s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogFlagged) == 12 &&
+             s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogFlaggedFinal) == 9,
+         "row log: flagged rows over the first `rows` flags");
+  Expect(
+      s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogRowHist + 9) == 3 &&
+          s.Site(qfn::kRowSiteDecodeBatch, qfn::kRowLogSessionHist + 3) == 3 &&
+          s.Site(qfn::kRowSiteVerify, qfn::kRowLogRowHist + 4) == 3,
+      "row log: histograms");
+  Expect(s.w[qfn::kRowLogChainRounds] == 3 &&
+             s.w[qfn::kRowLogChainRows] == 12 &&
+             s.w[qfn::kRowLogChainKept] == 6,
+         "row log: verification rounds");
+  CheckHip(hipGraphExecDestroy(exec), "destroy exec");
+  CheckHip(hipGraphDestroy(graph), "destroy graph");
+  CheckHip(hipStreamDestroy(stream), "destroy stream");
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckRowLog();
     CheckTiming();
     CheckCounters();
     CheckTimingTier2();

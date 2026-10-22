@@ -1140,7 +1140,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
            HeadProject(base.mixed, batch_logits_, rows, true, true, error,
-                       &chains);
+                       &chains, kRowSiteDecodeBatch,
+                       static_cast<std::uint32_t>(items.size()));
   };
   bool ok = false;
   try {

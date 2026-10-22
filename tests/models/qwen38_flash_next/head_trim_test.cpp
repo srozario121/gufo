@@ -323,8 +323,45 @@ void CheckCounters() {
           "one reported field per counter");
 }
 
+// The row log: differences, sums, the reported fields and the published copy.
+void CheckRowLog() {
+  qfn::HeadRowLogStats a;
+  a.w[qfn::kRowSiteDecodeBatch * qfn::kRowLogSiteWords + qfn::kRowLogCalls] = 4;
+  a.w[qfn::kRowSiteDecodeBatch * qfn::kRowLogSiteWords + qfn::kRowLogRows] = 36;
+  a.w[qfn::kRowSiteDecodeBatch * qfn::kRowLogSiteWords + qfn::kRowLogRowHist +
+      9] = 4;
+  a.w[qfn::kRowLogChainRounds] = 2;
+  a.w[qfn::kRowLogChainRows] = 8;
+  a.w[qfn::kRowLogChainKept] = 5;
+  Require(a.Any() && !qfn::HeadRowLogStats{}.Any(), "any word set");
+  auto b = a;
+  b += a;
+  const auto d = b.Since(a);
+  Require(d.w == a.w, "a later reading minus an earlier one");
+  double calls = -1, bin = -1, kept = -1;
+  std::size_t fields = 0;
+  a.ForEachField([&](const char* name, double value) {
+    ++fields;
+    if (std::string_view(name) == "decode_batch_calls")
+      calls = value;
+    if (std::string_view(name) == "decode_batch_rows_9")
+      bin = value;
+    if (std::string_view(name) == "chain_kept")
+      kept = value;
+  });
+  Require(calls == 4 && bin == 4 && kept == 5 && fields == 3 + 3 + 0,
+          "only nonzero fields are reported, plus the chain record");
+  qfn::PublishRowLog(a);
+  Require(qfn::PublishedRowLog()[qfn::kRowLogChainKept].load() == 5,
+          "the published copy");
+  Require(std::string_view(
+              qfn::HeadRowLogStats::SiteName(qfn::kRowSiteVerify)) == "verify",
+          "site names");
+}
+
 int main() {
   try {
+    CheckRowLog();
     CheckCounters();
     CheckPlan();
     CheckEmpty();

@@ -1211,6 +1211,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       if (e->head_ctr_ == nullptr || e->head_rowinfo_ == nullptr)
         return nullptr;
     }
+    if (trim->rowlog) {
+      e->head_rowlog_ = Alloc<unsigned long long>(a, kRowLogWords, error_msg);
+      if (e->head_rowlog_ == nullptr)
+        return nullptr;
+    }
     if (trim->discard_aware) {
       e->head_argmax_ = Alloc<std::int32_t>(a, head_rows, error_msg);
       e->head_defer_ = Alloc<std::int32_t>(a, head_rows, error_msg);
@@ -1521,7 +1526,8 @@ void Executor::MaskSuppressed(float* logits, std::uint32_t n,
 
 bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
                            bool batch, bool fallback, std::string* error_msg,
-                           const HeadChains* chains) const {
+                           const HeadChains* chains, std::uint32_t site,
+                           std::uint32_t sessions) const {
   const auto& full = model_->output();
   const auto* trim = model_->head_trim();
   if (trim == nullptr)
@@ -1544,6 +1550,8 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
   if (with_fallback && chains != nullptr && head_argmax_ != nullptr)
     for (std::uint32_t b = 0; b < chains->count; ++b)
       chained = chained || chains->mode[b] != kHeadChainInline;
+  if (head_rowlog_ != nullptr)
+    HeadRowLogCall(head_rowlog_, site, rows, sessions, stream_);
   if (timed) {
     HeadTimingStamp(head_timing_, 0, stream_);
     HeadTimingStamp(head_timing_, 4, stream_);
@@ -1562,10 +1570,16 @@ bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
                    trim->threshold, head_flags_, head_counters_, stream_,
                    chained ? trim->ids : nullptr,
                    chained ? head_argmax_ : nullptr);
+    if (head_rowlog_ != nullptr)
+      HeadRowLogFlags(head_rowlog_, site, kRowLogFlagged, head_flags_, rows,
+                      stream_);
     if (chained) {
       HeadChainPolicy(*chains, head_argmax_, head_flags_, head_defer_, rows,
                       head_timing_, stream_);
     }
+    if (head_rowlog_ != nullptr)
+      HeadRowLogFlags(head_rowlog_, site, kRowLogFlaggedFinal, head_flags_,
+                      rows, stream_);
     if (timed)
       HeadTimingStamp(head_timing_, 3, stream_);
     final_flags = HeadFallbackPass(x, out, rows);
@@ -1691,6 +1705,8 @@ bool Executor::ResolveDeferredHeadRows(std::uint32_t from, std::uint32_t rows,
 }
 
 void Executor::RecordHeadChain(std::uint32_t rows, std::uint32_t keep) const {
+  if (head_rowlog_ != nullptr && rows != 0)
+    HeadRowLogChain(head_rowlog_, rows, keep, stream_);
   if (head_ctr_ == nullptr || rows == 0)
     return;
   // A batched decode's head call carried every session's rows; this session's
@@ -1715,6 +1731,17 @@ HeadCounterStats Executor::HeadCounterStatistics() const {
       hipStreamSynchronize(stream_) != hipSuccess)
     return {};
   return HeadCounterStats::FromCounters(counters);
+}
+
+HeadRowLogStats Executor::HeadRowLogStatistics() const {
+  if (head_rowlog_ == nullptr)
+    return {};
+  unsigned long long counters[kRowLogWords]{};
+  if (hipMemcpyAsync(counters, head_rowlog_, sizeof(counters),
+                     hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+      hipStreamSynchronize(stream_) != hipSuccess)
+    return {};
+  return HeadRowLogStats::FromCounters(counters);
 }
 
 HeadTrimStats Executor::HeadStatistics() const {
@@ -3634,7 +3661,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!HcMix(model_->hc_head(),
                s_.res + std::size_t{checkpoint->tokens - 1} * c.HcDim(), false,
                s_.mixed, nullptr, 1, error_msg) ||
-        !HeadProject(s_.mixed, s_.logits, 1, false, true, error_msg) ||
+        !HeadProject(s_.mixed, s_.logits, 1, false, true, error_msg, nullptr,
+                     kRowSiteCheckpoint, 1) ||
         !Check(hipMemcpyAsync(checkpoint->logits.data(), s_.logits,
                               std::size_t{c.vocab_size} * sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
@@ -3656,6 +3684,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     return false;
   }
   if (n_logits > 0) {
+    const bool in_prefill = prefill_phase;
     PrefillPhase head_phase(false);
     // Only the requested tail needs the head's normalization.
     const std::size_t skip = static_cast<std::size_t>(n - n_logits);
@@ -3673,7 +3702,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg) ||
         !HeadProject(s_.mixed, s_.logits, n_logits, false, true, error_msg,
-                     &chains)) {
+                     &chains,
+                     in_prefill    ? kRowSitePrefill
+                     : speculative ? kRowSiteVerify
+                                   : kRowSiteDecodeOne,
+                     1)) {
       return false;
     }
     if (head_mode == kHeadChainLazy && download_logits &&

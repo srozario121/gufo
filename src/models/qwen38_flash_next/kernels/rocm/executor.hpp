@@ -260,6 +260,9 @@ public:
   /// The fallback's measurement counters (zero unless counters are on).
   /// Waits for the stream.
   [[nodiscard]] HeadCounterStats HeadCounterStatistics() const;
+  /// The row log of the trimmed head's calls (zero unless
+  /// --vocab-trim-rowlog). Waits for the stream.
+  [[nodiscard]] HeadRowLogStats HeadRowLogStatistics() const;
   /// Records one verification round for the counters: the chain of `rows`
   /// rows whose head call was the latest one, of which `keep` positions were
   /// kept. Stream-ordered, no host wait; a no-op unless counters are on.
@@ -609,7 +612,9 @@ private:
   /// false: a draft only proposes. `batch` selects DenseBatch.
   bool HeadProject(const float* x, float* out, std::uint32_t rows, bool batch,
                    bool fallback, std::string* error_msg,
-                   const HeadChains* chains = nullptr) const;
+                   const HeadChains* chains = nullptr,
+                   std::uint32_t site = kRowSiteDecodeOne,
+                   std::uint32_t sessions = 1) const;
   /// The full-head pass for the rows flagged in head_flags_ (quantize the
   /// activations, read the head, correct the rows of `out`). Shared by
   /// HeadProject and ResolveDeferredHeadRows.
@@ -848,6 +853,8 @@ private:
   /// Fallback counters (HeadCounterStats::kCounterCount) and one word per row
   /// saying whether the argmax changed; null unless counters are on.
   unsigned long long* head_ctr_{nullptr};
+  /// Row log (kRowLogWords counters); null unless --vocab-trim-rowlog.
+  unsigned long long* head_rowlog_{nullptr};
   std::int32_t* head_rowinfo_{nullptr};
   void* head_quantized_{nullptr};
   /// Discard-aware flagging (--vocab-trim-discard-aware): the argmax token of
