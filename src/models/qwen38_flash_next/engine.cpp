@@ -1041,7 +1041,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // established its source and a full sampled match still holds. New or
   // short matches retain the neural proposal: replacing it based only on
   // shared syntax previously regressed an identical Pi code write by 9%.
-  if (AppendLookup(*pending, stop_at_eos, 3, sampled)) {
+  if (!sampled && AppendLookup(*pending, stop_at_eos, 3)) {  // experiment
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
