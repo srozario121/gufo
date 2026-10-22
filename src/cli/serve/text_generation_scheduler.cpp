@@ -1496,6 +1496,7 @@ struct TextGenerationScheduler::Impl {
       request->result.head_trim_full_reads += step.head_trim_full_reads;
       request->result.head_trim_timing += step.head_trim_timing;
       request->result.head_trim_counters += step.head_trim_counters;
+      request->result.head_trim_rowlog += step.head_trim_rowlog;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1808,6 +1809,7 @@ struct TextGenerationScheduler::Impl {
       item.request->result.head_trim_full_reads += step.head_trim_full_reads;
       item.request->result.head_trim_timing += step.head_trim_timing;
       item.request->result.head_trim_counters += step.head_trim_counters;
+      item.request->result.head_trim_rowlog += step.head_trim_rowlog;
 
       bool published = true;
       try {

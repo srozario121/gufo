@@ -9,6 +9,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
@@ -738,6 +739,21 @@ void HeadTimingFinish(unsigned long long* timing, const std::int32_t* flags,
                       std::uint32_t rows, bool fallback, hipStream_t stream,
                       bool stage_only = false,
                       const std::int32_t* tier1_flags = nullptr);
+
+/// Row log (--vocab-trim-rowlog; HeadRowLogStats layout). One thread each, so
+/// the sums survive graph replay. HeadRowLogCall records one head call of
+/// `rows` rows serving `sessions` sessions at `site`; HeadRowLogFlags adds the
+/// number of set flags among the first `rows` to word `word` of the site
+/// (kRowLogFlagged or kRowLogFlaggedFinal); HeadRowLogChain records one
+/// verification round of `rows` rows of which `keep` were kept.
+void HeadRowLogCall(unsigned long long* log, std::uint32_t site,
+                    std::uint32_t rows, std::uint32_t sessions,
+                    hipStream_t stream);
+void HeadRowLogFlags(unsigned long long* log, std::uint32_t site,
+                     std::uint32_t word, const std::int32_t* flags,
+                     std::uint32_t rows, hipStream_t stream);
+void HeadRowLogChain(unsigned long long* log, std::uint32_t rows,
+                     std::uint32_t keep, hipStream_t stream);
 
 /// Measurement counters for the fallback (--vocab-trim-counters;
 /// HeadCounterStats). For each row with flags[r] != 0, after the fallback has

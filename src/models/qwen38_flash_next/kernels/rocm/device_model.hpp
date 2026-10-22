@@ -122,6 +122,7 @@ public:
     bool counters{
         false};  ///< count what the fallback buys (--vocab-trim-counters)
     bool discard_aware{false};  ///< --vocab-trim-discard-aware
+    bool rowlog{false};         ///< --vocab-trim-rowlog
     /// --vocab-trim-tier2: a flagged row is first re-scored over the first
     /// `tier2_rows` token ids (0 = off), and goes on to the full matrix only
     /// if its top probability over those and the compact set is under
@@ -150,6 +151,9 @@ public:
   /// Turns the fallback's measurement counters on (default off); needs
   /// SetHeadTrim.
   void SetHeadTrimCounters(bool on) noexcept { head_trim_.counters = on; }
+  /// Logs the rows of every head call by call site (default off); needs
+  /// SetHeadTrim.
+  void SetHeadTrimRowLog(bool on) noexcept { head_trim_.rowlog = on; }
   /// Discard-aware flagging (--vocab-trim-discard-aware; default off): chains
   /// do not pay a full-head read for rows that cannot be used. Needs
   /// SetHeadTrim and a threshold above 0.

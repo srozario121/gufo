@@ -1578,6 +1578,56 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
         << "gufo_head_trim_full_reads_total "
         << detail::TotalHeadTrimFullReads().load(std::memory_order_relaxed)
         << "\n";
+  {
+    // --vocab-trim-rowlog: the model's absolute row log as of the engine's
+    // latest statistics read (head calls by call site, prefill included).
+    namespace hq = ::gufo::models::qwen38_flash_next;
+    const auto& log = hq::PublishedRowLog();
+    bool any = false;
+    for (const auto& word : log)
+      any = any || word.load(std::memory_order_relaxed) != 0;
+    if (any) {
+      static constexpr const char* kWords[] = {"calls", "rows", "sessions",
+                                               "flagged", "flagged_final"};
+      for (std::uint32_t k = 0; k < 5; ++k) {
+        out << "# TYPE gufo_head_trim_rowhist_" << kWords[k] << "_total "
+            << "counter\n";
+        for (std::uint32_t site = 0; site < hq::kRowSiteCount; ++site)
+          out << "gufo_head_trim_rowhist_" << kWords[k] << "_total{site=\""
+              << hq::HeadRowLogStats::SiteName(site) << "\"} "
+              << log[site * hq::kRowLogSiteWords + k].load(
+                     std::memory_order_relaxed)
+              << "\n";
+      }
+      out << "# TYPE gufo_head_trim_rowhist_rows_bucket counter\n";
+      for (std::uint32_t site = 0; site < hq::kRowSiteCount; ++site)
+        for (std::uint32_t r = 0; r <= hq::kRowLogMaxRows; ++r)
+          if (const auto v =
+                  log[site * hq::kRowLogSiteWords + hq::kRowLogRowHist + r]
+                      .load(std::memory_order_relaxed))
+            out << "gufo_head_trim_rowhist_rows_bucket{site=\""
+                << hq::HeadRowLogStats::SiteName(site) << "\",rows=\"" << r
+                << "\"} " << v << "\n";
+      out << "# TYPE gufo_head_trim_rowhist_sessions_bucket counter\n";
+      for (std::uint32_t site = 0; site < hq::kRowSiteCount; ++site)
+        for (std::uint32_t n = 0; n <= hq::kRowLogMaxSessions; ++n)
+          if (const auto v =
+                  log[site * hq::kRowLogSiteWords + hq::kRowLogSessionHist + n]
+                      .load(std::memory_order_relaxed))
+            out << "gufo_head_trim_rowhist_sessions_bucket{site=\""
+                << hq::HeadRowLogStats::SiteName(site) << "\",sessions=\"" << n
+                << "\"} " << v << "\n";
+      out << "# TYPE gufo_head_trim_rowhist_chain_rounds_total counter\n"
+          << "gufo_head_trim_rowhist_chain_rounds_total "
+          << log[hq::kRowLogChainRounds].load(std::memory_order_relaxed)
+          << "\n# TYPE gufo_head_trim_rowhist_chain_rows_total counter\n"
+          << "gufo_head_trim_rowhist_chain_rows_total "
+          << log[hq::kRowLogChainRows].load(std::memory_order_relaxed)
+          << "\n# TYPE gufo_head_trim_rowhist_chain_kept_total counter\n"
+          << "gufo_head_trim_rowhist_chain_kept_total "
+          << log[hq::kRowLogChainKept].load(std::memory_order_relaxed) << "\n";
+    }
+  }
   out << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"

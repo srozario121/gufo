@@ -92,6 +92,13 @@ struct ModelOptions {
   /// The full pass reads only the rows the compact set does not hold and keeps
   /// the compact values for the rest (--vocab-trim-fallback-skip-scored).
   bool head_trim_skip_scored = false;
+  /// Log the rows of every head call by call site (--vocab-trim-rowlog);
+  /// measurement only.
+  bool head_trim_rowlog = false;
+  /// A batched decode step's head statistics are reported once, to the first
+  /// request of the batch, instead of to every request
+  /// (--vocab-trim-count-once); accounting only.
+  bool head_trim_count_once = false;
 };
 
 class Session;
@@ -129,6 +136,8 @@ public:
   [[nodiscard]] bool HeadTrimmed() const noexcept { return head_trimmed_; }
   /// The trimmed head defers or drops fallback reads of unusable chain rows.
   [[nodiscard]] bool HeadDiscardAware() const noexcept;
+  /// Batched steps report the model-wide head statistics to one request.
+  [[nodiscard]] bool HeadCountOnce() const noexcept { return head_count_once_; }
   /// The server-wide logit bias (vocabulary size and default suppression); null
   /// when `logit_bias` is off. Its presence is what makes a server accept
   /// `logit_bias` in a request.
@@ -169,6 +178,7 @@ private:
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
   bool head_trimmed_{false};
+  bool head_count_once_{false};
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Static rows at the start of every session's draft table: the special
@@ -286,6 +296,8 @@ public:
     HeadTimingStats head_timing{};
     /// Fallback measurement counters, when counters are on.
     HeadCounterStats head_counters{};
+    /// Row log of the head calls, when --vocab-trim-rowlog is on.
+    HeadRowLogStats head_rowlog{};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept;
 

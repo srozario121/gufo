@@ -204,6 +204,7 @@ struct TextDecodeStep {
   /// (--vocab-trim-timing); zero when off.
   ::gufo::models::qwen38_flash_next::HeadTimingStats head_trim_timing{};
   ::gufo::models::qwen38_flash_next::HeadCounterStats head_trim_counters{};
+  ::gufo::models::qwen38_flash_next::HeadRowLogStats head_trim_rowlog{};
   bool stop{false};
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.

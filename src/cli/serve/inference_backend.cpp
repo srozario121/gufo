@@ -3063,6 +3063,8 @@ public:
         stats_after.head_timing.Since(stats_before.head_timing);
     step.head_trim_counters =
         stats_after.head_counters.Since(stats_before.head_counters);
+    step.head_trim_rowlog =
+        stats_after.head_rowlog.Since(stats_before.head_rowlog);
     return step;
   }
 
@@ -3131,6 +3133,10 @@ public:
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
     std::vector<TextDecodeStep> steps(count);
+    // The head statistics are the model's: every request of the batch would
+    // report the whole step's. --vocab-trim-count-once gives them to the first
+    // request that decoded (the row log always does, so its sum is exact).
+    bool head_reported = false;
     for (std::size_t i = 0; i < count; ++i) {
       if (!outcomes[i].completed) {
         steps[i].failure = std::make_exception_ptr(
@@ -3157,14 +3163,21 @@ public:
           stats.lookup_accepted - before[i].lookup_accepted;
       // The head counters are the model's, so a batched step's rows are
       // shared by its requests: each one reports the whole step's.
-      step.head_trim_rows = stats.head_rows - before[i].head_rows;
-      step.head_trim_fallbacks =
-          stats.head_fallbacks - before[i].head_fallbacks;
-      step.head_trim_full_reads =
-          stats.head_full_reads - before[i].head_full_reads;
-      step.head_trim_timing = stats.head_timing.Since(before[i].head_timing);
-      step.head_trim_counters =
-          stats.head_counters.Since(before[i].head_counters);
+      const bool first_report = !head_reported && !results[i].tokens.empty();
+      if (first_report)
+        head_reported = true;
+      if (first_report || !model_->HeadCountOnce()) {
+        step.head_trim_rows = stats.head_rows - before[i].head_rows;
+        step.head_trim_fallbacks =
+            stats.head_fallbacks - before[i].head_fallbacks;
+        step.head_trim_full_reads =
+            stats.head_full_reads - before[i].head_full_reads;
+        step.head_trim_timing = stats.head_timing.Since(before[i].head_timing);
+        step.head_trim_counters =
+            stats.head_counters.Since(before[i].head_counters);
+      }
+      if (first_report)
+        step.head_trim_rowlog = stats.head_rowlog.Since(before[i].head_rowlog);
     }
     return steps;
   }
@@ -3441,6 +3454,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .head_trim_tier2_threshold =
                 speculative_config.head_trim_tier2_threshold,
             .head_trim_skip_scored = speculative_config.head_trim_skip_scored,
+            .head_trim_rowlog = speculative_config.head_trim_rowlog,
+            .head_trim_count_once = speculative_config.head_trim_count_once,
         },
         &load_error);
     if (model == nullptr) {
