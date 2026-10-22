@@ -4194,6 +4194,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
 bool Executor::CanCompactMtpVerification(
     const sampling::SamplerState& sampler) {
   const auto& config = sampler.config();
+  if (config.top_k >= 0)  // experiment: compact sampled verification off
+    return false;
   return config.uses_random_sampling() && config.top_k > 0 &&
          std::size_t(config.top_k) <= kMtpCandidates &&
          config.min_keep <= kMtpCandidates &&
