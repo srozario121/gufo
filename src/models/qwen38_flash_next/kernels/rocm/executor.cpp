@@ -4594,6 +4594,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
 bool Executor::CanCompactMtpVerification(
     const sampling::SamplerState& sampler) {
   const auto& config = sampler.config();
+  if (config.top_k >= 0)  // experiment: compact sampled verification off
+    return false;
   // The compact device path cannot apply a logit bias; that is host-side.
   return config.uses_random_sampling() && !config.bias_active() &&
          config.top_k > 0 && std::size_t(config.top_k) <= kMtpCandidates &&
