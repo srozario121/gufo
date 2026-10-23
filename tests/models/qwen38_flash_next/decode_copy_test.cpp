@@ -92,8 +92,8 @@ void CheckQuantizerAgainstReference() {
     std::uint8_t rlevels[32];
     ReferenceQ4_1(x, &rd, &rm, rlevels);
     const double e = Error(x, d, m, levels);
-    const double re = Error(x, qfn::RoundToHalf(rd), qfn::RoundToHalf(rm),
-                            rlevels);
+    const double re =
+        Error(x, qfn::RoundToHalf(rd), qfn::RoundToHalf(rm), rlevels);
     // The search starts from the plain mapping and keeps the best fit, so
     // it may not do materially worse on any block.
     Require(e <= re * 1.05 + 1e-9, "fitted block worse than the reference");
@@ -127,9 +127,9 @@ void CheckParse() {
   Require(qfn::ParseDecodeCopyMode(nullptr, &mode) &&
               mode == qfn::DecodeCopyMode::kOff,
           "unset is off");
-  Require(qfn::ParseDecodeCopyMode("", &mode) &&
-              mode == qfn::DecodeCopyMode::kOff,
-          "empty is off");
+  Require(
+      qfn::ParseDecodeCopyMode("", &mode) && mode == qfn::DecodeCopyMode::kOff,
+      "empty is off");
   Require(qfn::ParseDecodeCopyMode("off", &mode) &&
               mode == qfn::DecodeCopyMode::kOff,
           "off");

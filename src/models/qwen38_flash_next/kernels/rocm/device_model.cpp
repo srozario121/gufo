@@ -515,9 +515,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t copied = 0;
     std::size_t tensors = 0;
     const auto add = [&](DeviceTensor& t, DecodeCopyClass cls) {
-      const DecodeCopyCandidate candidate{
-          cls, t.type == core::GgmlType::kQ8_0, t.data != nullptr, t.rows,
-          t.cols};
+      const DecodeCopyCandidate candidate{cls, t.type == core::GgmlType::kQ8_0,
+                                          t.data != nullptr, t.rows, t.cols};
       if (!ShouldCopyForDecode(copy_mode, candidate)) {
         return;
       }
@@ -536,9 +535,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       m->allocations_.push_back(copy);
       m->bytes_ += bytes;
-      (void)hipMemset(static_cast<std::uint8_t*>(copy) +
-                          DecodeCopyBytes(t.rows, t.cols),
-                      0, kTailMargin);
+      (void)hipMemset(
+          static_cast<std::uint8_t*>(copy) + DecodeCopyBytes(t.rows, t.cols), 0,
+          kTailMargin);
       const std::size_t blocks = std::size_t{t.rows} * t.cols / 32;
       if (RequantQ8_0ToQ4_1(t.data, copy, blocks, nullptr)) {
         t.decode_data = copy;
@@ -560,8 +559,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       return nullptr;
     }
-    std::fprintf(stderr, "decode Q4_1 copies: %zu tensors, %.2f GiB\n",
-                 tensors,
+    std::fprintf(stderr, "decode Q4_1 copies: %zu tensors, %.2f GiB\n", tensors,
                  static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0));
   }
   return m;
