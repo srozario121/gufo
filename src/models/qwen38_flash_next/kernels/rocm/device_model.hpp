@@ -20,6 +20,12 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  /// Q4_1 re-encoding of a large Q8_0 matrix that the narrow (at most eight
+  /// row) decode projections read in place of `data`; null when there is
+  /// none, which is always so unless GUFO_DECODE_COPY=balanced. Prefill and
+  /// wide batches keep reading `data`. Any view of `data` that slices or
+  /// reshapes it must clear this.
+  void* decode_data{nullptr};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {

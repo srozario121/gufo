@@ -303,6 +303,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       kv.data = static_cast<std::uint8_t*>(kv.data) +
                 std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
       kv.rows = 2 * c.AttentionKvDim();
+      kv.decode_data = nullptr;  // the Q4_1 copy is of the whole matrix
       if (!DenseBatch(kv, base.mixed, base.qg, rows, error) ||
           !DenseBatch(l.indexer_k, base.mixed, base.ik, rows, error))
         return false;
@@ -692,6 +693,16 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.decode_data != nullptr && NarrowDecodeRows(kDecodeRows)) {
+    // A wider decode batch takes the Q4_1 copy in pieces of eight rows.
+    for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+      const auto count = std::min(kDecodeRows, rows - r);
+      if (!Dense(w, x + std::size_t{r} * w.cols, out + std::size_t{r} * w.rows,
+                 count, error))
+        return false;
+    }
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);

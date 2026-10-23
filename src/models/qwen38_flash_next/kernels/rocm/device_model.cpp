@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/qwen38_flash_next/decode_copy.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -496,6 +499,70 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.source_bytes + kTailMargin;
+  }
+  // GUFO_DECODE_COPY=balanced: a Q4_1 copy of the selected Q8_0 trunk matrices
+  // for the narrow decode projections. Off unless asked for; the MTP block is
+  // never copied.
+  DecodeCopyMode copy_mode = DecodeCopyMode::kOff;
+  const char* copy_env = std::getenv("GUFO_DECODE_COPY");
+  if (!ParseDecodeCopyMode(copy_env, &copy_mode)) {
+    std::fprintf(stderr,
+                 "GUFO_DECODE_COPY=%s is not off or balanced; decode copies "
+                 "stay off\n",
+                 copy_env);
+  }
+  if (copy_mode != DecodeCopyMode::kOff) {
+    std::size_t copied = 0;
+    std::size_t tensors = 0;
+    const auto add = [&](DeviceTensor& t, DecodeCopyClass cls) {
+      const DecodeCopyCandidate candidate{
+          cls, t.type == core::GgmlType::kQ8_0, t.data != nullptr, t.rows,
+          t.cols};
+      if (!ShouldCopyForDecode(copy_mode, candidate)) {
+        return;
+      }
+      const std::size_t bytes = DecodeCopyBytes(t.rows, t.cols) + kTailMargin;
+      std::size_t free_bytes = 0;
+      std::size_t total_bytes = 0;
+      if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess ||
+          !hip::HeapFitsAboveReserve(free_bytes, bytes)) {
+        (void)hipGetLastError();
+        return;  // the tensor keeps its Q8_0 decode path
+      }
+      void* copy = nullptr;
+      if (hipMalloc(&copy, bytes) != hipSuccess) {
+        (void)hipGetLastError();
+        return;
+      }
+      m->allocations_.push_back(copy);
+      m->bytes_ += bytes;
+      (void)hipMemset(static_cast<std::uint8_t*>(copy) +
+                          DecodeCopyBytes(t.rows, t.cols),
+                      0, kTailMargin);
+      const std::size_t blocks = std::size_t{t.rows} * t.cols / 32;
+      if (RequantQ8_0ToQ4_1(t.data, copy, blocks, nullptr)) {
+        t.decode_data = copy;
+        copied += bytes;
+        ++tensors;
+      }
+    };
+    for (auto& l : m->layers_) {
+      add(l.ssm_in, DecodeCopyClass::kSsmIn);
+      add(l.ssm_out, DecodeCopyClass::kSsmOut);
+      add(l.attn_qkv, DecodeCopyClass::kAttnQkv);
+      add(l.shexp_up, DecodeCopyClass::kShexp);
+      add(l.shexp_gate, DecodeCopyClass::kShexp);
+      add(l.shexp_down, DecodeCopyClass::kShexp);
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = "decode weight conversion failed";
+      }
+      return nullptr;
+    }
+    std::fprintf(stderr, "decode Q4_1 copies: %zu tensors, %.2f GiB\n",
+                 tensors,
+                 static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0));
   }
   return m;
 }

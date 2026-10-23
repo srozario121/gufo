@@ -704,6 +704,9 @@ private:
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
+  /// True when a projection of `rows` rows takes the narrow decode kernels
+  /// (never in a prefill pass), so a Q4_1 decode copy may be read.
+  static bool NarrowDecodeRows(std::uint32_t rows);
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,

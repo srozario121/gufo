@@ -1592,8 +1592,27 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   return true;
 }
 
+bool Executor::NarrowDecodeRows(std::uint32_t rows) {
+  return !MatrixRows(rows);
+}
+
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
+  // GUFO_DECODE_COPY=balanced: the narrow decode projection reads the Q4_1
+  // copy. q.n beyond kVecBatch never gets here with a copy in use.
+  if (w.decode_data != nullptr && q.data != nullptr && q.n <= kVecBatch) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_q4_1_dense_vec_preq(
+            w.decode_data, q.data, out, static_cast<int>(w.rows),
+            static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
+      AssignError(error_msg, "Q4_1 decode GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
@@ -1614,6 +1633,24 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      up.decode_data != nullptr && gate.decode_data != nullptr &&
+      up.rows == gate.rows && up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
+      return false;
+    }
+    if (xq.data != nullptr) {
+      if (qfn_mmq_q4_1_gated_vec_preq(
+              up.decode_data, gate.decode_data, xq.data, out,
+              static_cast<int>(up.rows), static_cast<int>(n_tokens),
+              static_cast<int>(up.cols), stream_) != 0) {
+        AssignError(error_msg, "gated Q4_1 GEMV failed");
+        return false;
+      }
+      return true;
+    }
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
@@ -4525,6 +4562,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();
     kv.rows = 2 * c.AttentionKvDim();
+    kv.decode_data = nullptr;  // the Q4_1 copy is of the whole matrix
     if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
                           nullptr, attn.k_cache, attn.v_cache, n, 0,
