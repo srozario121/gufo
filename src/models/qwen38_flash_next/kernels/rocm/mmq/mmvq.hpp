@@ -47,3 +47,15 @@ void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
                                  float* output, int k, int rows,
                                  int experts_used, int input_stride,
                                  hipStream_t stream);
+
+// Q4_1 decode copy (see decode_copy.hpp): dense projection of 1-8 tokens, and
+// the shared-expert pair out = silu(gate) * up. Inputs are already quantized
+// to Q8_1 with row stride input_stride blocks.
+void mul_mat_vec_q4_1_dense_dispatch(const void* weights,
+                                     const block_q8_1* input, float* output,
+                                     int k, int rows, int tokens,
+                                     int input_stride, hipStream_t stream);
+void mul_mat_vec_q4_1_gated_dispatch(const void* weights, const void* gate,
+                                     const block_q8_1* input, float* output,
+                                     int k, int rows, int tokens,
+                                     int input_stride, hipStream_t stream);

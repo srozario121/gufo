@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/models/qwen38_flash_next/decode_copy.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -5180,6 +5181,36 @@ struct Q5_1Block {
 };
 static_assert(sizeof(Q5_1Block) == 24, "block_q5_1 must be 24 bytes");
 
+struct Q4_1Block {
+  __half d;
+  __half m;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Q4_1Block) == 20, "block_q4_1 must be 20 bytes");
+
+/// One thread re-encodes one Q8_0 block as Q4_1 (see decode_copy.hpp).
+__global__ void RequantQ8ToQ4_1Kernel(const Q8_0Block* __restrict__ src,
+                                      Q4_1Block* __restrict__ dst,
+                                      std::size_t blocks) {
+  const std::size_t b = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (b >= blocks) {
+    return;
+  }
+  const Q8_0Block in = src[b];
+  const float scale = __half2float(in.d);
+  float x[32];
+  for (int j = 0; j < 32; ++j) {
+    x[j] = scale * static_cast<float>(in.qs[j]);
+  }
+  float d = 0.0F;
+  float m = 0.0F;
+  Q4_1Block out;
+  QuantizeQ4_1Block(x, &d, &m, out.qs);
+  out.d = __float2half(d);
+  out.m = __float2half(m);
+  dst[b] = out;
+}
+
 // Routed F16 WMMA expert GEMM. The int8 kernel above pays a float epilogue
 // and an activation-sum correction every K block because the per-32 scales
 // of both operands sit outside the integer dot product; here the weights are
@@ -5949,6 +5980,17 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 }
 
 }  // namespace
+
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream) {
+  if (blocks == 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(
+      RequantQ8ToQ4_1Kernel, dim3(Blocks(blocks)), dim3(kThreads), 0, stream,
+      static_cast<const Q8_0Block*>(src), static_cast<Q4_1Block*>(dst), blocks);
+  return hipGetLastError() == hipSuccess;
+}
 
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,

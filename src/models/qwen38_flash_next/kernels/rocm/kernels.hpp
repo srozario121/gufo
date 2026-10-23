@@ -184,6 +184,11 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
 void ExpandQ8_0(const void* q8, float* out, std::size_t count,
                 hipStream_t stream);
 
+/// Re-encodes `blocks` Q8_0 blocks as Q4_1 (20 bytes each) for the decode
+/// GEMV (see decode_copy.hpp). False, with nothing launched, for zero blocks.
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
+
 /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
 /// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
 /// bytes, padded to the GEMM's 128-token macro tile), then an int8 WMMA
