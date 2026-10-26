@@ -156,6 +156,8 @@
         in
         {
           default = base;
+          # MTP draft-head training-data dump tool (see .devops/nix/dump-hidden.nix); not part of the served image.
+          gufo-dump-hidden = gufoPackages.${system}.gufo-dump-hidden;
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };
