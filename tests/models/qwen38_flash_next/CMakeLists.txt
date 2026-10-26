@@ -23,6 +23,7 @@ add_qwen38_flash_next_test(rope_scaling_oracle
   gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(draft_vocab gufo_core "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
+add_qwen38_flash_next_test(dump_rows gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -82,6 +83,11 @@ if (ENGINE_ENABLE_HIP)
     routed_gemm_bench.cpp)
   target_link_libraries(qwen38_flash_next_routed_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
+
+  # Training-data dump for the MTP draft head (a long-lived stdin/stdout tool; its row logic is the CPU test dump_rows).
+  add_executable(qwen38_flash_next_dump_hidden EXCLUDE_FROM_ALL dump_hidden.cpp)
+  target_link_libraries(qwen38_flash_next_dump_hidden PRIVATE
+    gufo_qwen38_flash_next)
 
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
