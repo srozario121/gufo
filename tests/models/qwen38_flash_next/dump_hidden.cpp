@@ -52,20 +52,32 @@ class GpuTrunk {
     std::string error;
     if (!exec_.Forward(session_, tokens, 0, nullptr, q::rocm::Executor::ForwardMode::kPrefill, &error))
       throw Fail("prefill failed: " + error);
+    kept_ = std::min<std::size_t>(tokens.size(), exec_.max_speculative());
   }
   void Batch(std::span<const std::int32_t> tokens, float* logits, float* hidden) {
     std::string error;
     const auto n = static_cast<std::uint32_t>(tokens.size());
     if (!exec_.Forward(session_, tokens, n, logits, q::rocm::Executor::ForwardMode::kPrefill, &error))
       throw Fail("forward failed: " + error);
+    kept_ = std::min<std::size_t>(n, exec_.max_speculative());
     if (!exec_.CopyTrunkHidden(session_, std::span<float>(hidden, std::size_t{n} * hc_), &error))
       throw Fail("trunk hidden read failed: " + error);
+  }
+  // A prefill call consumes its known successors in the draft block itself but not the last one, and the next prefill call needs the
+  // draft block at the trunk's position ("MTP must consume the preceding frontier before prefill"): consume the frontier here, as
+  // the engine's own prefill does, with the first token of the next call and the last kept trunk row.
+  void Advance(std::int32_t next) {
+    std::string error;
+    if (!exec_.MtpForward(session_, std::span<const std::int32_t>(&next, 1), static_cast<std::int32_t>(kept_ - 1),
+                          {.kv_only = true}, &error))
+      throw Fail("draft frontier failed: " + error);
   }
 
  private:
   const q::rocm::Executor& exec_;
   q::rocm::Session& session_;
   std::size_t hc_;
+  std::size_t kept_ = 0;
 };
 
 std::vector<std::int32_t> ReadTokens(const std::string& path) {

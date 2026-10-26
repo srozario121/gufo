@@ -94,43 +94,76 @@ inline void ValidateWindows(std::span<const Window> w, std::size_t len, std::siz
   }
 }
 
-// Walks one sequence and returns the packed rows of every window, in order. `batch` is the widest Batch call.
+// Chunk sizes for `length` positions in calls of at most `widest`: never a call of one position. The 0.19.0 trunk consumes a
+// prefill call's known successors in the same call, so a one-position call leaves the draft block behind by more than the frontier.
+inline std::vector<std::size_t> Split(std::size_t length, std::size_t widest) {
+  if (widest < 3) throw std::invalid_argument("the widest call must be at least 3 positions");
+  if (length < 2) throw std::invalid_argument("a call must cover at least 2 positions");
+  std::vector<std::size_t> sizes(length / widest, widest);
+  if (const auto rest = length % widest; rest != 0) sizes.push_back(rest);
+  if (sizes.size() > 1 && sizes.back() == 1) {   // borrow one position from the call before
+    --sizes[sizes.size() - 2];
+    sizes.back() = 2;
+  }
+  return sizes;
+}
+
+// The positions to forward are the union of [a-1, b) over the windows, merged when they touch or lie one position apart (a gap
+// of one position cannot be prefilled alone), and starting from 0 when the first would begin at 1.
+struct Range {
+  std::size_t begin, end;
+};
+inline std::vector<Range> Ranges(std::span<const Window> windows) {
+  std::vector<Range> out;
+  for (const auto& w : windows) {
+    const Range r{w.begin - 1, w.end};
+    if (!out.empty() && r.begin <= out.back().end + 1) out.back().end = std::max(out.back().end, r.end);
+    else out.push_back(r);
+  }
+  if (!out.empty() && out.front().begin <= 1) out.front().begin = 0;
+  return out;
+}
+
+// Walks one sequence and returns the packed rows of every window, in order.
+//   Trunk::Prefill(span tokens)                           advance, no outputs (at least 2 tokens)
+//   Trunk::Batch(span tokens, float* logits, float* hidden) advance with logits (n x vocab) and residuals (n x hc), at least 2 tokens
+//   Trunk::Advance(int32 next)                            the draft block consumes the frontier: the successor of the last
+//                                                         position, called between every two forward calls and never after the last
+// `batch` is the widest Batch call (at least 3, at most the trunk's kept rows).
 template <class Trunk>
 std::string DumpSequence(Trunk& trunk, std::span<const std::int32_t> x, std::span<const Window> windows, std::size_t hc,
                          std::size_t vocab, std::size_t k, std::size_t batch, std::size_t prefill_chunk = 512,
                          std::size_t max_rows = 2000) {
   ValidateWindows(windows, x.size(), max_rows);
+  const auto ranges = Ranges(windows);
   std::string out;
   std::vector<float> logits(batch * vocab), hidden(batch * hc), carry(hc);
-  std::size_t pos = 0;           // positions [0, pos) are in the trunk
-  std::int64_t carry_pos = -1;   // the position whose residual `carry` holds
-  for (const auto& w : windows) {
-    std::size_t s;
-    if (carry_pos >= 0 && static_cast<std::size_t>(carry_pos) + 1 == w.begin && pos == w.begin) {
-      s = pos;  // the previous window ended right before this one: its last residual is the one this window needs first
-    } else {
-      if (w.begin - 1 < pos) throw std::invalid_argument("window needs a residual that was not kept");
-      while (pos < w.begin - 1) {
-        const std::size_t n = std::min(prefill_chunk, w.begin - 1 - pos);
+  std::size_t pos = 0;   // positions [0, pos) are in the trunk
+  std::size_t wi = 0;    // the window the next row belongs to
+  const std::size_t last = ranges.empty() ? 0 : ranges.back().end;
+  const auto frontier = [&] {
+    if (pos < last) trunk.Advance(x[pos]);
+  };
+  for (const auto& r : ranges) {
+    if (r.begin > pos) {
+      for (const auto n : Split(r.begin - pos, prefill_chunk)) {
         trunk.Prefill(x.subspan(pos, n));
         pos += n;
+        frontier();
       }
-      carry_pos = -1;
-      s = pos;
     }
-    while (s < w.end) {
-      const std::size_t n = std::min(batch, w.end - s);
-      trunk.Batch(x.subspan(s, n), logits.data(), hidden.data());
+    for (const auto n : Split(r.end - pos, batch)) {
+      trunk.Batch(x.subspan(pos, n), logits.data(), hidden.data());
       for (std::size_t j = 0; j < n; ++j) {
-        const std::size_t i = s + j;   // logits row j is position i
-        if (i < w.begin) continue;     // the residual-only position a-1
+        const std::size_t i = pos + j;   // logits row j is position i
+        while (wi < windows.size() && i >= windows[wi].end) ++wi;
+        if (wi == windows.size() || i < windows[wi].begin) continue;   // not a row of any window
         const float* h = j > 0 ? hidden.data() + (j - 1) * hc : carry.data();
         AppendRow(out, std::span<const float>(h, hc), x[i], TopKRow(std::span<const float>(logits.data() + j * vocab, vocab), k));
       }
       std::copy_n(hidden.data() + (n - 1) * hc, hc, carry.begin());
-      carry_pos = static_cast<std::int64_t>(s + n - 1);
-      s += n;
-      pos = s;
+      pos += n;
+      frontier();
     }
   }
   return out;
