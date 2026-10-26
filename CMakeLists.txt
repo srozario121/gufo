@@ -466,6 +466,14 @@ else()
     DEPENDS gufo
   )
 endif()
+# Training-data dump for MTP draft-head fine-tuning: a long-lived stdin/stdout tool that uses only the trunk
+# executor (see the file header). Not part of the production build; .devops/nix/dump-hidden.nix builds it.
+option(GUFO_BUILD_DUMP_HIDDEN "Build the MTP draft-head training-data dump tool" OFF)
+if (ENGINE_ENABLE_HIP AND GUFO_BUILD_DUMP_HIDDEN)
+  add_executable(gufo_dump_hidden tests/models/qwen38_flash_next/dump_hidden.cpp)
+  target_link_libraries(gufo_dump_hidden PRIVATE gufo_qwen38_flash_next)
+endif()
+
 if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
   add_library(gufo_kernel_bench_support STATIC
     src/cli/bench/kernel_bench.cpp)
