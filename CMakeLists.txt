@@ -474,6 +474,13 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_DUMP_HIDDEN)
   target_link_libraries(gufo_dump_hidden PRIVATE gufo_qwen38_flash_next)
 endif()
 
+# CPU reference of the MTP draft block over dumped rows (G2's parity comparator); no GPU. .devops/nix/ref-mtp.nix builds it.
+option(GUFO_BUILD_REF_MTP "Build the CPU reference MTP tool for head-training parity" OFF)
+if (GUFO_BUILD_REF_MTP)
+  add_executable(gufo_ref_mtp tests/models/qwen38_flash_next/ref_mtp.cpp)
+  target_link_libraries(gufo_ref_mtp PRIVATE gufo_qwen38_flash_next_reference)
+endif()
+
 if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
   add_library(gufo_kernel_bench_support STATIC
     src/cli/bench/kernel_bench.cpp)
