@@ -17,21 +17,39 @@ constexpr std::size_t kHc = 12, kVocab = 50, kK = 5;
 float Hidden(std::size_t pos, std::size_t c) { return static_cast<float>(pos) * 7.25F + static_cast<float>(c) * 0.5F + 1.0F; }
 float Logit(std::size_t pos, std::size_t v) { return std::sin(static_cast<float>(pos * 131 + v * 17)) * 4.0F; }
 
+// The fake enforces the rules of the 0.19.0 trunk that the first live window tripped over: a forward call needs the draft block
+// at the trunk's position ("MTP must consume the preceding frontier before prefill"), a call consumes its known successors, and a
+// one-position call does not. Advance() consumes the frontier and must be given the successor of the last position.
 struct FakeTrunk {
-  std::size_t position = 0;
-  std::size_t prefill_calls = 0, batch_calls = 0, widest = 0;
+  const std::vector<std::int32_t>* x = nullptr;
+  std::size_t position = 0, mtp = 0;
+  std::size_t prefill_calls = 0, batch_calls = 0, widest = 0, advances = 0;
+  bool bad_token = false;
+  void Enter(std::size_t n) {
+    if (n < 2) throw std::runtime_error("a one-position forward call");
+    if (mtp != position) throw std::runtime_error("MTP must consume the preceding frontier before prefill");
+    mtp = position + n - 1;
+    position += n;
+  }
   void Prefill(std::span<const std::int32_t> tokens) {
     ++prefill_calls;
-    position += tokens.size();
+    Enter(tokens.size());
   }
   void Batch(std::span<const std::int32_t> tokens, float* logits, float* hidden) {
     ++batch_calls;
     widest = std::max(widest, tokens.size());
+    const std::size_t start = position;
+    Enter(tokens.size());
     for (std::size_t j = 0; j < tokens.size(); ++j) {
-      for (std::size_t v = 0; v < kVocab; ++v) logits[j * kVocab + v] = Logit(position + j, v);
-      for (std::size_t c = 0; c < kHc; ++c) hidden[j * kHc + c] = Hidden(position + j, c);
+      for (std::size_t v = 0; v < kVocab; ++v) logits[j * kVocab + v] = Logit(start + j, v);
+      for (std::size_t c = 0; c < kHc; ++c) hidden[j * kHc + c] = Hidden(start + j, c);
     }
-    position += tokens.size();
+  }
+  void Advance(std::int32_t next) {
+    ++advances;
+    if (position >= x->size() || next != (*x)[position]) bad_token = true;
+    if (mtp + 1 != position) throw std::runtime_error("the draft block is not exactly one position behind");
+    ++mtp;
   }
 };
 
@@ -49,9 +67,10 @@ std::string Expected(const std::vector<std::int32_t>& x, const std::vector<t::Wi
 }
 
 std::string Run(const std::vector<std::int32_t>& x, const std::vector<t::Window>& ws, std::size_t batch, FakeTrunk* tr = nullptr,
-                std::size_t prefill_chunk = 4) {
+                std::size_t prefill_chunk = 5) {
   FakeTrunk local;
   FakeTrunk& trunk = tr ? *tr : local;
+  trunk.x = &x;
   return t::DumpSequence(trunk, x, ws, kHc, kVocab, kK, batch, prefill_chunk, 2000);
 }
 
@@ -81,14 +100,16 @@ int main() {
   ok(t::RowBytes(kHc, kK) == kHc * 2 + 4 + kK * 8, "row bytes for the test shape");
 
   // the row contract, for every batch width: row i = (h[i-1], x[i], top-k of the logits at i)
-  for (std::size_t batch : {1u, 3u, 8u, 64u}) {
+  for (std::size_t batch : {3u, 4u, 8u, 64u}) {
     const std::vector<t::Window> ws{{10, 40}};
     ok(Run(x, ws, batch) == Expected(x, ws), "one window: rows are (h[i-1], x[i], top-k at i) at every batch width");
   }
   const std::vector<t::Window> many{{1, 9}, {20, 33}, {33, 60}, {61, 62}, {100, 200}};
-  for (std::size_t batch : {1u, 4u, 7u, 64u}) {
+  for (std::size_t batch : {3u, 4u, 7u, 64u}) {
     ok(Run(x, many, batch) == Expected(x, many), "windows at the start, adjacent, one position apart, single-row and at the end");
   }
+  const std::vector<t::Window> gap_one{{10, 20}, {22, 30}, {32, 40}};   // one skipped position between the forward ranges
+  for (std::size_t batch : {3u, 5u, 64u}) ok(Run(x, gap_one, batch) == Expected(x, gap_one), "windows a single position apart are merged, never prefilled alone");
   ok(Run(x, many, 8).size() == (8 + 13 + 27 + 1 + 100) * t::RowBytes(kHc, kK), "the output holds exactly one row per window row");
 
   // work done: prefill only what lies before the windows, never past the last window
@@ -98,7 +119,8 @@ int main() {
   ok(tr.widest <= 4, "no batch is wider than asked");
   FakeTrunk tr2;
   Run(x, {{50, 60}}, 4, &tr2, 16);
-  ok(tr2.prefill_calls == 4, "49 positions before the window are prefilled in chunks (3 of 16 and 1 of 1)");
+  ok(tr2.prefill_calls == 4, "49 positions before the window are prefilled in 4 chunks, none of one position (16, 16, 15, 2)");
+  ok(!tr2.bad_token && tr2.advances == tr2.prefill_calls + tr2.batch_calls - 1, "the frontier is consumed between every two calls with the right token, and not after the last");
 
   // the first row's residual is the one before the window, whatever the batch width
   const auto first = Run(x, {{5, 6}}, 8);
@@ -110,6 +132,28 @@ int main() {
     head.append(reinterpret_cast<const char*>(&b), 2);
   }
   ok(first.compare(0, head.size(), head) == 0, "a one-row window carries the residual of the position before it");
+
+  // Split never yields a one-position call and always covers the length
+  bool split_ok = true;
+  for (std::size_t widest : {3u, 4u, 5u, 64u, 512u})
+    for (std::size_t length = 2; length < 1300; ++length) {
+      const auto sizes = t::Split(length, widest);
+      std::size_t sum = 0;
+      for (auto n : sizes) {
+        split_ok &= n >= 2 && n <= widest;
+        sum += n;
+      }
+      split_ok &= sum == length;
+    }
+  ok(split_ok, "Split covers every length with calls of 2..widest positions, never one");
+  ok(t::Split(65, 64) == std::vector<std::size_t>({63, 2}), "65 positions in calls of 64 are 63 and 2, not 64 and 1");
+  bool threw = false;
+  try {
+    t::Split(10, 2);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  ok(threw, "a widest call under 3 positions is refused");
 
   // refusals
   ok(Throws(x, {{0, 5}}), "a window starting at 0 is refused (no residual before it)");
