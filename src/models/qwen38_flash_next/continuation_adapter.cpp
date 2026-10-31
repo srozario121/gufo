@@ -424,6 +424,8 @@ void ContinuationAdapter::BeginRestore(
   state.session->valid_ = false;
   // The restore rewrites the tokens in place, not through RestoreSnapshot.
   state.session->lookup_.Clear();
+  state.session->trie_.Clear();
+  state.session->mtp_cost_.Reset();
   state.session->tokens_.resize(target);
   state.session->ForgetDraftVocab();
   state.session->logits_.resize(model_->VocabSize());
@@ -832,6 +834,8 @@ bool ContinuationAdapter::Validate(
   session.hidden_base_ = metadata.hidden_base;
   session.draft_length_ = policy;
   session.lookup_.Restore(metadata.lookup);
+  session.trie_.Clear();
+  session.mtp_cost_.Reset();
   session.draft_token_ = 0;
   session.stats_ = {};
   session.valid_ = true;

@@ -19,6 +19,7 @@
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/prompt_lookup.hpp"
+#include "src/models/qwen38_flash_next/trie_draft.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -219,6 +220,10 @@ public:
     /// Of drafted/accepted: proposals copied by prompt lookup.
     std::uint64_t lookup{0};
     std::uint64_t lookup_accepted{0};
+    /// Of lookup: cycles whose first proposal was the trie's token instead
+    /// of the head's, and how many of those first tokens were accepted.
+    std::uint64_t trie_first{0};
+    std::uint64_t trie_first_accepted{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -303,6 +308,14 @@ private:
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
                     std::size_t minimum = 1);
+  /// Sampled requests: before the first head token, propose the trie's token
+  /// and its copies where they differ from the head's argmax and pay.
+  bool AppendTrieFirst(PendingDecode& pending, bool stop_at_eos);
+  /// Sampled requests: trie copies after the head's first token, when they pay.
+  bool AppendTrieCopy(PendingDecode& pending, bool stop_at_eos);
+  bool AppendPointMasses(PendingDecode& pending,
+                         std::span<const TrieDraft::Step> steps,
+                         bool stop_at_eos);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -316,6 +329,10 @@ private:
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   PromptLookup lookup_;
+  /// Index of tokens_ for sampled requests' drafts (replaces lookup_ there).
+  TrieDraft trie_;
+  /// This request's MTP-only cost per token, for the trie policy.
+  trie_policy::MtpCost mtp_cost_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

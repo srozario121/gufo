@@ -316,6 +316,7 @@ void Session::ResetDraftPolicy() {
   // A fully reused prompt can start decoding without SyncImpl. It still
   // starts a new request: do not inherit a copy cursor or widen its first step.
   lookup_.BeginRequest();
+  mtp_cost_.Reset();
 }
 
 std::uint32_t Session::Position() const noexcept {
@@ -337,6 +338,8 @@ void Session::ResetImpl(bool reuse_mtp) {
   tokens_.clear();
   ForgetDraftVocab();
   lookup_.Clear();
+  trie_.Clear();
+  mtp_cost_.Reset();
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
@@ -553,6 +556,8 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
   lookup_.Restore(header.lookup);
+  trie_.Clear();
+  mtp_cost_.Reset();
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
@@ -777,6 +782,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
     return false;
   }
   lookup_.BeginRequest();
+  mtp_cost_.Reset();
   if (!valid_)
     Reset();
   // Recurrent state cannot be rewound, so any divergence restarts the
@@ -839,6 +845,11 @@ struct Session::PendingDecode {
   /// Identical copy budget in isolated and batched execution; zero on the
   /// request's first speculative step.
   std::size_t lookup_cap{0};
+  /// Sampled: the first proposal is the trie's token (point mass).
+  bool trie_first{false};
+  /// Sampled: the trie and the head disagreed and the trie's round did not
+  /// pay; the cycle drafts with the head alone.
+  bool trie_no_copy{false};
   std::uint32_t policy_concurrency{0};
 };
 
@@ -896,6 +907,106 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   pending.lookup_start = match.start;
   pending.width = pending.chain.size();
   return count != 0;
+}
+
+namespace {
+
+struct HeadTop {
+  std::int32_t token{0};
+  double probability{0};  ///< softmax of the candidate logits
+};
+
+HeadTop TopCandidate(const MtpCandidateLogits& candidates) {
+  std::size_t best = 0;
+  for (std::size_t i = 1; i < candidates.size; ++i) {
+    if (candidates.logits[i] > candidates.logits[best])
+      best = i;
+  }
+  double sum = 0;
+  for (std::size_t i = 0; i < candidates.size; ++i) {
+    sum += std::exp(static_cast<double>(candidates.logits[i]) -
+                    static_cast<double>(candidates.logits[best]));
+  }
+  return {static_cast<std::int32_t>(candidates.ids[best]), 1.0 / sum};
+}
+
+}  // namespace
+
+bool Session::AppendPointMasses(PendingDecode& pending,
+                                std::span<const TrieDraft::Step> steps,
+                                bool stop_at_eos) {
+  std::size_t count = 0;
+  for (const auto& step : steps) {
+    pending.chain.push_back(step.token);
+    MtpProposal proposal;
+    proposal.ids[0] = static_cast<sampling::TokenId>(step.token);
+    proposal.probabilities[0] = 1.0F;
+    proposal.size = 1;
+    proposal.token = proposal.ids[0];
+    proposal.probability = 1.0F;
+    pending.proposals.push_back(proposal);
+    ++count;
+    if (stop_at_eos && model_->IsStopToken(step.token))
+      break;
+  }
+  pending.lookup = static_cast<std::uint32_t>(count);
+  pending.lookup_start = 0;
+  pending.width = pending.chain.size();
+  return count != 0;
+}
+
+bool Session::AppendTrieFirst(PendingDecode& pending, bool stop_at_eos) {
+  if (!pending.sampled || pending.lookup_cap <= pending.chain.size() + 1 ||
+      pending.chain.size() != 1 || pending.candidates.size == 0) {
+    return false;
+  }
+  std::array<TrieDraft::Step, 1 + trie_policy::kMaxCopies> steps{};
+  if (trie_.Draft(tokens_, pending.chain, std::span(steps).first(1)) == 0)
+    return false;
+  if (steps[0].token == TopCandidate(pending.candidates).token)
+    return false;
+  // The trie and the head disagree on the next token. The round proposes the
+  // trie's token and its copy when that pays, and otherwise drafts with the
+  // head alone. The choice uses the prefix and the head's logits, never the
+  // proposal draw, so the trie's token is a point mass.
+  pending.trie_no_copy = true;
+  const std::int32_t tail[2] = {pending.chain.front(), steps[0].token};
+  const std::size_t room = std::min(trie_policy::kMaxCopies,
+                                    pending.lookup_cap - pending.chain.size() - 1);
+  const std::size_t found =
+      trie_.Draft(tokens_, tail, std::span(steps).subspan(1, room));
+  const std::size_t copies = trie_policy::PlanCopies(
+      trie_policy::Survival(steps[0]), std::span(steps).subspan(1, found),
+      mtp_cost_.MsPerToken(tokens_.size()), tokens_.size());
+  if (copies == 0)
+    return false;
+  AppendPointMasses(pending, std::span(steps).first(1 + copies), stop_at_eos);
+  pending.trie_first = true;
+  return true;
+}
+
+bool Session::AppendTrieCopy(PendingDecode& pending, bool stop_at_eos) {
+  if (!pending.sampled || pending.trie_no_copy || pending.chain.size() != 2 ||
+      pending.lookup_cap <= pending.chain.size() ||
+      pending.candidates.size == 0) {
+    return false;
+  }
+  if (stop_at_eos && model_->IsStopToken(pending.chain.back()))
+    return false;
+  std::array<TrieDraft::Step, trie_policy::kMaxCopies> steps{};
+  const std::size_t room = std::min(trie_policy::kMaxCopies,
+                                    pending.lookup_cap - pending.chain.size());
+  const std::size_t found =
+      trie_.Draft(tokens_, pending.chain, std::span(steps).first(room));
+  const std::size_t copies = trie_policy::PlanCopies(
+      trie_policy::HeadChance(TopCandidate(pending.candidates).probability),
+      std::span(steps).first(found), mtp_cost_.MsPerToken(tokens_.size()),
+      tokens_.size());
+  if (copies == 0)
+    return false;
+  // The head's token stays an MTP proposal; only the copies count as lookup.
+  return AppendPointMasses(pending, std::span(steps).first(copies),
+                           stop_at_eos);
 }
 
 bool Session::PrepareDecode(const DecodeRequest& request,
@@ -993,7 +1104,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // A request's first speculative step copies nothing (see PromptLookup).
   pending->lookup_cap = lookup_.Step(base) ? cap : 0;
   if (pending->lookup_cap != 0) {
-    lookup_.Extend(tokens_, sampled);
+    // Sampled requests draft from the smoothed trie over every committed
+    // token; greedy requests keep prompt lookup.
+    if (sampled)
+      trie_.Extend(tokens_);
+    else
+      lookup_.Extend(tokens_, sampled);
   }
   // Greedy copies can supply the whole chain without the neural head.
   // Sampled requests first extend with a neural proposal: a repeated prefix
@@ -1017,12 +1133,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->draft = draft_token_;
   if (!defer_head) {
     while (pending->chain.size() < width) {
+      if (AppendTrieFirst(*pending, stop_at_eos))
+        break;
       AppendDraft(*pending);
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
         break;
       }
-      if (AppendLookup(*pending, stop_at_eos)) {
+      if (sampled ? AppendTrieCopy(*pending, stop_at_eos)
+                  : AppendLookup(*pending, stop_at_eos)) {
         break;
       }
       if (pending->chain.size() < width &&
@@ -1160,17 +1279,27 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t mtp_accepted = std::min(keep - 1, mtp_drafts);
   stats_.lookup += pending.lookup;
   stats_.lookup_accepted += keep - 1 - mtp_accepted;
-  if (pending.lookup != 0) {
+  if (pending.lookup != 0 && !sampled) {
     lookup_.Observe(pending.lookup_start, pending.lookup,
                     keep - 1 - mtp_accepted);
+  }
+  if (pending.trie_first) {
+    stats_.trie_first += 1;
+    stats_.trie_first_accepted += keep > 1;
+  } else if (sampled && pending.lookup == 0) {
+    mtp_cost_.Observe(k - 1, keep);
   }
   const bool mtp_all = mtp_accepted == mtp_drafts;
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(observed,
-                        result->stop || mtp_all ? observed : mtp_drafts, base,
-                        pending.policy_concurrency);
+  // A trie-first cycle drafted nothing with the head: it says nothing about
+  // the head's chain length.
+  if (!pending.trie_first) {
+    draft_length_.Observe(observed,
+                          result->stop || mtp_all ? observed : mtp_drafts,
+                          base, pending.policy_concurrency);
+  }
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
@@ -1426,14 +1555,17 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       if (requests[i].session->session_->Cancelled() || !p.speculative ||
           p.chain.size() >= p.width)
         continue;
-      AppendDraft(p);
       auto& session = *requests[i].session;
+      if (session.AppendTrieFirst(p, requests[i].stop_at_eos))
+        continue;
+      AppendDraft(p);
       if (requests[i].stop_at_eos &&
           session.model_->IsStopToken(p.chain.back())) {
         p.width = p.chain.size();
         continue;
       }
-      if (session.AppendLookup(p, requests[i].stop_at_eos))
+      if (p.sampled ? session.AppendTrieCopy(p, requests[i].stop_at_eos)
+                    : session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
       if (p.chain.size() < p.width)
         bodies.push_back({requests[i].session->session_.get(),
