@@ -29,8 +29,8 @@ namespace gufo::models::qwen38_flash_next {
 class TrieDraft {
 public:
   static constexpr std::size_t kSlots = 4;
-  static constexpr std::array<std::size_t, 10> kOrders{1,  2,  3,  4,  6,
-                                                       8,  12, 16, 24, 32};
+  static constexpr std::array<std::size_t, 10> kOrders{1, 2,  3,  4,  6,
+                                                       8, 12, 16, 24, 32};
   static constexpr std::size_t kMaxOrder = 32;
   static constexpr double kBaseVocabulary = 151936.0;
 
@@ -111,8 +111,8 @@ public:
       Step best{};
       best.probability = -1;
       for (std::size_t c = 0; c < count; ++c) {
-        const double p =
-            Blend(std::span<const Node* const>(matched).first(m), candidates[c]);
+        const double p = Blend(std::span<const Node* const>(matched).first(m),
+                               candidates[c]);
         if (p > best.probability)
           best = {candidates[c], p, 0};
       }
@@ -183,8 +183,8 @@ private:
     std::size_t o = 0;
     for (std::size_t k = 1; k <= top; ++k) {
       const std::size_t i = len - k;
-      const auto token = static_cast<std::uint32_t>(
-          i < a.size() ? a[i] : b[i - a.size()]);
+      const auto token =
+          static_cast<std::uint32_t>(i < a.size() ? a[i] : b[i - a.size()]);
       h = std::rotl((h ^ token) * 0x100000001b3ULL, 17);
       if (o < kOrders.size() && kOrders[o] == k)
         out[o++] = Mix(h ^ (static_cast<std::uint64_t>(k) << 56));
@@ -291,23 +291,43 @@ inline constexpr std::array<double, 10> kHeadChance{
     0.9663766196916674, 0.9827643197808944, 0.997060566552092,
     0.997060566552092};
 
-inline constexpr std::array<std::size_t, 10> kOrderEdges{1,  2,  3,  4,  6,
-                                                         8,  12, 16, 24, 32};
-inline constexpr std::array<double, 8> kProbabilityEdges{
-    0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99, 1.01};
+inline constexpr std::array<std::size_t, 10> kOrderEdges{1, 2,  3,  4,  6,
+                                                         8, 12, 16, 24, 32};
+inline constexpr std::array<double, 8> kProbabilityEdges{0.3, 0.5,  0.7,  0.8,
+                                                         0.9, 0.95, 0.99, 1.01};
 /// Chance a copied step is right given the steps before it were, by cell
 /// [order bin][probability bin]; 0 where fewer than 30 replayed steps fell.
 inline constexpr std::array<std::array<double, 8>, 10> kSurvival{{
-    {0.08187927375618957, 0.20178755586112065, 0.2870760769935839, 0.5566546762589928, 0.7063106796116505, 0.8253119429590018, 0.903448275862069, 0.0},
-    {0.10568070519098922, 0.23993589139247667, 0.3113465037691708, 0.5006321112515802, 0.7189242374549032, 0.8328095537397863, 0.910288582183187, 0.9792284866468842},
-    {0.09694258016405667, 0.21247304693979102, 0.3264980353634578, 0.4659335920655455, 0.6019731246810682, 0.8133230054221534, 0.9113962725328445, 0.9796491228070175},
-    {0.10594989561586639, 0.2476501838986514, 0.3887187340479837, 0.5138676566936012, 0.56645074826893, 0.6862718340611353, 0.8413417951042611, 0.9648103632478633},
-    {0.12072072072072072, 0.20852095600969864, 0.44769403824521936, 0.5336183443451225, 0.5930087390761548, 0.6759807549962991, 0.8167880413951706, 0.9657253078787279},
-    {0.18829516539440203, 0.2949260042283298, 0.49259013492590137, 0.5987460815047022, 0.6545864045864046, 0.7211033274956217, 0.8048407288913618, 0.9438400352627677},
-    {0.15, 0.3021370670596905, 0.5354330708661418, 0.5835913312693498, 0.7609962904080552, 0.7382645803698435, 0.8069506032793647, 0.9485747977815857},
-    {0.36231884057971014, 0.4457395498392283, 0.6009842116054952, 0.7676261994159366, 0.7748463114754098, 0.8587843967342002, 0.8344630071599045, 0.9686639217605789},
-    {0.1455223880597015, 0.3445615839547442, 0.4113132461625924, 0.6074074074074074, 0.6596916299559471, 0.8242027800490597, 0.8979457682826623, 0.9774651430561871},
-    {0.4266666666666667, 0.3256880733944954, 0.5556179775280898, 0.6419491525423728, 0.7719467956469166, 0.8672953856517346, 0.8861218021281413, 0.96859909062402},
+    {0.08187927375618957, 0.20178755586112065, 0.2870760769935839,
+     0.5566546762589928, 0.7063106796116505, 0.8253119429590018,
+     0.903448275862069, 0.0},
+    {0.10568070519098922, 0.23993589139247667, 0.3113465037691708,
+     0.5006321112515802, 0.7189242374549032, 0.8328095537397863,
+     0.910288582183187, 0.9792284866468842},
+    {0.09694258016405667, 0.21247304693979102, 0.3264980353634578,
+     0.4659335920655455, 0.6019731246810682, 0.8133230054221534,
+     0.9113962725328445, 0.9796491228070175},
+    {0.10594989561586639, 0.2476501838986514, 0.3887187340479837,
+     0.5138676566936012, 0.56645074826893, 0.6862718340611353,
+     0.8413417951042611, 0.9648103632478633},
+    {0.12072072072072072, 0.20852095600969864, 0.44769403824521936,
+     0.5336183443451225, 0.5930087390761548, 0.6759807549962991,
+     0.8167880413951706, 0.9657253078787279},
+    {0.18829516539440203, 0.2949260042283298, 0.49259013492590137,
+     0.5987460815047022, 0.6545864045864046, 0.7211033274956217,
+     0.8048407288913618, 0.9438400352627677},
+    {0.15, 0.3021370670596905, 0.5354330708661418, 0.5835913312693498,
+     0.7609962904080552, 0.7382645803698435, 0.8069506032793647,
+     0.9485747977815857},
+    {0.36231884057971014, 0.4457395498392283, 0.6009842116054952,
+     0.7676261994159366, 0.7748463114754098, 0.8587843967342002,
+     0.8344630071599045, 0.9686639217605789},
+    {0.1455223880597015, 0.3445615839547442, 0.4113132461625924,
+     0.6074074074074074, 0.6596916299559471, 0.8242027800490597,
+     0.8979457682826623, 0.9774651430561871},
+    {0.4266666666666667, 0.3256880733944954, 0.5556179775280898,
+     0.6419491525423728, 0.7719467956469166, 0.8672953856517346,
+     0.8861218021281413, 0.96859909062402},
 }};
 
 /// Bins as numpy.searchsorted(edges, x) (side left): edges strictly below x.
@@ -323,10 +343,10 @@ template<typename T, std::size_t N>
 }
 
 [[nodiscard]] inline double Survival(const TrieDraft::Step& step) {
-  const auto o = std::min<std::size_t>(Bin(kOrderEdges, step.order),
-                                       kSurvival.size() - 1);
-  const auto p = std::min<std::size_t>(
-      Bin(kProbabilityEdges, step.probability), kSurvival[o].size() - 1);
+  const auto o =
+      std::min<std::size_t>(Bin(kOrderEdges, step.order), kSurvival.size() - 1);
+  const auto p = std::min<std::size_t>(Bin(kProbabilityEdges, step.probability),
+                                       kSurvival[o].size() - 1);
   return kSurvival[o][p];
 }
 
@@ -350,8 +370,9 @@ public:
     const double w = kPriorRounds + rounds_;
     const double rows = (kPriorRows * kPriorRounds + rows_) / w;
     const double tokens = (kPriorTokens * kPriorRounds + tokens_) / w;
-    const double round = kRoundMs + kMtpRowMs * rows -
-                         kDepthMsPerThousand * static_cast<double>(depth) / 1000;
+    const double round =
+        kRoundMs + kMtpRowMs * rows -
+        kDepthMsPerThousand * static_cast<double>(depth) / 1000;
     return std::max(round, 1.0) / std::max(tokens, 1.0);
   }
 

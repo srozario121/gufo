@@ -971,8 +971,8 @@ bool Session::AppendTrieFirst(PendingDecode& pending, bool stop_at_eos) {
   // proposal draw, so the trie's token is a point mass.
   pending.trie_no_copy = true;
   const std::int32_t tail[2] = {pending.chain.front(), steps[0].token};
-  const std::size_t room = std::min(trie_policy::kMaxCopies,
-                                    pending.lookup_cap - pending.chain.size() - 1);
+  const std::size_t room = std::min(
+      trie_policy::kMaxCopies, pending.lookup_cap - pending.chain.size() - 1);
   const std::size_t found =
       trie_.Draft(tokens_, tail, std::span(steps).subspan(1, room));
   const std::size_t copies = trie_policy::PlanCopies(
@@ -1297,8 +1297,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // the head's chain length.
   if (!pending.trie_first) {
     draft_length_.Observe(observed,
-                          result->stop || mtp_all ? observed : mtp_drafts,
-                          base, pending.policy_concurrency);
+                          result->stop || mtp_all ? observed : mtp_drafts, base,
+                          pending.policy_concurrency);
   }
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
