@@ -234,9 +234,12 @@ gf_prepare() {
     else sha="$GF_CAND_SHA"; targets="gufo qwen38_flash_next_tests"; fi
     td="$(gf_tree_dir "$tree")"
     if gf_built "$tree" "$sha"; then gf_say "gpu-test: $tree already built at ${sha:0:12}"; echo "build_$tree=CACHED"; continue; fi
-    if [ "${GF_DRY_RUN:-0}" != 1 ]; then
-      rm -rf "$td/src" "$td/built"; mkdir -p "$td/src" "$td/build"
+    # Extracted once per commit, so an interrupted build resumes where Ninja
+    # stopped instead of seeing every source as new.
+    if [ "${GF_DRY_RUN:-0}" != 1 ] && [ "$(cat "$td/src.sha" 2>/dev/null)" != "$sha" ]; then
+      rm -rf "$td/src" "$td/build" "$td/built" "$td/src.sha"; mkdir -p "$td/src" "$td/build"
       git_ archive "$sha" | tar -x -C "$td/src" || gf_die "git archive of $sha failed" 3
+      printf '%s\n' "$sha" > "$td/src.sha"
     fi
     gf_say "gpu-test: building $tree at ${sha:0:12} ($targets), log $GF_OUT/logs/gufo-gpu-build-$tree.log"
     gf_container "gufo-gpu-build-$tree" "$GF_BUILD_MEM_MIB" 0 "$tree" "$GF_ENV_SCRIPT
