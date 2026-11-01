@@ -21,7 +21,23 @@ is a hypothesis until step 5 measures it. The patches are described in the READM
       and `cache-tests` pass.
 - [x] Both trees are built for the GPU run (`ai-sdlc/gpu-test.sh prepare` on the tooling branch).
       `build.conf` for v0.28.1 is prepared on `ai-sdlc/tooling-v0.28.1` (toolboxes `58fdb5da`).
-- [ ] 5b: `ai-sdlc/gpu-test.sh run` under a lease.
+- [x] 5b, run on 2026-11-01 under lease item 151 at commit `c29cdc14`; later commits on this branch
+      are docs only.
+  - **GPU operator tests:** 14 of 14 pass. `head_trim_ops` first failed on its bit comparison: the
+    test's reference kernel was built with `-O2`, while the kernel library uses `-O3 -ffast-math`.
+    Fixed by giving the test the library's flags.
+  - **Flags off:** byte-identical to unpatched v0.28.1 (8/8 greedy prompts, MTP on).
+  - **Low draft set:** byte-identical (8/8).
+  - **G smoke:** passes. It answers every request, scores 1,431 trimmed rows, and returns finite
+    sampled logprobs.
+  - **G divergence:** text differs from flags-off on 5 of 8 prompts, for example `SUM(o.amount)` →
+    `SUM(oamount)`, mostly on rows where the fallback never fired. A diagnostic separates the port
+    from the approximation: with threshold 1.0, where every row takes the full-head pass, the trimmed
+    path is identical to flags-off on 8/8. So the port is bit-correct, and the divergence is the trim's
+    approximation on prompts outside the corpus the High set was built from (SQL, general knowledge).
+  - **Implication:** the gating evidence is the 100-turn held-out report in 5c, whose prompts match
+    the corpus the High set was built from (v0.19.0: 1/100). These 8 prompts are a reminder that the
+    set is corpus-specific.
 - [ ] 5c: images built with `build.sh`, divergence on the 100 held-out turns, and the A1/A2/A3
       speed runs.
 
