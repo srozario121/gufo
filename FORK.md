@@ -231,6 +231,26 @@ Do every item, every push:
 - [ ] `git push origin <branch>`; never `--force` on a pinned commit, and
       never `--no-verify`.
 
+## todo/
+
+`todo/` on this branch holds the planning items for work whose remaining
+changes all land in this fork. They moved here from the deployment repository
+on 2026-11-01 (its item 170.2) and keep their ids, so "item 151" means the same
+item in both places. The deployment keeps a `moved` stub per item that points
+here (`moved_to: srozario121/gufo#<id>`); an id the items name that stayed in
+the deployment has a reference stub here (`moved_to: ai-sdlc#<id>`). `TODO.md`
+is the index.
+
+- `make check-todo` validates the items (front matter, ids, dependencies, task
+  ids, index drift) and `make todo-index` regenerates `TODO.md`. The scripts
+  (`check_todo.sh`, `todo_lib.sh`, `gen_todo_index.sh`) are copies of the
+  deployment's, with this repository's name in `TODO_SELF_REPO`.
+- **The scan rule.** Everything here is public. Evidence held in the
+  deployment's private repository is named in plain text ("private evidence,
+  ai-sdlc item N"), never by a path or a link. Before this branch is pushed,
+  `leakcheck.sh` runs over it with the patterns file, extra patterns and a
+  manual read, and the maintainer signs the result off.
+
 ## Removal
 
 Each outward change, with its removal command:
