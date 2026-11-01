@@ -2,13 +2,14 @@
 // resolves, the JSON line, and the GUFO_TRIE_SHADOW sink.
 #include "src/models/qwen38_flash_next/trie_shadow.hpp"
 
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
-#include <unistd.h>
 
 namespace q = gufo::models::qwen38_flash_next;
 
@@ -28,9 +29,14 @@ bool Has(const std::string& s, const std::string& part) {
 }
 
 q::TrieShadowEvent Event(std::uint32_t chain, std::uint32_t keep) {
-  return {.position = 100 + chain, .token = 42, .order = 6,
-          .probability = 0.25, .reason = q::TrieShadowReason::kGate,
-          .sampled = true, .chain = chain, .keep = keep};
+  return {.position = 100 + chain,
+          .token = 42,
+          .order = 6,
+          .probability = 0.25,
+          .reason = q::TrieShadowReason::kGate,
+          .sampled = true,
+          .chain = chain,
+          .keep = keep};
 }
 
 void TestFires() {
@@ -83,7 +89,8 @@ void TestTracker() {
   line = t.Flush();
   Expect(Has(line, "\"pos\":105") && !t.Waiting() && t.Flush().empty(),
          "flush writes the wait once");
-  Expect(t.Anchor(1, 1).empty(), "an anchor with nothing waiting writes nothing");
+  Expect(t.Anchor(1, 1).empty(),
+         "an anchor with nothing waiting writes nothing");
 }
 
 void TestFormat() {

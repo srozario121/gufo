@@ -63,8 +63,8 @@ struct TrieShadowEvent {
       "\"emitted\":%d,\"match\":%s}\n",
       static_cast<unsigned long long>(e.position),
       e.reason == TrieShadowReason::kGate ? "gate" : "width",
-      e.sampled ? "true" : "false", e.chain, e.keep,
-      reached ? "true" : "false", e.token, e.order, e.probability, emitted,
+      e.sampled ? "true" : "false", e.chain, e.keep, reached ? "true" : "false",
+      e.token, e.order, e.probability, emitted,
       reached && emitted == e.token ? "true" : "false");
   return n > 0 ? std::string(line, static_cast<std::size_t>(n)) : std::string();
 }
@@ -84,8 +84,7 @@ public:
   }
   /// The next cycle's anchor at `position`: it is the emitted token when the
   /// position is the waiting event's; anything else flushes it unresolved.
-  [[nodiscard]] std::string Anchor(std::uint64_t position,
-                                   std::int32_t token) {
+  [[nodiscard]] std::string Anchor(std::uint64_t position, std::int32_t token) {
     if (!waiting_)
       return {};
     if (waiting_->position != position)
