@@ -327,6 +327,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->executor_) {
     return nullptr;
   }
+  m->trie_shadow_ = TrieShadowLog::FromEnvironment();
+  if (m->trie_shadow_)
+    std::cerr << "[trie-shadow] recording trie v3 shadow events to "
+              << std::getenv("GUFO_TRIE_SHADOW") << "\n";
   return m;
 }
 
@@ -516,6 +520,9 @@ void Session::ResetImpl(bool reuse_mtp) {
   tokens_.clear();
   ForgetDraftVocab();
   lookup_.Clear();
+  if (model_->trie_shadow_)
+    model_->trie_shadow_->Write(shadow_.Flush());
+  trie_.Clear();
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
@@ -739,6 +746,9 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
   lookup_.Restore(header.lookup);
+  if (model_->trie_shadow_)
+    model_->trie_shadow_->Write(shadow_.Flush());
+  trie_.Clear();
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
@@ -1196,6 +1206,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return true;
   }
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  // Trie v3 shadow: this anchor is what the target emitted at a waiting
+  // event's position (trie_shadow.hpp).
+  if (model_->trie_shadow_)
+    model_->trie_shadow_->Write(shadow_.Anchor(tokens_.size(), anchor));
   auto anchor_logprobs =
       sampling::CollectLogprobs(logits_, anchor, sampler.config().logprobs);
   if (is_stop(anchor)) {
@@ -1346,6 +1360,30 @@ bool Session::FinishDecode(const DecodeRequest& request,
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
+  // Trie v3 shadow: where v3 would append a proposal after this chain, take
+  // the trie's token from the prefix alone (before verification, so nothing
+  // the target does here can steer it). Nothing is proposed.
+  std::optional<TrieShadowEvent> shadow_event;
+  if (model_->trie_shadow_) {
+    trie_.Extend(tokens_);
+    const auto reason = TrieShadowFires(
+        pending.lookup, chain.size(), exec.max_speculative(),
+        !(pending.sampled && pending.proposals.empty()) && GateStops(pending),
+        model_->IsStopToken(chain.back()));
+    std::array<TrieDraft::Step, 1> step{};
+    if (reason != TrieShadowReason::kNone &&
+        trie_.Draft(tokens_, chain, step) == 1) {
+      shadow_event = TrieShadowEvent{
+          .position = base + k,
+          .token = step[0].token,
+          .order = static_cast<std::uint32_t>(step[0].order),
+          .probability = step[0].probability,
+          .reason = reason,
+          .sampled = sampled,
+          .chain = k,
+      };
+    }
+  }
   std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
   if (gpu_greedy &&
       !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), sampler,
@@ -1496,6 +1534,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
+  if (shadow_event) {
+    shadow_event->keep = keep;
+    model_->trie_shadow_->Write(shadow_.Verified(*shadow_event));
+  }
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
