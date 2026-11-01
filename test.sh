@@ -136,7 +136,7 @@ in
 pkgs.runCommand "check-cache-tests" {
   nativeBuildInputs = [ pkgs.stdenv.cc pkgs.cmake pkgs.ninja pkgs.pkg-config
     pkgs.python3 pkgs.icu pkgs.curl pkgs.libpng pkgs.libjpeg pkgs.libwebp
-    pkgs.openssl ];
+    pkgs.openssl pkgs.libsndfile pkgs.soxr pkgs.ffmpeg-headless ];
   src = f.outPath;
 } ''
   export HOME=\$TMPDIR
