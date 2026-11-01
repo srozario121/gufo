@@ -376,15 +376,20 @@ PY
 gf_check_shadow() {  # trie v3's shadow log: valid records, counted
   python3 -I - "$GF_OUT/logs/trie-shadow.jsonl" <<'PY'
 import json, sys
-keys = {"pos", "reason", "sampled", "chain", "keep", "reached", "trie", "order", "p", "emitted", "match"}
+keys = {"pos", "reason", "sampled", "chain", "keep", "reached", "trie", "order", "p", "emitted", "match",
+        "conf", "g_tok", "g_order", "g_p", "g_agree", "g_acc", "lk_len", "lk_tok", "lk_match"}
 try:
     rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 except Exception as e:
     print(f"  shadow log unreadable: {e}", file=sys.stderr); sys.exit(1)
 bad = [r for r in rows if set(r) != keys or r["reason"] not in ("gate", "width")]
 reached = [r for r in rows if r["reached"] and r["emitted"] >= 0]
+gates = [r for r in rows if r["g_tok"] >= 0]
 print(f"  shadow records {len(rows)} (bad {len(bad)}): reached {len(reached)}, matched "
-      f"{sum(r['match'] for r in reached)}, gate {sum(r['reason'] == 'gate' for r in rows)}", file=sys.stderr)
+      f"{sum(r['match'] for r in reached)}, gate {sum(r['reason'] == 'gate' for r in rows)}; "
+      f"B gate predictions {len(gates)} (agree {sum(r['g_agree'] for r in gates)}); "
+      f"D lookup proposals {sum(r['lk_tok'] >= 0 for r in rows)} (matched {sum(r['lk_match'] for r in reached)})",
+      file=sys.stderr)
 sys.exit(0 if rows and not bad else 1)
 PY
 }
