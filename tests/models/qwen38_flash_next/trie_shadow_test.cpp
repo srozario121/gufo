@@ -149,6 +149,28 @@ void TestVariants() {
          "D: the tracker resolves the lookup match with the anchor");
 }
 
+void TestGateProbe() {
+  q::GateProbeChain c{.position = 77,
+                      .sampled = true,
+                      .chain = 4,
+                      .keep = 2,
+                      .lookup = 0,
+                      .probability = {0.5F, 0.25F, 0.125F},
+                      .agree = {1, 0, -1},
+                      .order = {6, 1, 0}};
+  const auto line = q::FormatGateProbe(c);
+  Expect(line ==
+             "{\"pos\":77,\"sampled\":true,\"chain\":4,\"keep\":2,"
+             "\"lookup\":0,\"p\":[0.5,0.25,0.125],\"agree\":[1,0,-1],"
+             "\"order\":[6,1,0]}\n",
+         "the gate probe line: " + line);
+  c.probability.clear();
+  c.agree.clear();
+  c.order.clear();
+  Expect(Has(q::FormatGateProbe(c), "\"p\":[],\"agree\":[],\"order\":[]"),
+         "a chain without MTP drafts has empty arrays");
+}
+
 void TestSink() {
   char path[] = "/tmp/trie_shadow_testXXXXXX";
   const int fd = mkstemp(path);
@@ -177,6 +199,12 @@ void TestSink() {
   Expect(q::TrieShadowLog::FromEnvironment() == nullptr,
          "an unopenable path leaves shadow mode off");
   unsetenv("GUFO_TRIE_SHADOW");
+  setenv("GUFO_MTP_GATE_PROBE", path, 1);
+  Expect(
+      q::TrieShadowLog::FromEnvironment() == nullptr &&
+          q::TrieShadowLog::FromEnvironment("GUFO_MTP_GATE_PROBE") != nullptr,
+      "the gate probe's sink reads its own variable only");
+  unsetenv("GUFO_MTP_GATE_PROBE");
   std::remove(path);
 }
 
@@ -187,6 +215,7 @@ int main() {
   TestTracker();
   TestFormat();
   TestVariants();
+  TestGateProbe();
   TestSink();
   if (failures != 0)
     return 1;

@@ -328,6 +328,11 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->trie_shadow_ = TrieShadowLog::FromEnvironment();
+  m->gate_probe_ = TrieShadowLog::FromEnvironment("GUFO_MTP_GATE_PROBE");
+  if (m->gate_probe_)
+    std::cerr << "[gate-probe] the MTP confidence gate is off; recording every "
+                 "chain to "
+              << std::getenv("GUFO_MTP_GATE_PROBE") << "\n";
   if (m->trie_shadow_)
     std::cerr << "[trie-shadow] recording trie v3 shadow events to "
               << std::getenv("GUFO_TRIE_SHADOW") << "\n";
@@ -1085,6 +1090,8 @@ struct Session::PendingDecode {
   std::uint32_t policy_concurrency{0};
   /// Trie v3 shadow (variant A): the product of the drafts' confidences.
   double draft_confidence_product{1.0};
+  /// MTP gate probe: each MTP draft's probability, in chain order.
+  std::vector<float> draft_probabilities;
 };
 
 bool Session::GateStops(const PendingDecode& pending) {
@@ -1102,8 +1109,10 @@ void Session::AppendDraft(PendingDecode& pending) {
     pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
     pending.draft_sampler->Accept(pending.proposals.back().token);
     pending.draft_confidence_product *= pending.proposals.back().probability;
+    pending.draft_probabilities.push_back(pending.proposals.back().probability);
   } else {
     pending.draft_confidence_product *= pending.draft_confidence;
+    pending.draft_probabilities.push_back(pending.draft_confidence);
   }
   pending.chain.push_back(pending.draft);
 }
@@ -1319,7 +1328,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
-      if (GateStops(*pending)) {
+      if (!model_->gate_probe_ && GateStops(*pending)) {
         pending->width = pending->chain.size();
         break;
       }
@@ -1559,6 +1568,31 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (shadow_event) {
     shadow_event->keep = keep;
     model_->trie_shadow_->Write(shadow_.Verified(*shadow_event));
+  }
+  if (model_->gate_probe_) {
+    // The trie's agreement with each MTP draft, from the prefix before it
+    // (tokens_ now holds this cycle's kept tokens, so index the history the
+    // drafts were made from: the committed prefix plus the chain before j).
+    GateProbeChain record{.position = base,
+                          .sampled = sampled,
+                          .chain = k,
+                          .keep = keep,
+                          .lookup = pending.lookup,
+                          .probability = pending.draft_probabilities};
+    const std::span<const std::int32_t> prefix(tokens_.data(), base);
+    trie_.Extend(prefix);
+    std::array<TrieDraft::Step, 1> step{};
+    for (std::size_t j = 1; j <= pending.draft_probabilities.size() && j < k;
+         ++j) {
+      if (trie_.Draft(prefix, std::span(chain).first(j), step) == 1) {
+        record.agree.push_back(step[0].token == chain[j] ? 1 : 0);
+        record.order.push_back(static_cast<std::uint32_t>(step[0].order));
+      } else {
+        record.agree.push_back(-1);
+        record.order.push_back(0);
+      }
+    }
+    model_->gate_probe_->Write(FormatGateProbe(record));
   }
   stats_.cycles += 1;
   stats_.drafted += k - 1;
@@ -1856,7 +1890,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       }
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
-      if (GateStops(p)) {
+      if (!model_->gate_probe_ && GateStops(p)) {
         if (batch_drafts && !p.sampled &&
             p.draft_confidence < kMtpBatchDropProbability) {
           // Without proposals left the anchor decodes as an ordinary step;
