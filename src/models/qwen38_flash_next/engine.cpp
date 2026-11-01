@@ -1890,7 +1890,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       }
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
-      if (!model_->gate_probe_ && GateStops(p)) {
+      if (!session.model_->gate_probe_ && GateStops(p)) {
         if (batch_drafts && !p.sampled &&
             p.draft_confidence < kMtpBatchDropProbability) {
           // Without proposals left the anchor decodes as an ordinary step;
