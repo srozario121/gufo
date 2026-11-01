@@ -14,7 +14,8 @@
 #
 # What it does (FORK.md has the why):
 #   1. Host refusals, before any container: not the fork's main clone; a dirty
-#      or untracked tree; HEAD detached or not on ai-sdlc/$BASE_TAG; NIX_IMAGE
+#      or untracked tree; HEAD detached or not on the patch branch
+#      (GF_PATCH_BRANCH, default ai-sdlc/$BASE_TAG, as in build.sh); NIX_IMAGE
 #      not by digest or not in the local store (never pulled); MemAvailable
 #      below MEM_FLOOR_MIB + GF_TEST_MEM_MIB (the engine may be running: the test
 #      container is capped, but it must never push the host under the floor).
@@ -102,7 +103,7 @@ gf_host_checks() {
   br="$(git -C "$top" symbolic-ref -q --short HEAD 2>/dev/null)"
   GF_HEAD="$(git -C "$top" rev-parse HEAD 2>/dev/null)"
   if [ -z "$br" ]; then gf_check branch REFUSED "HEAD is detached (check out ai-sdlc/$BASE_TAG)"
-  elif [ "$br" != "ai-sdlc/$BASE_TAG" ]; then gf_check branch REFUSED "on '$br', not ai-sdlc/$BASE_TAG"
+  elif [ "$br" != "${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}" ]; then gf_check branch REFUSED "on '$br', not ${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}"
   else gf_check branch ok "$br at ${GF_HEAD:0:12}"; fi
   case "$NIX_IMAGE" in
     *@sha256:*) if docker_ image inspect "$NIX_IMAGE" >/dev/null 2>&1; then gf_check niximage ok "$NIX_IMAGE"
@@ -171,7 +172,7 @@ INNER
 )"
 
 gf_argv() {  # fills GF_ARGV: the test container's docker argv
-  GF_REF="git+file:///work/gufo.git?ref=refs/heads/ai-sdlc/$BASE_TAG&rev=$GF_HEAD"
+  GF_REF="git+file:///work/gufo.git?ref=refs/heads/${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}&rev=$GF_HEAD"
   GF_ARGV=(run --name "$GF_NAME" --pull never --network bridge --cpus "$GF_TEST_CORES"
     --memory "${GF_TEST_MEM_MIB}m" --memory-swap "${GF_TEST_MEM_MIB}m"
     -v "$GF_SRC:/src/gufo:ro" -v "$NIX_VOLUME:/nix" -v "$GF_OUT:/out"
@@ -180,7 +181,7 @@ accept-flake-config = true
 max-jobs = 1
 cores = $GF_TEST_CORES
 sandbox = false"
-    -e "GF_BRANCH=ai-sdlc/$BASE_TAG" -e "GF_HEAD=$GF_HEAD" -e "GF_REF=$GF_REF"
+    -e "GF_BRANCH=${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}" -e "GF_HEAD=$GF_HEAD" -e "GF_REF=$GF_REF"
     -e "GF_CHECKS=$GF_CHECKS" -e "GF_OWNER=$(id -u):$(id -g)"
     "$NIX_IMAGE" bash -euo pipefail -c "$GF_INNER")
 }

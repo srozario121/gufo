@@ -9,7 +9,8 @@
 # What it does (FORK.md has the why):
 #   1. Host refusals, before any build container: not the fork's main clone (a
 #      linked worktree, such as the tooling one, is refused); a dirty or
-#      untracked tree; HEAD detached or not on ai-sdlc/$BASE_TAG; the tag not
+#      untracked tree; HEAD detached or not on the patch branch (GF_PATCH_BRANCH,
+#      default ai-sdlc/$BASE_TAG); the tag not
 #      at BASE_COMMIT (gufo re-points tags); HEAD not descended from
 #      BASE_COMMIT; a merge in BASE_COMMIT..HEAD; NIX_IMAGE not by digest or
 #      not in the local store (never pulled implicitly); MAX_JOBS x CORES over
@@ -53,6 +54,12 @@
 # checks pass, 1 otherwise); GF_DOCKER the docker CLI; GF_MEMINFO a meminfo
 # file; GF_DF the df used on the out dir; GF_CONF the config file;
 # GF_WATCH_S the watcher's tick (2 s).
+#
+# GF_PATCH_BRANCH (default ai-sdlc/$BASE_TAG) names the branch HEAD must be on,
+# for a local experiment branch on top of the base (item 151's ports, item
+# 152.5's reverts). It sets the refusal, the bare clone's ref and the
+# org.ai-sdlc.gufo-fork.branch label; every other check is unchanged (HEAD must
+# still descend from BASE_COMMIT with no merge).
 set -uo pipefail
 
 GF_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -160,7 +167,7 @@ gf_host_checks() {
   br="$(git -C "$top" symbolic-ref -q --short HEAD 2>/dev/null)"
   GF_HEAD="$(git -C "$top" rev-parse HEAD 2>/dev/null)"
   if [ -z "$br" ]; then gf_check branch REFUSED "HEAD is detached (check out ai-sdlc/$BASE_TAG)"
-  elif [ "$br" != "ai-sdlc/$BASE_TAG" ]; then gf_check branch REFUSED "on '$br', not ai-sdlc/$BASE_TAG"
+  elif [ "$br" != "${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}" ]; then gf_check branch REFUSED "on '$br', not ${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}"
   else gf_check branch ok "$br at ${GF_HEAD:0:12}"; fi
   tagc="$(git -C "$top" rev-parse -q --verify "refs/tags/$BASE_TAG^{commit}" 2>/dev/null)"
   if [ "$tagc" != "$BASE_COMMIT" ]; then gf_check tag REFUSED "$BASE_TAG is at '${tagc:-absent}', build.conf pins $BASE_COMMIT (a re-pointed tag)"
@@ -238,7 +245,7 @@ INNER
 gf_argv() {  # fills GF_ARGV: the build container's docker argv
   local mem_mib=$(( GF_MEM_AVAIL_MIB - 8192 ))
   [ "$mem_mib" -gt 98304 ] && mem_mib=98304
-  GF_REF="git+file:///work/gufo.git?ref=refs/heads/ai-sdlc/$BASE_TAG&rev=$GF_HEAD"
+  GF_REF="git+file:///work/gufo.git?ref=refs/heads/${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}&rev=$GF_HEAD"
   GF_ARGV=(run --name "$GF_NAME" --pull never --network bridge --cpus 16
     --memory "${mem_mib}m" --memory-swap "${mem_mib}m"
     -v "$GF_SRC:/src/gufo:ro" -v "$NIX_VOLUME:/nix" -v "$GF_OUT:/out"
@@ -247,7 +254,7 @@ accept-flake-config = true
 max-jobs = $MAX_JOBS
 cores = $CORES
 sandbox = false"
-    -e "GF_BRANCH=ai-sdlc/$BASE_TAG" -e "GF_HEAD=$GF_HEAD" -e "GF_REF=$GF_REF"
+    -e "GF_BRANCH=${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}" -e "GF_HEAD=$GF_HEAD" -e "GF_REF=$GF_REF"
     -e "TOOLBOXES_REPO=$TOOLBOXES_REPO" -e "TOOLBOXES_COMMIT=$TOOLBOXES_COMMIT"
     -e "TOOLBOXES_ATTR=$TOOLBOXES_ATTR" -e "EXPECTED_DRV=$EXPECTED_DRV"
     -e "GF_OWNER=$(id -u):$(id -g)"
@@ -256,6 +263,23 @@ sandbox = false"
 
 # --- compare against stock ------------------------------------------------------
 gf_cfg() { docker_ image inspect -f "$2" "$1" 2>/dev/null; }
+# The archive's first RepoTags entry, read from manifest.json (or ./manifest.json)
+# as JSON; empty when there is none or the archive cannot be read.
+gf_archive_name() {  # <image.tar.gz>
+  python3 -I -c '
+import json, sys, tarfile
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as t:
+        for m in t:
+            if m.name in ("manifest.json", "./manifest.json"):
+                tags = json.load(t.extractfile(m))[0].get("RepoTags") or []
+                if tags and isinstance(tags[0], str):
+                    print(tags[0])
+                break
+except Exception:
+    pass
+' "$1" 2>/dev/null
+}
 gf_labels() {  # <image>: sorted k=v, the fork's own labels left out
   gf_cfg "$1" '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' | grep -v '^org\.ai-sdlc\.gufo-fork\.' | grep . | sort
 }
@@ -332,21 +356,22 @@ main() {
   # loading it moves that name. Record what the name held BEFORE the load, then
   # afterwards remove the name if the load created it, or point it back at its
   # old image if the load moved it. Stock is pinned by digest either way.
-  name="$(tar -xzOf "$GF_OUT/image.tar.gz" manifest.json 2>/dev/null | sed -n 's/.*"RepoTags":\["\([^"]*\)".*/\1/p' | head -1)"
+  # manifest.json is pretty-printed (item 154), so it is parsed as JSON.
+  name="$(gf_archive_name "$GF_OUT/image.tar.gz")"
   pre=""; [ -n "$name" ] && pre="$(gf_cfg "$name" '{{.Id}}')"
-  loaded="$(docker_ load -i "$GF_OUT/image.tar.gz" | sed -n 's/^Loaded image: //p' | tail -1)"
+  loaded="$(docker_ load -i "$GF_OUT/image.tar.gz" | sed -n 's/^Loaded image\( ID\)\{0,1\}: //p' | tail -1)"
   lid="$(gf_cfg "$loaded" '{{.Id}}')"
   [ -n "$lid" ] || gf_die "docker load did not report an image (loaded '$loaded')" 3
   docker_ tag "$loaded" "$IMAGE_REPO-unlabelled:$h12" || gf_die "cannot tag $loaded" 3
-  if [ -n "$name" ] && [ "$loaded" = "$name" ]; then
-    if [ -z "$pre" ]; then docker_ rmi "$loaded" >/dev/null 2>&1
-    elif [ "$pre" != "$lid" ]; then docker_ tag "$pre" "$loaded" >/dev/null 2>&1 || gf_say "build: could not point $loaded back at $pre"
+  if [ -n "$name" ]; then
+    if [ -z "$pre" ]; then docker_ rmi "$name" >/dev/null 2>&1 || gf_say "build: could not remove $name"
+    elif [ "$pre" != "$lid" ]; then docker_ tag "$pre" "$name" >/dev/null 2>&1 || gf_say "build: could not point $name back at $pre"
     fi
   else
-    gf_say "build: left $loaded as loaded (its name was not read from the archive beforehand)"
+    gf_say "build: left $loaded as loaded (no RepoTags read from the archive's manifest.json)"
   fi
   printf 'FROM %s-unlabelled:%s\nLABEL org.ai-sdlc.gufo-fork.commit=%s org.ai-sdlc.gufo-fork.branch=%s org.ai-sdlc.gufo-fork.base-tag=%s org.ai-sdlc.gufo-fork.base-commit=%s org.ai-sdlc.gufo-fork.toolboxes-commit=%s\n' \
-    "$IMAGE_REPO" "$h12" "$GF_HEAD" "ai-sdlc/$BASE_TAG" "$BASE_TAG" "$BASE_COMMIT" "$TOOLBOXES_COMMIT" \
+    "$IMAGE_REPO" "$h12" "$GF_HEAD" "${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}" "$BASE_TAG" "$BASE_COMMIT" "$TOOLBOXES_COMMIT" \
     | docker_ build -q --pull=false -t "$IMAGE_REPO:$h12" - >/dev/null || gf_die "the label step failed" 3
   id="$(gf_cfg "$IMAGE_REPO:$h12" '{{.Id}}')"
   [[ "$id" =~ ^sha256:[0-9a-f]{64}$ ]] || gf_die "the labelled image's id is not sha256:<64 hex>: '$id'" 3

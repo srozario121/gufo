@@ -112,6 +112,12 @@ EXPECTED_DRV=/nix/store/izfwqpzfim1bz2n1nj3i6nsbpdww2q6w-gufo-runtime.tar.gz.drv
   the patch range, a linked worktree, a Nix image not by digest or not local,
   more than 16 build cores, a disk budget that does not fit, or too little
   memory. Each is refused before any build container starts.
+- **Another branch.** `GF_PATCH_BRANCH=<branch> ai-sdlc/build.sh` (and
+  `test.sh`) builds a local experiment branch on top of the base, such as an
+  item's port or revert branch, in place of `ai-sdlc/<tag>`. HEAD must be on
+  that branch; it names the bare clone's ref and the `branch` label. The
+  other refusals are unchanged: the branch must still descend from the base
+  commit with no merge. Unset, the branch is `ai-sdlc/<tag>`.
 - **Result.** `docker load`, then a retag to
   `ai-sdlc/gufo-runtime-fork-unlabelled:<HEAD12>`. The loaded name is the
   stock tag's name: what it held before the load is recorded, and afterwards
