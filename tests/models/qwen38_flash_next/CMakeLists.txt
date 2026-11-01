@@ -38,8 +38,11 @@ if (ENGINE_ENABLE_HIP)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()
   # The head-trim test keeps the replaced fallback kernel as its reference:
-  # device code, so HIP-Clang compiles it whatever the C++ compiler is.
-  set_source_files_properties(head_trim_ops_test.cpp PROPERTIES LANGUAGE HIP)
+  # device code, so HIP-Clang compiles it whatever the C++ compiler is, with
+  # the kernel library's floating-point flags so the bit comparisons hold.
+  set_source_files_properties(head_trim_ops_test.cpp PROPERTIES LANGUAGE HIP
+    COMPILE_OPTIONS
+    "-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument")
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)
