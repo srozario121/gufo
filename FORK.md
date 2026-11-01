@@ -183,6 +183,43 @@ ai-sdlc/test.sh format                        # or any subset
   suite and every GPU or model oracle stay explicit checks; the patch's
   equivalence rests on the tier-1 proof, not on these.
 
+## GPU test
+
+`ai-sdlc/gpu-test.sh` is the GPU half of a port's checks: a candidate branch
+against the upstream release it sits on, in the same container image and store
+volume, with nothing installed on the host. It works from commits (`git archive`),
+so it runs from the main clone or any worktree. Two phases:
+
+```
+ai-sdlc/gpu-test.sh status                     # what is built; whether run may start
+ai-sdlc/gpu-test.sh prepare                    # no lease: build both trees, no GPU
+# take the box (the deployment's lease, engine off), then:
+GF_TRIM_SET=<high set> GF_LOW_SET=<low set> ai-sdlc/gpu-test.sh run
+# give the box back
+```
+
+- **prepare** may run while the engine serves: one container per tree, capped at
+  `GF_BUILD_MEM_MIB` (6144) and `GF_BUILD_CORES` (4), no devices, the
+  production package's toolchain (`nix develop <tree>#default`) with its
+  patched ROCr, the gpu-test configuration (RelWithDebInfo, assertions, HIP).
+  Defaults: candidate `ai-sdlc/v0.28.1`, base `v0.28.1` (`GF_CAND`, `GF_BASE`).
+  A tree built at the same commit is not rebuilt.
+- **run** refuses without a lease lock, while any other container has `/dev/kfd`
+  mapped, or under `GF_RUN_MIN_AVAIL_MIB` (64 GiB). It never takes or gives back
+  the lease. It runs the candidate's `qwen38_flash_next` GPU operator tests,
+  then one server per arm, greedy on eight fixed prompts:
+  flags off on the base and the candidate (must be byte-identical), the Low
+  draft set (must equal flags off), and configuration G on the High set (must
+  answer, score trimmed rows and keep sampled logprobs finite; its divergence
+  is reported, not gated). The sets are the deployment's evidence, passed by
+  path and mounted read-only; an arm whose set is unset is SKIP.
+- **Result.** `check_<name>=PASS|FAIL|SKIP` lines and the folder
+  `~/.cache/gufo-fork-gpu/<cand12>-on-<base12>/` (logs, responses, summary).
+  Exit: 0 all passed; 1 refused; 2 usage; 3 a check failed; 5 stopped by the
+  memory floor or the store budget.
+- **Not covered.** Speed: the paired A/B stays with the deployment's harness on
+  exact image IDs from `build.sh`.
+
 ## Rebase onto a new upstream release
 
 1. In the main clone: `git fetch upstream --tags`.
