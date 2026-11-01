@@ -5,6 +5,26 @@ what `git merge-tree` reports, not finished resolutions. It is a plan, and every
 is a hypothesis until step 5 measures it. The patches are described in the README section
 "What this fork changes".
 
+## Progress (2026-11-01)
+
+- [x] Step 4.2: the vocab-trim series is ported onto this branch. Four commits conflicted, and each
+      conflict keeps upstream's logic:
+  - the #849 remap bound now takes the length of the table actually used;
+  - #882's draft confidence is computed over the trimmed rows;
+  - upstream's new `logprobs` path resolves deferred rows before reading them (noted in the
+    commit message);
+  - our GPU test is compiled as HIP.
+- [x] Step 4.3 and 4.5: `ai-sdlc/port-q4-1-decode-copy-v0.28.1` (applied cleanly) and
+      `feat/dump-hidden-v0.28.1` (one CMake conflict). Each is on its own branch.
+- [x] 5a: all 15 flags and 26 usage/metrics fields are unchanged from the source branch, and
+      `range-diff` shows only the edits listed above. `format` (708 files), `pr-tests` (79/79)
+      and `cache-tests` pass.
+- [x] Both trees are built for the GPU run (`ai-sdlc/gpu-test.sh prepare` on the tooling branch).
+      `build.conf` for v0.28.1 is prepared on `ai-sdlc/tooling-v0.28.1` (toolboxes `58fdb5da`).
+- [ ] 5b: `ai-sdlc/gpu-test.sh run` under a lease.
+- [ ] 5c: images built with `build.sh`, divergence on the 100 held-out turns, and the A1/A2/A3
+      speed runs.
+
 ## 1. Where things stand
 
 | | Commit | Notes |
