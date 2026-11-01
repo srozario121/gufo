@@ -79,6 +79,14 @@ Measured on the same turns, only 2 of 2,909 flagged greedy rows (0.07%) changed 
 the full-head pass. That is why the threshold was lowered from 0.5 to 0.25 and the rows past the
 first rejection are no longer paid for.
 
+**Known limits with a trim set loaded.** These hold on every base the trim has run on:
+
+- **`logprobs`:** a token outside the set has a logprob of −∞. The exception is a row that took the
+  full-head fallback, which carries the full distribution.
+- **Structured output:** a grammar or JSON schema cannot produce a token outside the set unless that
+  row falls back. Leave the trim off for schema-constrained traffic, or make sure the set covers the
+  schema's tokens.
+
 ### Fork branches
 
 | Branch | Holds |
@@ -87,9 +95,11 @@ first rejection are no longer paid for.
 | `ai-sdlc/v0.19.0-vocab` | v0.19.0 plus the vocabulary-trim, `logit_bias` and draft-vocabulary series (10 commits) |
 | `ai-sdlc/upstream-main-vocab` | The same series on upstream `1167a944` (after v0.21.0) |
 | `ai-sdlc/port-q4-1-decode-copy` | The Q4_1 decode copy on upstream `6c8b2ff4` |
+| `ai-sdlc/port-q4-1-decode-copy-v0.28.1` | The same 5 commits on v0.28.1, kept apart from the vocab trim |
 | `ai-sdlc/c2b-*`, `ai-sdlc/c2b-trie-first-token` | The trie-drafting experiments (dropped) |
 | `feat/dump-hidden` | The MTP training-data tools |
-| `ai-sdlc/v0.28.1` (this branch) | Upstream v0.28.1 plus this README. The integration branch for porting the patches; see the merge plan |
+| `feat/dump-hidden-v0.28.1` | The same tools on v0.28.1 |
+| `ai-sdlc/v0.28.1` (this branch) | Upstream v0.28.1 plus this README and the vocabulary-trim, `logit_bias` and draft-vocabulary series, ported. CPU checks pass; GPU and speed checks are pending (see the merge plan) |
 | `ai-sdlc/tooling` | `FORK.md`, the reproducible image build (`build.sh`), `test.sh`, the leak check and the planning items |
 
 ## Models and benchmarks
