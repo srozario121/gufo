@@ -1083,6 +1083,8 @@ struct Session::PendingDecode {
   /// request's first speculative step.
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
+  /// Trie v3 shadow (variant A): the product of the drafts' confidences.
+  double draft_confidence_product{1.0};
 };
 
 bool Session::GateStops(const PendingDecode& pending) {
@@ -1099,6 +1101,9 @@ void Session::AppendDraft(PendingDecode& pending) {
         pending.candidates, *pending.draft_sampler, &pending.draft_rng));
     pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
     pending.draft_sampler->Accept(pending.proposals.back().token);
+    pending.draft_confidence_product *= pending.proposals.back().probability;
+  } else {
+    pending.draft_confidence_product *= pending.draft_confidence;
   }
   pending.chain.push_back(pending.draft);
 }
@@ -1381,7 +1386,24 @@ bool Session::FinishDecode(const DecodeRequest& request,
           .reason = reason,
           .sampled = sampled,
           .chain = k,
+          .confidence = pending.draft_confidence_product,
       };
+      // Variant B: at a gate stop, the trie's view of the gated draft itself.
+      if (reason == TrieShadowReason::kGate && k >= 2 &&
+          trie_.Draft(tokens_, std::span(chain).first(k - 1), step) == 1) {
+        shadow_event->gate_token = step[0].token;
+        shadow_event->gate_agree = step[0].token == chain.back();
+        shadow_event->gate_order = static_cast<std::uint32_t>(step[0].order);
+        shadow_event->gate_probability = step[0].probability;
+      }
+      // Variant D: prompt lookup's best match from its 3-token key up (under
+      // its own sampled rules), and the token it would copy next.
+      const auto match =
+          lookup_.Find(tokens_, chain, speculative::PromptLookup<>::kKeyTokens);
+      if (match.length != 0 && match.start < tokens_.size()) {
+        shadow_event->lookup_length = static_cast<std::uint32_t>(match.length);
+        shadow_event->lookup_token = tokens_[match.start];
+      }
     }
   }
   std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
