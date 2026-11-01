@@ -15,6 +15,83 @@ for user-facing changes and release history.
 > [!TIP]
 > Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
+## What this fork changes
+
+> [!IMPORTANT]
+> **This is [srozario121/gufo](https://github.com/srozario121/gufo), a fork of
+> [gufo-org/gufo](https://github.com/gufo-org/gufo).** Everything outside this section is upstream's
+> text and still describes upstream's engine. The fork adds a short series of patches for one
+> workload: serving **Qwen3.8 Flash-Next** (UD-Q4_K_XL trunk plus the Q8_0 MTP head) to a coding
+> agent, with English-only, sampled traffic and cached prompt prefixes.
+>
+> **Every patch is off by default.** If you pass none of the flags below, the fork behaves like the
+> upstream release it is based on. The branch layout, build and push rules are in `FORK.md` on the
+> `ai-sdlc/tooling` branch. The plan for porting the patches onto this base is in
+> [docs/fork/MERGE_PLAN.md](docs/fork/MERGE_PLAN.md).
+
+### Summary
+
+All numbers come from one Strix Halo box (`gfx1151`) running Qwen3.8 Flash-Next with MTP, on
+upstream **v0.19.0**. The benchmark replays 36 held-out coding-agent turns, measured as paired
+A/B runs with a server restart per visit, an A-against-A null run, and 95% clustered bootstrap
+intervals. Quality is judged on 100 held-out turns, decoded greedily. "Lossless" is used only for
+output that is byte-identical. The patches have not yet been re-measured on a newer upstream base;
+see the merge plan.
+
+| Change | Flags | Measured benefit | Quality | Status |
+| --- | --- | --- | --- | --- |
+| **Vocabulary-trimmed output head** ("High" level, configuration G) | `--vocab-trim-set`, `--vocab-trim-fallback-threshold 0.25`, `--vocab-trim-discard-aware`, `--vocab-trim-fallback-skip-scored` | **+5.6% decode tok/s** for a single stream (interval +3.6% to +7.5%) and **+5.7%** with 4 concurrent streams (+1.6% to +11.0%). The A/A null passes on both. Decode round time drops from 61.9 ms to 59.7 ms. | Approximate. Greedy text diverges on 1 of 100 held-out turns. Seeded sampling gives identical text on 33 of 36 turns. Every non-English script still passes through. | Meets the +3% adoption bar on both legs. Not yet the production default: the agent task-slice check and an at-scale sampled-quality check are still open |
+| Fallback refinements (part of G) | `--vocab-trim-discard-aware`, `--vocab-trim-fallback-skip-scored` | Full-head fallback time per round drops from 1.20 ms to 0.33 ms (−73%). The head's share of a round drops from 3.4% to 1.9%. | Discard-aware is output-neutral. Skip-scored can change a near tie; it added no divergence on the held-out set. | Part of G |
+| MTP draft-vocabulary restriction ("Low") | `--mtp-draft-vocab-prefix`, `--mtp-draft-vocab-set` | Not resolved: +3.2% single-stream, −1.0% with 4 streams, and both intervals include 0 | **Lossless**: greedy output byte-identical (72/72) | Kept as an off flag |
+| `logit_bias` and soft non-ASCII suppression ("Medium") | `--logit-bias`, `--suppress-nonascii-keep`, `--suppress-nonascii-value` | Not a speed gain: −5.1% with 4 streams, because biasing runs on the host. The value is functional: the fork accepts OpenAI-style `logit_bias` on token IDs, which upstream rejects with `unsupported_sampling`. | 0/100 English divergence; Japanese and Hindi pass-through failed at −8 | Dropped as a speed lever; kept as an API feature |
+| Head instrumentation | `--vocab-trim-timing`, `--vocab-trim-counters`, `--vocab-trim-rowlog`, `--vocab-trim-count-once` | Device-side timing and counters for each phase. These numbers drove the G tuning. `--vocab-trim-count-once` fixes a `/metrics` over-count: batched decode was reporting head counters 2.45× too high. | None (measurement only) | Diagnostic |
+| Two-tier fallback | `--vocab-trim-tier2`, `--vocab-trim-tier2-threshold` | **Negative**: every flagged row escalated anyway, and fallback time rose 7% | — | Failed; code kept off so later commits apply cleanly. Do not use |
+| Smoothed n-gram **trie drafting** (C2b, "trie-first token") | branches `ai-sdlc/c2b-*` | Offline replay predicted +8.4% decode. **Live it was slower** than upstream's prompt lookup: v1 −21%, and v2 a median −13.5% per agent replay. At live trie-first rounds the target gave the trie's token a mean probability of 0.17, against the 0.82 predicted offline. The offline data was rebuilt from trace text rather than the model's own token stream. | Distribution-exact: drafts are verified as point masses | **Dropped, not ported.** Branches kept for reference |
+| Q4_1 decode copy of the Q8_0 trunk | `GUFO_DECODE_COPY=balanced`, branch `ai-sdlc/port-q4-1-decode-copy` | 4-visit screen: +6.1% single-stream and +7.6% with 4 streams. Both nulls failed, so neither leg is judged. Costs +1.66 GiB of device memory. | Approximate; greedy divergence d = 0.80 on 100 turns, a quality alarm | Screen only; not adopted. Reimplemented from the design in [mikealanni/gufo](https://github.com/mikealanni/gufo) (MIT) |
+| MTP training-data tools | `dump_hidden`, `ref_mtp` (branch `feat/dump-hidden`) | Dumps per-token hidden rows and trunk top-k for training the MTP draft head. `ref_mtp` is a CPU reference for parity checks. | Not in the serving path; separate Nix derivation, `GUFO_BUILD_DUMP_HIDDEN=OFF` by default | Tooling |
+
+### How the vocabulary trim works
+
+Qwen3.8 Flash-Next has 248,320 output tokens. On one English coding-agent corpus, 19,878 distinct
+tokens appear in output, and the top 10,000 cover 98.7% of it. The output-head projection reads
+every row on every decode and verify step. The trim exploits that gap:
+
+1. **Compact head.** `--vocab-trim-set PATH` takes one token ID per line. Special and stop tokens
+   are always added. At load, the Q8_0 rows for the set (48,696 rows in the measured set) are
+   gathered into a compact device copy. The projection scores only those rows. A kernel then
+   expands the result to full-vocabulary logits, filling every unscored token with −∞. So the
+   sampler, penalties and `logit_bias` still see real token IDs.
+2. **The MTP draft head reads the same compact rows.** It also takes its argmax and top-64 there
+   and maps the winners back to token IDs. This replaces the draft-vocabulary prefix and table
+   (the two option sets exclude each other).
+3. **Confidence fallback.** If a position's best probability over the scored rows falls below the
+   threshold, a device kernel recomputes the full head for that row. Its integer dot products keep
+   the bit pattern of an unrestricted head. The fallback runs on the stream, so decode graphs still
+   capture it.
+4. **Discard-aware flagging.** In a greedy chain, the first draft the target rejects ends the
+   chain, so flagged rows after it are cleared on the device before the full-head read. A sampled
+   or biased chain defers each flagged row until the verify loop actually reaches it. Either way,
+   rows that would be thrown away never pay for a full-head read.
+5. **Skip-scored fallback.** A full-head pass reads only the 199,624 rows the compact projection did
+   not already score, instead of all 248,320.
+
+Measured on the same turns, only 2 of 2,909 flagged greedy rows (0.07%) changed their argmax after
+the full-head pass. That is why the threshold was lowered from 0.5 to 0.25 and the rows past the
+first rejection are no longer paid for.
+
+### Fork branches
+
+| Branch | Holds |
+| --- | --- |
+| `ai-sdlc/v0.19.0` | Upstream v0.19.0 with no patches. This is the build that is currently deployed |
+| `ai-sdlc/v0.19.0-vocab` | v0.19.0 plus the vocabulary-trim, `logit_bias` and draft-vocabulary series (10 commits) |
+| `ai-sdlc/upstream-main-vocab` | The same series on upstream `1167a944` (after v0.21.0) |
+| `ai-sdlc/port-q4-1-decode-copy` | The Q4_1 decode copy on upstream `6c8b2ff4` |
+| `ai-sdlc/c2b-*`, `ai-sdlc/c2b-trie-first-token` | The trie-drafting experiments (dropped) |
+| `feat/dump-hidden` | The MTP training-data tools |
+| `ai-sdlc/v0.28.1` (this branch) | Upstream v0.28.1 plus this README. The integration branch for porting the patches; see the merge plan |
+| `ai-sdlc/tooling` | `FORK.md`, the reproducible image build (`build.sh`), `test.sh`, the leak check and the planning items |
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
