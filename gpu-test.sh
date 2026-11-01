@@ -54,6 +54,8 @@
 # (${XDG_STATE_HOME:-$HOME/.local/state}/ai-sdlc/server-measure.lock),
 # GF_MODEL_DIR, GF_MODEL, GF_MTP,
 # GF_TRIM_SET, GF_LOW_SET, GF_PORT (18099), GF_MAX_TOKENS (256),
+# GF_SHADOW (1 adds the cand-shadow arm: the candidate with GUFO_TRIE_SHADOW set must
+# reply as cand-off and write valid trie v3 shadow records; MTP item 1.32),
 # GF_RUN_DOCKER_EXTRA (extra `docker run` words for the GPU containers, empty by
 # default; nothing here adds --privileged). GF_DRY_RUN=1 prints the checks and
 # the container commands and exits.
@@ -297,6 +299,7 @@ gf_serve_arm() {  # <arm> <tree> [fork flags...]: serve, ask every prompt, stop
   local flags=() a
   for a in "$@"; do
     case "$a" in /*) mounts+=(-v "$a:/sets/$(basename "$a"):ro"); flags+=("/sets/$(basename "$a")") ;;
+                 env:*) mounts+=(-e "${a#env:}") ;;   # a container environment variable, not a flag
                  *) flags+=("$a") ;; esac
   done
   gf_container "$name" "$mem" 1 "$tree" "exec /build/gufo serve --host 0.0.0.0 --port $GF_PORT llm \
@@ -370,6 +373,22 @@ sys.exit(0 if ok and rows > 0 and finite else 1)
 PY
 }
 
+gf_check_shadow() {  # trie v3's shadow log: valid records, counted
+  python3 -I - "$GF_OUT/logs/trie-shadow.jsonl" <<'PY'
+import json, sys
+keys = {"pos", "reason", "sampled", "chain", "keep", "reached", "trie", "order", "p", "emitted", "match"}
+try:
+    rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+except Exception as e:
+    print(f"  shadow log unreadable: {e}", file=sys.stderr); sys.exit(1)
+bad = [r for r in rows if set(r) != keys or r["reason"] not in ("gate", "width")]
+reached = [r for r in rows if r["reached"] and r["emitted"] >= 0]
+print(f"  shadow records {len(rows)} (bad {len(bad)}): reached {len(reached)}, matched "
+      f"{sum(r['match'] for r in reached)}, gate {sum(r['reason'] == 'gate' for r in rows)}", file=sys.stderr)
+sys.exit(0 if rows and not bad else 1)
+PY
+}
+
 gf_run() {
   local rc=0 r
   gf_run_checks
@@ -387,8 +406,9 @@ nix develop --no-write-lock-file path:/src#default -c \
   local g_flags=(--vocab-trim-set "$GF_TRIM_SET" --vocab-trim-fallback-threshold 0.25
     --vocab-trim-discard-aware --vocab-trim-fallback-skip-scored)
   local arm
-  for arm in base-off cand-off cand-low cand-g; do
+  for arm in base-off cand-off cand-low cand-g cand-shadow; do
     case "$arm" in
+      cand-shadow) [ "${GF_SHADOW:-0}" = 1 ] || { gf_result shadow_identity SKIP; continue; } ;;
       cand-low) [ -n "$GF_LOW_SET" ] || { gf_result low_lossless SKIP; continue; } ;;
       cand-g)   [ -n "$GF_TRIM_SET" ] || { gf_result g_smoke SKIP; continue; } ;;
     esac
@@ -398,6 +418,8 @@ nix develop --no-write-lock-file path:/src#default -c \
       cand-off) gf_serve_arm "$arm" cand ;;
       cand-low) gf_serve_arm "$arm" cand --mtp-draft-vocab-set "$GF_LOW_SET" ;;
       cand-g)   gf_serve_arm "$arm" cand "${g_flags[@]}" ;;
+      cand-shadow) rm -f "$GF_OUT/logs/trie-shadow.jsonl"
+                   gf_serve_arm "$arm" cand env:GUFO_TRIE_SHADOW=/logs/trie-shadow.jsonl ;;
     esac
     r=$?; [ "$r" = 5 ] && gf_die "stopped by the memory floor during $arm" 5
     [ "$r" = 0 ] || { gf_say "gpu-test: arm $arm failed (exit $r); see $GF_OUT/logs"; rc=3; }
@@ -413,6 +435,10 @@ nix develop --no-write-lock-file path:/src#default -c \
     if [ -n "$GF_TRIM_SET" ]; then
       [ -f "$GF_OUT/results/cand-g.json" ] && gf_check_g \
         && gf_result g_smoke PASS || { gf_result g_smoke FAIL; rc=3; }
+    fi
+    if [ "${GF_SHADOW:-0}" = 1 ]; then
+      [ -f "$GF_OUT/results/cand-shadow.json" ] && gf_compare shadow cand-off cand-shadow && gf_check_shadow \
+        && gf_result shadow_identity PASS || { gf_result shadow_identity FAIL; rc=3; }
     fi
     printf '%s\n' "${GF_RESULTS[@]}" > "$GF_OUT/results/summary.txt"
   fi
