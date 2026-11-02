@@ -1,5 +1,35 @@
 # Qwen3.8 Flash-Next experiments
 
+## Decode and verification routed experts (November 2, 2026)
+
+`qwen38_flash_next_decode_moe_bench` (new) times the routed expert vectors as
+verification calls them: the gated Q4_K gate/up and the Q5_1 down projection
+over the top-10 slot rows, at 1–8 rows. It uses six layers of 512 synthetic
+experts (9.4 GB, beyond MALL), with independent routing or rows sharing 5 of 10
+experts. It prints a hash of the down output and two read controls over the
+same expert bytes: one launch, or one per projection as the executor launches
+them.
+
+- **The gap:**
+  - The measured DRAM read ceiling is 238.9 GB/s.
+  - The production kernels stream 193–220 GB/s: gate/up 207–212 at 1–2 rows and
+    187–197 at 3–8 shared rows; down 193–210.
+  - The per-projection read control reaches 222–237 GB/s. Launch granularity is
+    therefore 2–7%, and the kernels themselves sit 10% (1 row) to 17% (6
+    shared rows) below it.
+  - Kernel times match production's profile: gate/up 0.324 against 0.326 ms per
+    layer at 6 rows, down 0.202 against 0.192.
+- **Why:** every kernel already runs 16 waves per SIMD with no scratch, so the
+  gap is not occupancy.
+
+| Experiment | Outcome |
+| --- | --- |
+| More anchor-list block rows for the split Q4_K grouped launch (`kListRows` 2 → 4/8/16/64) | Rejected: byte-identical, within 1% at every width; 640 blocks already fill the machine. |
+| Eight-row Q5_1 down tiles from two slot rows on (the 20-row threshold → 1) | Rejected: byte-identical and unchanged at every width. |
+| All five Q4_K fragments of a lane loaded before the first dot (k = 2560) | Rejected: byte-identical, but 5–12% slower on shared routing at 2–8 rows (171–181 against 190–197 GB/s). |
+| One 16-byte load for a Q4_K block's dm and scales | No change: the compiler already merges them into `global_load_b128`. |
+| Q4_K codes as coalesced 8-byte loads with lane exchange (two `b64` and eight `ds_bpermute` replace four `b32` per fragment), and the gated 1-row and 2-row paths through the fragment | Rejected: byte-identical, within ±1% at every width and routing. |
+
 ## Prefill route independence (October 23, 2026)
 
 A prompt restored from a checkpoint and finished by a short prefill pass must
