@@ -650,17 +650,49 @@ struct InjectParts {
   }
 };
 
+/// MoeEpilogueKernel's value at element i of token t (k <= 16): the same
+/// loads, the same materialized slot order and the same final expression.
+__device__ __forceinline__ float MoeEpilogueValue(
+    const MoeEpilogueOperands& m, std::uint32_t t, std::uint32_t i,
+    std::uint32_t dim) {
+  constexpr std::uint32_t kMaxSlots = 16;
+  const std::uint32_t k = m.k;
+  const float* rows = m.expert_out + static_cast<std::size_t>(t) * k * dim + i;
+  float w[kMaxSlots];
+  float v[kMaxSlots];
+#pragma unroll
+  for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+    w[s] = s < k ? m.weights[t * k + s] : 0.0f;
+    v[s] = s < k ? rows[static_cast<std::size_t>(s) * dim] : 0.0f;
+  }
+  const std::size_t idx = static_cast<std::size_t>(t) * dim + i;
+  const float sh = m.shared[idx];
+  const float g = m.gate[static_cast<std::size_t>(t) * m.gate_stride];
+  float acc = Materialize(0.0f);
+#pragma unroll
+  for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+    if (s < k) {
+      acc = Materialize(acc + w[s] * v[s]);
+    }
+  }
+  return acc + SigmoidF(g) * sh;
+}
+
 /// grid (tokens, streams): one block owns one residual stream, so the
 /// grouped norm of the next mixer reduces over exactly its own elements.
 /// `XnT` is float for the reference route and __half for the F16 mixer
 /// input route; a non-null `xn_q8` also receives the norm quantized into
 /// the tiled Q8 layout (hidden % 32 == 0) for the W8A8 down projection.
-template<typename XnT>
+/// With kMoe the block output is computed from `moe` (MoeEpilogueValue)
+/// instead of read from block_out, and stream 0 writes it to moe.block_out;
+/// only the held-row route below takes it (HcCombineQ8_1Moe checks the shape).
+template<typename XnT, bool kMoe = false>
 __global__ void HcCombineKernel(float* res, const float* block_out,
                                 const float* inject, std::uint32_t inject_parts,
                                 const float* gamma, XnT* xn, void* xn_q8,
                                 std::uint32_t hidden, std::uint32_t streams,
-                                float eps, void* xn_q8_1) {
+                                float eps, void* xn_q8_1,
+                                MoeEpilogueOperands moe) {
   __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
@@ -688,8 +720,21 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
       const std::uint32_t i = threadIdx.x + c * blockDim.x;
       const std::uint32_t k = i < hidden ? i : hidden - 1;
       r[c] = dst[k];
-      b[c] = src[k];
+      if constexpr (kMoe)
+        b[c] = MoeEpilogueValue(moe, t, k, hidden);
+      else
+        b[c] = src[k];
       gv[c] = gamma != nullptr ? g[k] : 0.0f;
+    }
+    if constexpr (kMoe) {
+      if (s == 0) {
+#pragma unroll
+        for (std::uint32_t c = 0; c < kHeld; ++c) {
+          const std::uint32_t i = threadIdx.x + c * blockDim.x;
+          if (i < hidden)
+            moe.block_out[static_cast<std::size_t>(t) * hidden + i] = b[c];
+        }
+      }
     }
     const float w =
         2.0f * SigmoidF(inject_sum.Sum() / static_cast<float>(streams));
@@ -6061,7 +6106,7 @@ void HcCombine(float* res, const float* block_out, const float* inject,
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
-                     nullptr);
+                     nullptr, MoeEpilogueOperands{});
 }
 
 bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
@@ -6074,7 +6119,25 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
   hipLaunchKernelGGL(HcCombineKernel<float>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, nullptr, hidden, streams, eps,
-                     xn_q8);
+                     xn_q8, MoeEpilogueOperands{});
+  return true;
+}
+
+bool HcCombineQ8_1Moe(float* res, const MoeEpilogueOperands& moe,
+                      const float* inject, std::uint32_t inject_parts,
+                      const float* gamma, float* xn, void* xn_q8,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, float eps, hipStream_t stream) {
+  // The held-row route of HcCombineKernel (10 elements per thread) and
+  // MoeEpilogueKernel's register route (k <= 16) are the ones folded.
+  if (gamma == nullptr || hidden % 32 != 0 || hidden > 10 * kThreads ||
+      moe.k == 0 || moe.k > 16 || moe.block_out == nullptr) {
+    return false;
+  }
+  hipLaunchKernelGGL((HcCombineKernel<float, true>), dim3(n_tokens, streams),
+                     dim3(kThreads), 0, stream, res, nullptr, inject,
+                     inject_parts, gamma, xn, nullptr, hidden, streams, eps,
+                     xn_q8, moe);
   return true;
 }
 
@@ -6159,7 +6222,7 @@ bool HcCombineF16(float* res, const float* block_out, const float* inject,
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),
                      dim3(kThreads), 0, stream, res, block_out, inject,
                      inject_parts, gamma, xn, xn_q8, hidden, streams, eps,
-                     nullptr);
+                     nullptr, MoeEpilogueOperands{});
   return false;
 }
 

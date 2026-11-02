@@ -107,6 +107,17 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
                    std::uint32_t inject_parts, const float* gamma, float* xn,
                    void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                    std::uint32_t streams, float eps, hipStream_t stream);
+struct MoeEpilogueOperands;
+/// HcCombineQ8_1 with the MoE epilogue folded in: each stream's block
+/// computes the block output from `moe` (MoeEpilogue's arithmetic, element
+/// for element) instead of reading it, and stream 0 also writes it to
+/// moe.block_out. False (nothing launched) outside its shapes: hidden % 32,
+/// hidden <= 10 * 256, moe.k <= 16, gamma non-null.
+bool HcCombineQ8_1Moe(float* res, const MoeEpilogueOperands& moe,
+                      const float* inject, std::uint32_t inject_parts,
+                      const float* gamma, float* xn, void* xn_q8,
+                      std::uint32_t n_tokens, std::uint32_t hidden,
+                      std::uint32_t streams, float eps, hipStream_t stream);
 /// HcCombine writing the normalized output as F16, the width the next
 /// mixer's projection and epilogue consume on the F16 mixer input route.
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8
@@ -539,6 +550,19 @@ void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
+
+/// MoeEpilogue's inputs, for a combine that folds the epilogue in
+/// (HcCombineQ8_1Moe); block_out receives the epilogue rows as MoeEpilogue's
+/// `out` would.
+struct MoeEpilogueOperands {
+  const float* expert_out{nullptr};
+  const float* weights{nullptr};
+  const float* shared{nullptr};
+  const float* gate{nullptr};
+  std::uint32_t gate_stride{0};
+  std::uint32_t k{0};
+  float* block_out{nullptr};
+};
 
 /// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].

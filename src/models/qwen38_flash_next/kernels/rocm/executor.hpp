@@ -884,6 +884,10 @@ private:
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
+  /// A decode batch's MoE epilogue left for the combine that follows, which
+  /// folds it into its pass (HcCombineQ8_1Moe) or runs it first.
+  mutable bool decode_moe_pending_{false};
+  mutable MoeEpilogueOperands decode_moe_{};
   /// Set before an attention-side combine whose FFN combine fuses the MoE
   /// epilogue: that combine may then leave its residual update to the next
   /// one (res_deferred_), which reads s_.block_out and s_.hc_defer_w.
