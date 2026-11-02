@@ -29,6 +29,16 @@ them.
 | All five Q4_K fragments of a lane loaded before the first dot (k = 2560) | Rejected: byte-identical, but 5–12% slower on shared routing at 2–8 rows (171–181 against 190–197 GB/s). |
 | One 16-byte load for a Q4_K block's dm and scales | No change: the compiler already merges them into `global_load_b128`. |
 | Q4_K codes as coalesced 8-byte loads with lane exchange (two `b64` and eight `ds_bpermute` replace four `b32` per fragment), and the gated 1-row and 2-row paths through the fragment | Rejected: byte-identical, within ±1% at every width and routing. |
+| Decode MoE epilogue folded into the FFN combine (`HcCombineQ8_1` computes each block-output element from the expert rows instead of reading it; one launch fewer per layer) | Rejected: byte-identical (residual, norm, Q8_1 rows and block output at 1–9 rows, four value scales), but the cost audit under G at d4096 is about 1 ms slower at every width (ABBA: 32.4/32.7 → 33.6/33.5 ms at width 1; 62.4/62.3 → 64.8/63.4 at width 6). The decode combine runs four blocks per token; the separate epilogue spreads the same loads over ten 256-thread blocks, so folding it lengthens the critical path by more than the launch it removes. |
+
+A decode pass at width 1 under G (cost-audit profile, d4096) spends 18.7 ms in
+dense Q8 matvecs, 7.8 ms in routed experts, 4.8 ms in about 900 small kernels
+(mean about 5 µs) and 2.8 ms idle between dispatches (1,398 per pass). The
+small-kernel runs between large kernels are 1–3 kernels long. Removing a launch
+saves its roughly 2 µs gap only if the fused work does not add critical-path
+latency at decode width, so the remaining candidates (Q8_1 written by the
+producer, SiLU-scale folded into the next projection) are each worth about
+0.1–0.3 ms per pass at most.
 
 ## Prefill route independence (October 23, 2026)
 
