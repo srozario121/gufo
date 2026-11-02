@@ -2314,18 +2314,6 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   defer_residual_ = false;
   const bool deferred = res_deferred_;
   res_deferred_ = false;
-  bool decode_moe = decode_moe_pending_;
-  decode_moe_pending_ = false;
-  const MoeEpilogueOperands moe = decode_moe_;
-  // A route that reads s_.block_out without folding the epilogue settles it.
-  const auto settle_moe = [&] {
-    if (!decode_moe)
-      return;
-    decode_moe = false;
-    MoeEpilogue(moe.expert_out, moe.weights, moe.shared, moe.gate,
-                moe.gate_stride, moe.block_out, n_tokens, moe.k, c.hidden_size,
-                stream_);
-  };
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe), and with it
     // the previous combine's residual update when that was deferred too.
@@ -2354,12 +2342,10 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   if (deferred) {
     // Only a fused MoE combine follows a deferring one; settle the update
     // before anything else reads the residual.
-    settle_moe();
     HcApplyDeferred(res, s_.block_out, s_.hc_defer_w, n_tokens, c.hidden_size,
                     stream_);
   }
   if (xn_half_) {
-    settle_moe();
     // The FFN combine that follows rereads this block output (42 MB at
     // 4,096 tokens) instead of this combine writing the residual and the
     // next reading it back (168 MB each).
@@ -2375,14 +2361,6 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well.
-  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) && decode_moe &&
-      HcCombineQ8_1Moe(res, moe, s_.inject, inject_parts_, gamma, s_.xn,
-                       s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count,
-                       c.rms_eps, stream_)) {
-    xn_q8_ready_ = {s_.xn, s_.xn_q8_1, n_tokens, c.HcDim()};
-    return;
-  }
-  settle_moe();
   if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
@@ -3274,13 +3252,6 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
                     s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
                     used, c.hidden_size, stream_);
-  } else if (out == s_.block_out) {
-    // The combine that follows computes this epilogue inside its own pass
-    // (one launch fewer per layer), or runs it first on its other routes.
-    decode_moe_ = {s_.down_e, s_.weights, s_.shexp_out,
-                   s_.router + c.num_experts, c.num_experts + 1, used,
-                   s_.block_out};
-    decode_moe_pending_ = true;
   } else {
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
