@@ -10,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
@@ -329,10 +330,15 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->trie_shadow_ = TrieShadowLog::FromEnvironment();
   m->gate_probe_ = TrieShadowLog::FromEnvironment("GUFO_MTP_GATE_PROBE");
-  if (m->gate_probe_)
-    std::cerr << "[gate-probe] the MTP confidence gate is off; recording every "
-                 "chain to "
+  if (m->gate_probe_) {
+    const char* keep = std::getenv("GUFO_MTP_GATE_PROBE_GATE");
+    m->gate_probe_keeps_gate_ =
+        keep != nullptr && std::string_view(keep) == "on";
+    std::cerr << "[gate-probe] the MTP confidence gate is "
+              << (m->gate_probe_keeps_gate_ ? "on" : "off")
+              << "; recording every chain to "
               << std::getenv("GUFO_MTP_GATE_PROBE") << "\n";
+  }
   if (m->trie_shadow_)
     std::cerr << "[trie-shadow] recording trie v3 shadow events to "
               << std::getenv("GUFO_TRIE_SHADOW") << "\n";
@@ -1092,6 +1098,8 @@ struct Session::PendingDecode {
   double draft_confidence_product{1.0};
   /// MTP gate probe: each MTP draft's probability, in chain order.
   std::vector<float> draft_probabilities;
+  /// Probe v2: when the single-session cycle started (unset when batched).
+  std::chrono::steady_clock::time_point started{};
 };
 
 bool Session::GateStops(const PendingDecode& pending) {
@@ -1224,6 +1232,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // event's position (trie_shadow.hpp).
   if (model_->trie_shadow_)
     model_->trie_shadow_->Write(shadow_.Anchor(tokens_.size(), anchor));
+  if (model_->gate_probe_) {
+    // Probe v2: the trie's continuation after the target's token here, the
+    // branch a sibling of a rejected draft would have proposed.
+    GateProbeAnchor line{.position = tokens_.size(), .token = anchor};
+    trie_.Extend(tokens_);
+    std::array<TrieDraft::Step, 4> steps{};
+    const auto n = trie_.Draft(tokens_, std::span(&anchor, 1), steps);
+    for (std::size_t i = 0; i < n; ++i)
+      line.continuation.push_back(steps[i].token);
+    model_->gate_probe_->Write(FormatGateAnchor(line));
+  }
   auto anchor_logprobs =
       sampling::CollectLogprobs(logits_, anchor, sampler.config().logprobs);
   if (is_stop(anchor)) {
@@ -1328,7 +1347,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
-      if (!model_->gate_probe_ && GateStops(*pending)) {
+      if (!model_->GateBypassed() && GateStops(*pending)) {
         pending->width = pending->chain.size();
         break;
       }
@@ -1587,11 +1606,18 @@ bool Session::FinishDecode(const DecodeRequest& request,
       if (trie_.Draft(prefix, std::span(chain).first(j), step) == 1) {
         record.agree.push_back(step[0].token == chain[j] ? 1 : 0);
         record.order.push_back(static_cast<std::uint32_t>(step[0].order));
+        record.trie.push_back(step[0].token);
       } else {
         record.agree.push_back(-1);
         record.order.push_back(0);
+        record.trie.push_back(-1);
       }
     }
+    record.kept.assign(chain.begin(), chain.begin() + keep);
+    if (pending.started != std::chrono::steady_clock::time_point{})
+      record.ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - pending.started)
+                      .count();
     model_->gate_probe_->Write(FormatGateProbe(record));
   }
   stats_.cycles += 1;
@@ -1644,6 +1670,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
   valid_ = false;
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
+  if (model_->gate_probe_)
+    pending.started = std::chrono::steady_clock::now();
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
                      occupancy)) {
     return false;
@@ -1890,7 +1918,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       }
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
-      if (!session.model_->gate_probe_ && GateStops(p)) {
+      if (!session.model_->GateBypassed() && GateStops(p)) {
         if (batch_drafts && !p.sampled &&
             p.draft_confidence < kMtpBatchDropProbability) {
           // Without proposals left the anchor decodes as an ordinary step;

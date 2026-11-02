@@ -203,6 +203,12 @@ private:
   std::unique_ptr<TrieShadowLog> trie_shadow_;
   /// MTP gate probe (trie_shadow.hpp): null unless GUFO_MTP_GATE_PROBE.
   std::unique_ptr<TrieShadowLog> gate_probe_;
+  /// Probe v2: GUFO_MTP_GATE_PROBE_GATE=on keeps the confidence gate while
+  /// recording, so cycles keep their served widths and times.
+  bool gate_probe_keeps_gate_{false};
+  [[nodiscard]] bool GateBypassed() const noexcept {
+    return gate_probe_ != nullptr && !gate_probe_keeps_gate_;
+  }
   /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
