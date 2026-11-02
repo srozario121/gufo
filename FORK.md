@@ -257,6 +257,14 @@ Push state (2026-10-11): `ai-sdlc/v0.10.0` is pushed to `origin` (it equals
 upstream's `3020d24`). `ai-sdlc/tooling` stays local, backed up by the
 bundle, until the maintainer's dated yes to publish it is recorded.
 
+Push state (2026-11-02, the maintainer's dated yes that day: "Approve item 3"):
+`ai-sdlc/v0.28.1` (`6509896b`, the deployed pin's source),
+`ai-sdlc/port-q4-1-decode-copy-v0.28.1`, `feat/dump-hidden-v0.28.1` and
+`ai-sdlc/tooling` are pushed, each with `leakcheck.sh --range` clean, noreply
+authors and no merges. The day's experiment branches (`ai-sdlc/gate-probe*`,
+`ai-sdlc/cost-audit-trim`, `ai-sdlc/gate-q070`, `ai-sdlc/moe-decode`,
+`ai-sdlc/trie-v3-shadow`) stay local, backed up by the bundle.
+
 ## Push checklist
 
 Do every item, every push:
