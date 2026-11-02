@@ -15,9 +15,11 @@ namespace gufo::models::qwen38_flash_next {
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 /// A chain ends after its first proposal below its gate: the head's
 /// probability of a greedy draft, or the proposal probability q of a sampled
-/// one.
+/// one. The sampled gate is 0.70 under the vocab-trimmed head (fork): its
+/// proposal step costs about 1.6 ms against 4 ms for the full head, so longer
+/// sampled chains pay (MTP item 1.34's cost audit and gate-probe replay).
 inline constexpr float kMtpGateProbability = 0.85F;
-inline constexpr float kMtpSampledGateProbability = 0.95F;
+inline constexpr float kMtpSampledGateProbability = 0.70F;
 /// In a jointly planned greedy batch a final proposal below this
 /// probability is not verified: its row costs a C8 cycle more than the
 /// expected accepted token returns.
