@@ -10,6 +10,8 @@
 // (float32, tokens - 1 values) and prints the mean.
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
+//                      [--vocab-trim-set IDS [--vocab-trim-threshold T]]
+//                      (the served trimmed head, discard-aware, skip-scored)
 //                      [--depth N] (default: 0, 4096, 32768)
 // Matched-token decode: --prompt-file P --decode-file C --dump rows.bin
 //                       [--decode-ids ids.bin] (prefill P, then feed C's
@@ -32,6 +34,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -101,6 +104,8 @@ int main(int argc, char** argv) {
   bool reference = false;
   bool cost_audit = false;
   bool sampled_head = false;
+  std::string trim_set_path;
+  float trim_threshold = 0.25F;
   std::vector<std::uint32_t> cost_concurrencies;
   std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
@@ -119,6 +124,10 @@ int main(int argc, char** argv) {
       mtp_audit = true;
     } else if (arg == "--sampled-head") {
       sampled_head = true;
+    } else if (arg == "--vocab-trim-set") {
+      trim_set_path = next();
+    } else if (arg == "--vocab-trim-threshold") {
+      trim_threshold = std::stof(next());
     } else if (arg == "--cost-audit") {
       cost_audit = true;
       const auto value = next();
@@ -245,6 +254,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--depth and --sampled-head require --cost-audit\n");
     return 2;
   }
+  if (!trim_set_path.empty() && (!cost_audit || sampled_head)) {
+    std::fprintf(stderr,
+                 "--vocab-trim-set requires --cost-audit and excludes "
+                 "--sampled-head (the draft reads the trimmed head)\n");
+    return 2;
+  }
   std::string error;
   auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   if (!reader) {
@@ -319,6 +334,33 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "draft vocabulary failed: %s\n", error.c_str());
       return 1;
     }
+  }
+  if (!trim_set_path.empty()) {
+    // As the engine applies --vocab-trim-set with discard-aware and
+    // skip-scored fallbacks (engine.cpp), so the audit prices the served head.
+    std::ifstream in(trim_set_path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    auto ids = q::ParseTokenIdList(text, c.vocab_size, &error);
+    if (!in.is_open() || !ids) {
+      std::fprintf(stderr, "trimmed head set: %s\n", error.c_str());
+      return 1;
+    }
+    std::vector<std::int32_t> special;
+    for (std::uint32_t id = 0; id < c.vocab_size; ++id)
+      if (tokenizer->IsSpecialToken(id) ||
+          tokenizer->IsStopToken(static_cast<gufo::tokenization::TokenId>(id)))
+        special.push_back(static_cast<std::int32_t>(id));
+    const auto plan = q::PlanHeadTrim(c.vocab_size, *ids, special);
+    if (!device->SetHeadTrim(plan.ids, plan.inverse, plan.padded_rows,
+                             trim_threshold, &error) ||
+        !device->SetHeadTrimSkipScored(true, plan.inverse, &error)) {
+      std::fprintf(stderr, "trimmed head failed: %s\n", error.c_str());
+      return 1;
+    }
+    device->SetHeadTrimDiscardAware(true);
+    std::printf("MTP cost head-trim rows=%zu threshold=%g\n", plan.ids.size(),
+                trim_threshold);
   }
   q::rocm::Executor::Options options;
   options.max_batch = batch;
