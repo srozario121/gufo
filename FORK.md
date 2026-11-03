@@ -265,6 +265,11 @@ authors and no merges. The day's experiment branches (`ai-sdlc/gate-probe*`,
 `ai-sdlc/cost-audit-trim`, `ai-sdlc/gate-q070`, `ai-sdlc/moe-decode`,
 `ai-sdlc/trie-v3-shadow`) stay local, backed up by the bundle.
 
+Push state (2026-11-03, the maintainer's choice that day "Publish all of them" and #876 "Now, before window 1"):
+`ai-sdlc/v0.28.1` fast-forwards to `fe4a18e5` (upstream #876 cherry-picked on `6509896b`; GPU checks passed under
+lease item 876). Every experiment branch above, and `ai-sdlc/v0.28.1-876`, is pushed, each with `leakcheck.sh
+--range` clean, noreply authors and no merges.
+
 ## Push checklist
 
 Do every item, every push:
