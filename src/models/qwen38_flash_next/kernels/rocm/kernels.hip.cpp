@@ -6135,10 +6135,12 @@ __global__ void HcTapMeanToRingKernel(const float* res, const float* block_out,
                                       const float* w, float* ring,
                                       const std::uint32_t* position,
                                       std::uint32_t window, std::uint32_t slot,
-                                      std::uint32_t slots,
-                                      std::uint32_t hidden) {
+                                      std::uint32_t slots, std::uint32_t hidden,
+                                      std::uint32_t first_row) {
   constexpr std::uint32_t kStreams = 4;
-  const std::uint32_t t = blockIdx.x;
+  // Only the batch's last `window` rows (first_row onward): earlier rows would
+  // share ring slots with later ones, and the draft never attends past them.
+  const std::uint32_t t = first_row + blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
   const float* row = res + static_cast<std::size_t>(t) * hc_dim;
   const std::uint32_t pos = (position[0] + t) % window;
@@ -6163,9 +6165,10 @@ void HcTapMeanToRing(const float* res, const float* block_out, const float* w,
                      std::uint32_t hidden, hipStream_t stream) {
   if (n_tokens == 0 || window == 0)
     return;
-  hipLaunchKernelGGL(HcTapMeanToRingKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, res, block_out, w, ring, position, window, slot,
-                     slots, hidden);
+  const std::uint32_t first_row = n_tokens > window ? n_tokens - window : 0U;
+  hipLaunchKernelGGL(HcTapMeanToRingKernel, dim3(n_tokens - first_row),
+                     dim3(kThreads), 0, stream, res, block_out, w, ring,
+                     position, window, slot, slots, hidden, first_row);
 }
 
 void HcApplyDeferred(float* res, const float* block_out, const float* w,

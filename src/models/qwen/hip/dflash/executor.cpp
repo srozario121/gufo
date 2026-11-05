@@ -828,13 +828,7 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
 bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
     std::span<const float> target_features, std::uint32_t position,
     std::uint32_t num_tokens, const DFlashTrace& trace) {
-  const auto& weights = model_->GetWeights();
-  const auto& cfg = model_->GetConfig();
-  const std::size_t hidden_size = cfg.hidden_size;
   const std::size_t enc_in_dim = GetTargetFeaturesSize();
-  const std::size_t kv_dim =
-      static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
-
   if (target_features.size() != num_tokens * enc_in_dim ||
       position + num_tokens > max_context_) {
     return false;
@@ -854,6 +848,71 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
     hipStream_t stream;
     ~DrainContextUpload() { (void)hipStreamSynchronize(stream); }
   } drain{stream_};
+  InjectUploadedChunk(position, num_tokens, trace);
+  return true;
+}
+
+bool QwenDFlashGpuExecutor::InjectTargetContextDevice(const float* features,
+                                                      std::uint32_t position,
+                                                      std::uint32_t num_tokens,
+                                                      hipStream_t producer) {
+  CheckContinuation();
+  if (features == nullptr || position > max_context_ ||
+      num_tokens > max_context_ - position) {
+    return false;
+  }
+  const std::uint32_t end = position + num_tokens;
+  if (end <= injected_context_len_)
+    return true;
+  // Rows the draft can no longer attend need no K/V.
+  if (end - injected_context_len_ > history_capacity_)
+    injected_context_len_ = end - history_capacity_;
+  if (position < injected_context_len_) {
+    features += static_cast<std::size_t>(injected_context_len_ - position) *
+                GetTargetFeaturesSize();
+    num_tokens = end - injected_context_len_;
+    position = injected_context_len_;
+  }
+  if (position != injected_context_len_)
+    return false;
+  hipEvent_t ready = nullptr;
+  struct DestroyEvent {
+    hipEvent_t* event;
+    ~DestroyEvent() {
+      if (*event != nullptr)
+        (void)hipEventDestroy(*event);
+    }
+  } destroy{&ready};
+  if (producer != stream_ &&
+      (hipEventCreateWithFlags(&ready, hipEventDisableTiming) != hipSuccess ||
+       hipEventRecord(ready, producer) != hipSuccess ||
+       hipStreamWaitEvent(stream_, ready, 0) != hipSuccess)) {
+    return false;
+  }
+  const std::size_t width = GetTargetFeaturesSize();
+  for (std::uint32_t offset = 0; offset < num_tokens;) {
+    const auto count = std::min(injection_capacity_, num_tokens - offset);
+    if (hipMemcpyAsync(d_target_features_,
+                       features + static_cast<std::size_t>(offset) * width,
+                       static_cast<std::size_t>(count) * width * sizeof(float),
+                       hipMemcpyDeviceToDevice, stream_) != hipSuccess) {
+      return false;
+    }
+    InjectUploadedChunk(position + offset, count, {});
+    offset += count;
+  }
+  return true;
+}
+
+void QwenDFlashGpuExecutor::InjectUploadedChunk(std::uint32_t position,
+                                                std::uint32_t num_tokens,
+                                                const DFlashTrace& trace) {
+  const auto& weights = model_->GetWeights();
+  const auto& cfg = model_->GetConfig();
+  const std::size_t hidden_size = cfg.hidden_size;
+  const std::size_t enc_in_dim = GetTargetFeaturesSize();
+  const std::size_t kv_dim =
+      static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
 
   // FC Projection & Norm
   RunInjectGemm(weights.fc_projection, d_target_features_, d_fused_features_,
@@ -914,7 +973,6 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
 
   injected_context_len_ =
       std::max(injected_context_len_, position + num_tokens);
-  return true;
 }
 
 kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(

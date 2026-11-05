@@ -180,6 +180,20 @@ public:
                            std::uint32_t position, std::uint32_t num_tokens,
                            const DFlashTrace& trace = {});
 
+  /// InjectTargetContext from device-resident features (a target's capture
+  /// ring, item 2.1): `features` holds `num_tokens` rows of
+  /// GetTargetFeaturesSize() floats, ready once `producer` reaches this call.
+  /// Rows the draft can no longer attend are skipped: a gap wider than the
+  /// history window first advances the injected length to `position +
+  /// num_tokens - window`.
+  bool InjectTargetContextDevice(const float* features, std::uint32_t position,
+                                 std::uint32_t num_tokens,
+                                 hipStream_t producer);
+  /// Rows of history the draft attends (its sliding window).
+  [[nodiscard]] std::uint32_t GetHistoryCapacity() const noexcept {
+    return history_capacity_;
+  }
+
   /// Projects committed features together and writes each private cache at
   /// its original absolute positions. Reuses the coordinator's scalar scratch.
   static void InjectTargetContextBatch(
@@ -240,6 +254,10 @@ private:
                                 std::uint32_t position,
                                 std::uint32_t num_tokens,
                                 const DFlashTrace& trace);
+  /// One chunk's projection, norm and K/V writes, its features already in
+  /// d_target_features_.
+  void InjectUploadedChunk(std::uint32_t position, std::uint32_t num_tokens,
+                           const DFlashTrace& trace);
   void Allocate();
   void Free() noexcept;
   [[nodiscard]] static std::size_t BatchScratchBytes(
