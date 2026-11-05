@@ -4,8 +4,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -3588,11 +3590,27 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
+  // TEMPORARY (item 2.8 stall trace, removed before landing).
+  static const bool trace = std::getenv("GUFO_DFLASH_TRACE") != nullptr;
+  const auto t_wait = std::chrono::steady_clock::now();
   if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
+  const auto t_run = std::chrono::steady_clock::now();
+  const bool had_graph = session.graphs_.contains(key);
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
+  }
+  if (trace && speculative) {
+    const auto t_end = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::fprintf(stderr,
+                 "dflash-trace n=%u graph=%d had_graph=%d wait_ple=%.3f "
+                 "run=%.3f\n",
+                 n, int{graph}, int{had_graph}, ms(t_wait, t_run),
+                 ms(t_run, t_end));
   }
   if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,

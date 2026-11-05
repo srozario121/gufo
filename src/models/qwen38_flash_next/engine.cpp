@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -23,6 +25,28 @@
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
+
+namespace {
+// TEMPORARY (item 2.8 sweep, removed before landing): DFlash-2 length knobs.
+struct DflashKnobs {
+  bool full{false};
+  float greedy_gate{0.0F};
+  float sampled_gate{0.0F};
+};
+const DflashKnobs& DflashExperiment() {
+  static const DflashKnobs knobs = [] {
+    DflashKnobs k;
+    const char* full = std::getenv("GUFO_DFLASH_FULL");
+    k.full = full != nullptr && full[0] == '1';
+    if (const char* g = std::getenv("GUFO_DFLASH_GREEDY_GATE"))
+      k.greedy_gate = std::strtof(g, nullptr);
+    if (const char* g = std::getenv("GUFO_DFLASH_SAMPLED_GATE"))
+      k.sampled_gate = std::strtof(g, nullptr);
+    return k;
+  }();
+  return knobs;
+}
+}  // namespace
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -1255,7 +1279,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     // MTP chains draft to the budget and end at the gate. A DFlash-2 block
     // has no gate, so it keeps the controller's priced length: verifying
     // every block position cost more rows than its acceptance returned.
-    if (!batch_drafts && drafts != 0 && !dflash_)
+    if (!batch_drafts && drafts != 0 && (!dflash_ || DflashExperiment().full))
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
@@ -1609,6 +1633,20 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
                           const sampling::SamplerState& sampler,
                           std::string* error_msg) {
   auto& exec = *model_->executor_;
+  // TEMPORARY (item 2.8 stall trace, removed before landing).
+  static const bool trace = std::getenv("GUFO_DFLASH_TRACE") != nullptr;
+  const auto t_start = std::chrono::steady_clock::now();
+  struct TraceEnd {
+    bool on;
+    std::chrono::steady_clock::time_point t;
+    ~TraceEnd() {
+      if (on)
+        std::fprintf(stderr, "dflash-trace draft_ms=%.3f\n",
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t)
+                         .count());
+    }
+  } trace_end{trace, t_start};
   const auto position = static_cast<std::uint32_t>(tokens_.size());
   const float* ring = session_->dflash_ring();
   const std::uint32_t window = exec.dflash_window();
@@ -1634,11 +1672,21 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
     from += count;
   }
   const auto drafts = static_cast<std::uint32_t>(pending.width - 1);
+  // The drafter was trained on full blocks and its attention is non-causal:
+  // a shorter block changes every earlier draft. Run the trained width
+  // (bounded by the context) and keep the first `drafts` proposals.
+  const auto block = static_cast<std::uint32_t>(
+      dflash_->GetModel().GetDFlashConfig().block_size);
+  const std::uint32_t room = model_->MaxContext() > position + 1
+                                 ? model_->MaxContext() - position - 1
+                                 : 0;
+  const std::uint32_t forward =
+      std::max(drafts, std::min(block > 0 ? block - 1 : 0, room));
   const bool sampled = pending.sampled;
   std::vector<float> uniforms;
   if (sampled) {
-    uniforms.reserve(drafts);
-    for (std::uint32_t i = 0; i < drafts; ++i)
+    uniforms.reserve(forward);
+    for (std::uint32_t i = 0; i < forward; ++i)
       uniforms.push_back(
           static_cast<float>(sampling::Uniform(&pending.draft_rng)));
   }
@@ -1648,7 +1696,7 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
   std::vector<tokenization::TokenId> tokens;
   try {
     tokens = dflash_->ForwardBlock(
-        static_cast<tokenization::TokenId>(anchor), position, drafts,
+        static_cast<tokenization::TokenId>(anchor), position, forward,
         sampled ? sampler.config().temperature : 0.0F, uniforms, &confidences,
         sampled ? &ids : nullptr, sampled ? &probabilities : nullptr, {},
         sampled && pending.draft_sampler ? &*pending.draft_sampler : nullptr);
@@ -1657,7 +1705,8 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
     return false;
   }
   const std::size_t k = dflash_->GetModel().GetDFlashConfig().selector_top_k;
-  for (std::size_t i = 0; i < tokens.size(); ++i) {
+  for (std::size_t i = 0; i < std::min<std::size_t>(tokens.size(), drafts);
+       ++i) {
     pending.chain.push_back(static_cast<std::int32_t>(tokens[i]));
     if (sampled) {
       MtpProposal proposal;
@@ -1675,9 +1724,18 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
     }
     if (stop_at_eos && model_->IsStopToken(pending.chain.back()))
       break;
+    // As an MTP chain, the block ends after its first proposal below the
+    // gate: the cut depends only on the drafter's own values.
+    const float gate = sampled ? DflashExperiment().sampled_gate
+                               : DflashExperiment().greedy_gate;
+    const float confidence = sampled ? pending.proposals.back().probability
+                             : i < confidences.size() ? confidences[i]
+                                                      : 1.0F;
+    if (confidence < gate)
+      break;
   }
   pending.width = pending.chain.size();
-  pending.gated = false;  // a DFlash-2 block has no per-draft confidence gate
+  pending.gated = false;  // the block applied its gate above
   return true;
 }
 
