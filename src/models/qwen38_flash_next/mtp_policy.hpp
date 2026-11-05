@@ -19,10 +19,12 @@ inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 inline constexpr float kMtpGateProbability = 0.85F;
 inline constexpr float kMtpSampledGateProbability = 0.95F;
 // A DFlash-2 block ends after its first proposal below these (engine.cpp
-// DflashDraft), chosen on development turns (MTP item 2.8): greedy reads the
+// DflashFinish), chosen on development turns (MTP item 2.8): greedy reads the
 // argmax's softmax share over the selector's top-k, sampled its drawn mass.
+// A gate-off calibration found no gain from per-depth thresholds on held-back
+// rounds; sampled 0.60 beat 0.85 by about 3.6% per request in an ABBA run.
 inline constexpr float kDflashGateProbability = 0.5F;
-inline constexpr float kDflashSampledGateProbability = 0.85F;
+inline constexpr float kDflashSampledGateProbability = 0.60F;
 /// In a jointly planned greedy batch a final proposal below this
 /// probability is not verified: its row costs a C8 cycle more than the
 /// expected accepted token returns.
