@@ -6131,6 +6131,43 @@ __global__ void HcApplyDeferredKernel(float* res, const float* block_out,
   }
 }
 
+__global__ void HcTapMeanToRingKernel(const float* res, const float* block_out,
+                                      const float* w, float* ring,
+                                      const std::uint32_t* position,
+                                      std::uint32_t window, std::uint32_t slot,
+                                      std::uint32_t slots,
+                                      std::uint32_t hidden) {
+  constexpr std::uint32_t kStreams = 4;
+  const std::uint32_t t = blockIdx.x;
+  const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
+  const float* row = res + static_cast<std::size_t>(t) * hc_dim;
+  const std::uint32_t pos = (position[0] + t) % window;
+  float* dst = ring + (static_cast<std::size_t>(pos) * slots + slot) * hidden;
+  for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
+    float sum = 0.0F;
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      float v = row[static_cast<std::size_t>(s) * hidden + i];
+      if (block_out != nullptr)
+        v = __fmaf_rn(block_out[static_cast<std::size_t>(t) * hidden + i],
+                      w[static_cast<std::size_t>(t) * kStreams + s], v);
+      sum += v;
+    }
+    dst[i] = sum * (1.0F / kStreams);
+  }
+}
+
+void HcTapMeanToRing(const float* res, const float* block_out, const float* w,
+                     float* ring, const std::uint32_t* position,
+                     std::uint32_t window, std::uint32_t slot,
+                     std::uint32_t slots, std::uint32_t n_tokens,
+                     std::uint32_t hidden, hipStream_t stream) {
+  if (n_tokens == 0 || window == 0)
+    return;
+  hipLaunchKernelGGL(HcTapMeanToRingKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, res, block_out, w, ring, position, window, slot,
+                     slots, hidden);
+}
+
 void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      hipStream_t stream) {

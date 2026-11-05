@@ -203,6 +203,10 @@ private:
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
+  /// DFlash-2 capture ring: [window][taps][hidden] float, the mean over the
+  /// hyper-connection streams of each tapped layer's settled output, at row
+  /// position % window. Null unless the executor taps (Options).
+  float* dflash_ring_{nullptr};
   Control* control_{nullptr};
   std::uint32_t blocks_{0};  ///< host shadow of Control::blocks
   /// Captured decode graphs by batch shape, and the shapes that ran eagerly
@@ -248,6 +252,10 @@ public:
     /// Largest session context. Zero selects the native context; values
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
+    /// DFlash-2 target taps (zero-based layer outputs) and the per-session
+    /// capture ring's rows. Empty: no tap and no ring (the default).
+    std::vector<std::uint32_t> dflash_tap_layers;
+    std::uint32_t dflash_window{0};
   };
 
   /// Target rows the trimmed head scored and how many fell back to the full

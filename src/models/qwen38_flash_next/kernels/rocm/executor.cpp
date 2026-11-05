@@ -1384,6 +1384,13 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->ple_history_ = Alloc<float>(a, hist, error_msg, &s->allocated_bytes_);
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
+  if (!options_.dflash_tap_layers.empty() && options_.dflash_window != 0) {
+    s->dflash_ring_ =
+        Alloc<float>(a,
+                     static_cast<std::size_t>(options_.dflash_window) *
+                         options_.dflash_tap_layers.size() * c.hidden_size,
+                     error_msg, &s->allocated_bytes_);
+  }
   if (s->mtp_enabled_) {
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
@@ -3717,6 +3724,24 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         return false;
     } else if (!finish(n)) {
       return false;
+    }
+    if (session.dflash_ring_ != nullptr) {
+      const auto& taps = options_.dflash_tap_layers;
+      for (std::uint32_t slot = 0; slot < taps.size(); ++slot) {
+        if (taps[slot] != il)
+          continue;
+        // After the layer's last combine the MoE update is settled; only a
+        // self-deferred residual update can remain. Fold it in on the copy
+        // the tap reads, exactly as the next combine will (the deferred and
+        // separate combines are byte-identical; moe_epilogue_ops_test), so
+        // the target's own arithmetic is untouched.
+        HcTapMeanToRing(s_.res, res_deferred_ ? s_.block_out : nullptr,
+                        res_deferred_ ? s_.hc_defer_w : nullptr,
+                        session.dflash_ring_, &session.control_->position,
+                        options_.dflash_window, slot,
+                        static_cast<std::uint32_t>(taps.size()), n - skipped,
+                        c.hidden_size, stream_);
+      }
     }
     normed = next_norm != nullptr;
   }
