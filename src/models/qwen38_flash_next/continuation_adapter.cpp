@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/hip/snapshot_copy.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
@@ -33,10 +34,11 @@ bool Pool(ContinuationPart part) {
   return part == ContinuationPart::kPooledKeys ||
          part == ContinuationPart::kDraftPooledKeys;
 }
+// Version 3 adds the DFlash-2 drafter's injected length (zero without one).
 struct Metadata {
-  std::uint32_t version{2};
+  std::uint32_t version{3};
   std::uint32_t target{}, draft{}, blocks{}, draft_blocks{}, hidden_base{};
-  std::uint32_t residual_valid{}, image_bytes{};
+  std::uint32_t residual_valid{}, image_bytes{}, dflash_injected{};
   NgramHistory ngram;
   MtpLengthState policy;
   speculative::PromptLookup<>::State lookup;
@@ -176,6 +178,13 @@ public:
   rocm::Session& CaptureState() const {
     return checkpoint ? *checkpoint->state : *session->session_;
   }
+  // The drafter's injected length at the captured target frontier. Prefill
+  // never injects, so an in-pass boundary keeps the live length. A drafter
+  // ahead of the frontier re-primes at its next block, as a reset one does.
+  std::uint32_t DflashInjected() const {
+    const auto injected = session->dflash_->GetInjectedContextLength();
+    return injected > CaptureState().position_ ? 0 : injected;
+  }
   struct CaptureDuringGuard {
     explicit CaptureDuringGuard(State& state)
         : state(state), previous(std::exchange(state.guarding, true)) {}
@@ -209,12 +218,25 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     : model_(std::move(model)),
       mode_(mode),
       context_(context),
-      // MTP state is part of the layout only when the MTP sidecar drafts; a
-      // DFlash-2 session holds none (its draft state is not captured yet).
+      // Draft state is part of the layout only when a drafter runs: the MTP
+      // sidecar's caches, or a DFlash-2 drafter's K/V and pending target rows.
       layout_(
           model_ ? model_->config() : Config{},
           mode == core::SessionMode::kSpeculative && model_ && model_->HasMtp(),
-          context, model_ ? model_->executor_->max_speculative() : 0),
+          context, model_ ? model_->executor_->max_speculative() : 0,
+          [&]() -> ContinuationDflash {
+            if (mode != core::SessionMode::kSpeculative || !model_ ||
+                !model_->HasDflash())
+              return {};
+            const auto& draft = *model_->dflash_model_;
+            return {
+                .layers = draft.GetDFlashConfig().num_layers,
+                .kv_width = std::size_t{draft.GetConfig().num_key_value_heads} *
+                            draft.GetConfig().head_dim,
+                .window = model_->executor_->dflash_window(),
+                .ring_width = std::size_t{model_->executor_->dflash_taps()} *
+                              model_->config().hidden_size};
+          }()),
       identity_(std::move(identity)) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
@@ -226,13 +248,16 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(2);  // Private components attest the target checkpoint boundary.
+  // 2: private components attest the target checkpoint boundary.
+  // 3: metadata carries the DFlash-2 injected length; drafter components.
+  put(3);
   put(Session::kSnapshotPayloadVersion);
   put(context);
   put(mode == core::SessionMode::kSpeculative);
   put(model_->executor_->max_speculative());
   put(model_->PrefillCapacity());
   put(model_->DecodeConcurrency());
+  put(layout_.DflashRows());
   for (const auto& component : layout_.Components())
     descriptors_.push_back(component.descriptor);
 }
@@ -304,6 +329,14 @@ std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
   auto session = model_->CreateSession(mode_, context_, &error);
   if (!session)
     throw std::runtime_error(error);
+  // Drafter loads write DflashRows() rows into each history it owns.
+  if (layout_.DflashRows() &&
+      (!session->dflash_ ||
+       session->dflash_->GetHistoryCapacity() != layout_.DflashRows() ||
+       session->dflash_->GetNumLayers() !=
+           model_->dflash_model_->GetDFlashConfig().num_layers ||
+       !session->session_->dflash_ring_))
+    throw std::logic_error("Flash-Next drafter state differs from its layout");
   return std::make_unique<State>(*this, guard, std::move(session));
 }
 std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(
@@ -424,6 +457,13 @@ void ContinuationAdapter::BeginRestore(
   state.GuardAll();
   Check(hipStreamSynchronize(model_->executor_->stream()));
   state.session->session_->PreserveSnapshots(0, 0);
+  // The loads overwrite the drafter's K/V. Until Validate adopts the saved
+  // length, the drafter holds no context, so a refused restore cannot
+  // leave it attending another history.
+  if (state.session->dflash_) {
+    Check(hipStreamSynchronize(state.session->dflash_->GetStream()));
+    state.session->dflash_->Reset();
+  }
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
@@ -505,6 +545,47 @@ ContinuationAdapter::Region ContinuationAdapter::PrivateRegion(
                                                  : session.KeptHiddenRows()} *
                         model_->config().HcDim() * sizeof(float));
       break;
+    case ContinuationPart::kDflashKey:
+    case ContinuationPart::kDflashValue: {
+      // Row p % rows holds position p. A load cannot know the injected
+      // length before the metadata arrives, so it writes every row; rows
+      // past that length are never attended.
+      auto& drafter = *session.dflash_;
+      const auto rows =
+          loading ? layout_.DflashRows()
+                  : std::min(state.DflashInjected(), layout_.DflashRows());
+      add(component.part == ContinuationPart::kDflashKey
+              ? drafter.InjectedKeys(component.layer)
+              : drafter.InjectedValues(component.layer),
+          std::size_t{rows} * drafter.GetKvWidth() * sizeof(float));
+      break;
+    }
+    case ContinuationPart::kDflashContext: {
+      // Logical row i holds target position T - rows + i: the window before
+      // the frontier. Capture stores only the rows the drafter has not
+      // injected; a load also writes the zeros below them, which the next
+      // block skips (it injects from the restored length).
+      std::uint32_t target = native.position_;
+      if (loading)
+        for (std::size_t i = 0; i < state.expected.size(); ++i)
+          if (layout_.Components()[i].part == ContinuationPart::kTokens)
+            target = static_cast<std::uint32_t>(state.expected[i].valid_rows);
+      const auto first = target - std::min(target, layout_.DflashRows());
+      const auto begin =
+          loading ? first : std::max(first, state.DflashInjected());
+      const auto ring_rows = model_->executor_->dflash_ring_rows();
+      const auto width = std::size_t{model_->executor_->dflash_taps()} *
+                         model_->config().hidden_size * sizeof(float);
+      const auto rows = target - begin;
+      const auto physical = begin % ring_rows;
+      const auto tail = std::min(rows, ring_rows - physical);
+      auto* pointer =
+          reinterpret_cast<std::byte*>(state.session->session_->dflash_ring_);
+      const auto offset = std::size_t{begin - first} * width;
+      add(pointer + physical * width, tail * width, false, offset);
+      add(pointer, (rows - tail) * width, false, offset + tail * width);
+      break;
+    }
     case ContinuationPart::kRawKeys:
     case ContinuationPart::kDraftRawKeys: {
       const auto positions = loading ? state.expected : Positions(state);
@@ -570,6 +651,8 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
         state.checkpoint ? native.position_ - state.checkpoint->hidden_rows
                          : session.hidden_base_;
     metadata.residual_valid = native.mtp_.residual_valid;
+    metadata.dflash_injected =
+        layout_.DflashRows() ? state.DflashInjected() : 0;
     metadata.ngram = native.ngram_;
     metadata.policy = session.draft_length_.State();
     metadata.lookup = session.lookup_.Save();
@@ -582,6 +665,11 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     }
     std::memcpy(host_metadata.data(), &metadata, sizeof(metadata));
   }
+  if (component.part == ContinuationPart::kDflashKey ||
+      component.part == ContinuationPart::kDflashValue)
+    // Injection runs on the drafter's own stream, which may still be
+    // writing the rows a transfer is about to read.
+    Check(hipStreamSynchronize(state.session->dflash_->GetStream()));
   auto region = PrivateRegion(state, component, false);
   if (component.part == ContinuationPart::kMetadata)
     region.pieces = {{host_metadata.data(), 0, host_metadata.size(), true}};
@@ -776,6 +864,8 @@ bool ContinuationAdapter::Validate(
     throw std::logic_error("Flash-Next validation requires an active restore");
   const auto refuse = [&] {
     state.failed = true;
+    if (state.session->dflash_)
+      state.session->dflash_->Reset();
     return false;
   };
   if (state.failed || state.pending ||
@@ -797,7 +887,9 @@ bool ContinuationAdapter::Validate(
   auto& session = *state.session;
   auto& native = *session.session_;
   auto policy = session.draft_length_;
-  if (metadata.version != 2 || metadata.hidden_base > metadata.target ||
+  if (metadata.version != 3 || metadata.hidden_base > metadata.target ||
+      metadata.dflash_injected > metadata.target ||
+      (!layout_.DflashRows() && metadata.dflash_injected) ||
       metadata.target - metadata.hidden_base >
           model_->executor_->max_speculative() ||
       metadata.residual_valid > 1 ||
@@ -840,6 +932,12 @@ bool ContinuationAdapter::Validate(
   session.draft_length_ = policy;
   session.lookup_.Restore(metadata.lookup);
   session.draft_token_ = 0;
+  // The drafter's K/V rows below its injected length and the target rows
+  // after it were loaded; its next block injects the same chunk as the
+  // saved session's would.
+  if (session.dflash_)
+    session.dflash_->AdoptInjectedContext(
+        layout_.DflashRows() ? metadata.dflash_injected : 0);
   session.stats_ = {};
   session.valid_ = true;
   state.restoring = false;

@@ -130,12 +130,13 @@ void HcApplyDeferred(float* res, const float* block_out, const float* w,
                      hipStream_t stream);
 /// DFlash-2 tap: for each of n_tokens rows, the mean over the 4
 /// hyper-connection streams of the settled residual, written to
-/// ring[(position[0] + t) % window][slot][0..hidden). When `block_out` and `w`
-/// are set, the residual still owes a deferred update and each stream is
-/// settled first with HcApplyDeferred's own fma (res itself is not written).
+/// ring[(position[0] + t) % rows][slot][0..hidden) for the batch's last `rows`
+/// rows. When `block_out` and `w` are set, the residual still owes a deferred
+/// update and each stream is settled first with HcApplyDeferred's own fma
+/// (res itself is not written).
 void HcTapMeanToRing(const float* res, const float* block_out, const float* w,
                      float* ring, const std::uint32_t* position,
-                     std::uint32_t window, std::uint32_t slot,
+                     std::uint32_t rows, std::uint32_t slot,
                      std::uint32_t slots, std::uint32_t n_tokens,
                      std::uint32_t hidden, hipStream_t stream);
 /// HcCombineF16 with the MoE epilogue fused in: the block output is

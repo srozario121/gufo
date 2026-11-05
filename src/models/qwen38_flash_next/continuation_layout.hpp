@@ -29,12 +29,24 @@ enum class ContinuationPart {
   kDraftRawKeys,
   kDraftResidual,
   kKeptHidden,
+  kDflashKey,
+  kDflashValue,
+  kDflashContext,
 };
 
 struct ContinuationComponent {
   cache::ComponentDescriptor descriptor;
   ContinuationPart part;
   std::uint32_t layer{0};
+};
+
+// A DFlash-2 drafter's state geometry (Model::HasDflash). Zero layers: no
+// drafter state in the layout.
+struct ContinuationDflash {
+  std::uint32_t layers{0};
+  std::size_t kv_width{0};    ///< floats per drafter K or V row
+  std::uint32_t window{0};    ///< rows the drafter attends
+  std::size_t ring_width{0};  ///< floats per target capture-ring row
 };
 
 // Host metadata has an explicit fixed-size representation. It includes the
@@ -50,7 +62,7 @@ struct ContinuationBackingClass {
 class ContinuationLayout {
 public:
   ContinuationLayout(const Config&, bool mtp, std::uint32_t context,
-                     std::uint32_t kept_rows);
+                     std::uint32_t kept_rows, ContinuationDflash dflash = {});
   [[nodiscard]] std::span<const ContinuationComponent> Components() const {
     return components_;
   }
@@ -71,9 +83,14 @@ public:
   [[nodiscard]] std::uint32_t RawCapacity() const noexcept {
     return raw_capacity_;
   }
+  // DFlash-2 history rows each drafter part stores: min(context, window).
+  // Zero without a drafter.
+  [[nodiscard]] std::uint32_t DflashRows() const noexcept {
+    return dflash_rows_;
+  }
 
 private:
-  std::uint32_t context_, ratio_, raw_capacity_;
+  std::uint32_t context_, ratio_, raw_capacity_, dflash_rows_{0};
   bool mtp_;
   std::vector<ContinuationComponent> components_;
 };

@@ -6134,16 +6134,16 @@ __global__ void HcApplyDeferredKernel(float* res, const float* block_out,
 __global__ void HcTapMeanToRingKernel(const float* res, const float* block_out,
                                       const float* w, float* ring,
                                       const std::uint32_t* position,
-                                      std::uint32_t window, std::uint32_t slot,
+                                      std::uint32_t rows, std::uint32_t slot,
                                       std::uint32_t slots, std::uint32_t hidden,
                                       std::uint32_t first_row) {
   constexpr std::uint32_t kStreams = 4;
-  // Only the batch's last `window` rows (first_row onward): earlier rows would
-  // share ring slots with later ones, and the draft never attends past them.
+  // Only the batch's last `rows` rows (first_row onward): earlier rows would
+  // share ring slots with later ones, and nothing reads them again.
   const std::uint32_t t = first_row + blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
   const float* row = res + static_cast<std::size_t>(t) * hc_dim;
-  const std::uint32_t pos = (position[0] + t) % window;
+  const std::uint32_t pos = (position[0] + t) % rows;
   float* dst = ring + (static_cast<std::size_t>(pos) * slots + slot) * hidden;
   for (std::uint32_t i = threadIdx.x; i < hidden; i += kThreads) {
     float sum = 0.0F;
@@ -6160,15 +6160,15 @@ __global__ void HcTapMeanToRingKernel(const float* res, const float* block_out,
 
 void HcTapMeanToRing(const float* res, const float* block_out, const float* w,
                      float* ring, const std::uint32_t* position,
-                     std::uint32_t window, std::uint32_t slot,
+                     std::uint32_t rows, std::uint32_t slot,
                      std::uint32_t slots, std::uint32_t n_tokens,
                      std::uint32_t hidden, hipStream_t stream) {
-  if (n_tokens == 0 || window == 0)
+  if (n_tokens == 0 || rows == 0)
     return;
-  const std::uint32_t first_row = n_tokens > window ? n_tokens - window : 0U;
+  const std::uint32_t first_row = n_tokens > rows ? n_tokens - rows : 0U;
   hipLaunchKernelGGL(HcTapMeanToRingKernel, dim3(n_tokens - first_row),
                      dim3(kThreads), 0, stream, res, block_out, w, ring,
-                     position, window, slot, slots, hidden, first_row);
+                     position, rows, slot, slots, hidden, first_row);
 }
 
 void HcApplyDeferred(float* res, const float* block_out, const float* w,

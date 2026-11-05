@@ -21,13 +21,16 @@ bool IsPool(ContinuationPart part) {
 
 ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                                        std::uint32_t context,
-                                       std::uint32_t kept_rows)
+                                       std::uint32_t kept_rows,
+                                       ContinuationDflash dflash)
     : context_(context), ratio_(c.compress_ratio), mtp_(mtp) {
   if (!context || context > c.MaxContextLength() || !ratio_ ||
       !c.full_attention_interval || !c.num_layers || !c.AttentionKvDim() ||
       !c.indexer_head_dim || !c.indexer_top_k || !c.ssm_conv_kernel ||
       !c.ssm_head_dim || !c.ssm_num_v_heads || !c.HcDim() || !c.vocab_size ||
-      (mtp && !kept_rows))
+      (mtp && !kept_rows) ||
+      (dflash.layers &&
+       (mtp || !dflash.kv_width || !dflash.window || !dflash.ring_width)))
     throw std::invalid_argument("invalid Flash-Next continuation geometry");
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
   const auto add = [&](ContinuationPart part, std::size_t row,
@@ -82,6 +85,21 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
         std::size_t{c.HcDim()} * sizeof(float));
     add(ContinuationPart::kKeptHidden, 0,
         std::size_t{kept_rows} * c.HcDim() * sizeof(float));
+  }
+  if (dflash.layers) {
+    // The drafter attends the last `window` positions, from its own K/V up
+    // to its injected length and then from target rows it has not injected
+    // yet. Both are FP32 rings indexed by position; the session context
+    // bounds them below the window.
+    dflash_rows_ = std::min(context, dflash.window);
+    for (std::uint32_t layer = 0; layer < dflash.layers; ++layer) {
+      add(ContinuationPart::kDflashKey, 0,
+          std::size_t{dflash_rows_} * dflash.kv_width * sizeof(float), layer);
+      add(ContinuationPart::kDflashValue, 0,
+          std::size_t{dflash_rows_} * dflash.kv_width * sizeof(float), layer);
+    }
+    add(ContinuationPart::kDflashContext, 0,
+        std::size_t{dflash_rows_} * dflash.ring_width * sizeof(float));
   }
 }
 

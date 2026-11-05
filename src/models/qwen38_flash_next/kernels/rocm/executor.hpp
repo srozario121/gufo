@@ -209,9 +209,10 @@ private:
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
-  /// DFlash-2 capture ring: [window][taps][hidden] float, the mean over the
+  /// DFlash-2 capture ring: [rows][taps][hidden] float, the mean over the
   /// hyper-connection streams of each tapped layer's settled output, at row
-  /// position % window. Null unless the executor taps (Options).
+  /// position % rows (Executor::dflash_ring_rows()). Null unless the
+  /// executor taps (Options).
   float* dflash_ring_{nullptr};
   Control* control_{nullptr};
   std::uint32_t blocks_{0};  ///< host shadow of Control::blocks
@@ -258,8 +259,8 @@ public:
     /// Largest session context. Zero selects the native context; values
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
-    /// DFlash-2 target taps (zero-based layer outputs) and the per-session
-    /// capture ring's rows. Empty: no tap and no ring (the default).
+    /// DFlash-2 target taps (zero-based layer outputs) and the drafter's
+    /// attention window. Empty: no tap and no ring (the default).
     std::vector<std::uint32_t> dflash_tap_layers;
     std::uint32_t dflash_window{0};
   };
@@ -489,6 +490,9 @@ public:
   [[nodiscard]] std::uint32_t dflash_window() const noexcept {
     return options_.dflash_window;
   }
+  /// Physical rows of the DFlash-2 capture ring (row position % rows), or
+  /// zero without one. See Session::dflash_ring_.
+  [[nodiscard]] std::uint32_t dflash_ring_rows() const noexcept;
   [[nodiscard]] std::uint32_t dflash_taps() const noexcept {
     return static_cast<std::uint32_t>(options_.dflash_tap_layers.size());
   }

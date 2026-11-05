@@ -719,8 +719,9 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                                   const rocm::SnapshotState* deferred,
                                   std::string* error_msg) {
   if (dflash_) {
-    // The capture ring and the draft's window are not in the payload yet
-    // (item 2.1 T6, continuation): a restored DFlash-2 session prefills.
+    // The capture ring and the draft's window are not in this payload; the
+    // component cache (ContinuationAdapter) restores them. A restored
+    // DFlash-2 session here prefills.
     AssignError(error_msg, "DFlash-2 sessions do not restore snapshots yet");
     return false;
   }
@@ -1616,6 +1617,7 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
   const auto position = static_cast<std::uint32_t>(tokens_.size());
   const float* ring = session_->dflash_ring();
   const std::uint32_t window = exec.dflash_window();
+  const std::uint32_t ring_rows = exec.dflash_ring_rows();
   if (ring == nullptr || window == 0) {
     AssignError(error_msg, "DFlash-2 session has no capture ring");
     return false;
@@ -1628,8 +1630,8 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
   std::uint32_t from = std::max(dflash_->GetInjectedContextLength(),
                                 position > window ? position - window : 0U);
   while (from < position) {
-    const std::uint32_t slot = from % window;
-    const std::uint32_t count = std::min(position - from, window - slot);
+    const std::uint32_t slot = from % ring_rows;
+    const std::uint32_t count = std::min(position - from, ring_rows - slot);
     if (!dflash_->InjectTargetContextDevice(ring + slot * row, from, count,
                                             exec.stream())) {
       AssignError(error_msg, "DFlash-2 context injection failed");

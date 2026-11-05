@@ -254,6 +254,28 @@ public:
   [[nodiscard]] const QwenDFlashGpuModel& GetModel() const noexcept {
     return *model_;
   }
+  /// Device K or V history of drafter layer `layer` (GetNumLayers()):
+  /// GetHistoryCapacity() rows of GetKvWidth() floats, position p at row
+  /// p % GetHistoryCapacity(). A continuation cache copies it directly
+  /// (Flash-Next), then AdoptInjectedContext.
+  [[nodiscard]] float* InjectedKeys(std::size_t layer) const noexcept {
+    return d_injected_k_[layer];
+  }
+  [[nodiscard]] float* InjectedValues(std::size_t layer) const noexcept {
+    return d_injected_v_[layer];
+  }
+  [[nodiscard]] std::uint32_t GetNumLayers() const noexcept {
+    return static_cast<std::uint32_t>(d_injected_k_.size());
+  }
+  [[nodiscard]] std::size_t GetKvWidth() const noexcept {
+    return static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
+           model_->GetConfig().head_dim;
+  }
+  /// The stream every drafter write is ordered on.
+  [[nodiscard]] hipStream_t GetStream() const noexcept { return stream_; }
+  /// Takes positions [0, length) as injected once their window's K/V rows
+  /// were written to InjectedKeys/InjectedValues by the caller.
+  void AdoptInjectedContext(std::uint32_t length);
 
 private:
   [[nodiscard]] kernels::DFlashSampling PrepareDraftSampling(

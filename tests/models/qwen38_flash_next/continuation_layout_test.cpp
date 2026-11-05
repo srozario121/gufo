@@ -199,6 +199,32 @@ int main() {
     const auto c = ProductionGeometry();
     Reject([&] { qfn::ContinuationLayout layout(c, false, 0, 8); });
     Reject([&] { qfn::ContinuationLayout layout(c, true, 100000, 0); });
+    // A DFlash-2 drafter adds K and V per drafter layer and the pending
+    // target rows, each min(context, window) FP32 rows; MTP excludes it.
+    const qfn::ContinuationDflash dflash{
+        .layers = 3, .kv_width = 1024, .window = 2048, .ring_width = 12800};
+    for (const auto context : {100000U, 1000U}) {
+      const qfn::ContinuationLayout drafted(c, false, context, 8, dflash);
+      const qfn::ContinuationLayout plain(c, false, context, 8);
+      const std::size_t rows = std::min(context, 2048U);
+      Require(drafted.Components().size() == plain.Components().size() + 7 &&
+                  drafted.DflashRows() == rows && !plain.DflashRows() &&
+                  drafted.PrivateBytes() ==
+                      plain.PrivateBytes() +
+                          rows * (6 * 1024 + 12800) * sizeof(float),
+              "DFlash-2 drafter state differs from its geometry");
+      Require(std::equal(plain.Components().begin(), plain.Components().end(),
+                         drafted.Components().begin(),
+                         [](const auto& a, const auto& b) {
+                           return a.part == b.part && a.layer == b.layer &&
+                                  a.descriptor.state_bytes ==
+                                      b.descriptor.state_bytes &&
+                                  a.descriptor.row_bytes ==
+                                      b.descriptor.row_bytes;
+                         }),
+              "DFlash-2 drafter state moved the target components");
+    }
+    Reject([&] { qfn::ContinuationLayout layout(c, true, 100000, 8, dflash); });
     auto bad = c;
     bad.compress_ratio = 0;
     Reject([&] { qfn::ContinuationLayout layout(bad, false, 100000, 8); });

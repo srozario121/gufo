@@ -805,6 +805,13 @@ void QwenDFlashGpuExecutor::RestorePersistentSnapshot(
   injected_context_len_ = valid_context;
 }
 
+void QwenDFlashGpuExecutor::AdoptInjectedContext(std::uint32_t length) {
+  CheckContinuation();
+  if (length > max_context_)
+    throw std::invalid_argument("DFlash injected context exceeds the session");
+  injected_context_len_ = length;
+}
+
 void QwenDFlashGpuExecutor::Reset() noexcept {
   try {
     CheckContinuation();
