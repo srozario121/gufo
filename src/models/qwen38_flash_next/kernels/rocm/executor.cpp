@@ -946,8 +946,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   // The first greedy verification otherwise resolves the shared argmax
   // module on the decode path. Preparation launches no trial kernels.
-  if (e->has_mtp() && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
-                             "MTP argmax preparation", error_msg))
+  // A DFlash-2 drafter (Options::dflash_tap_layers) verifies through the
+  // same greedy and sampled paths as MTP.
+  const bool verifies_drafts =
+      e->has_mtp() || !e->options_.dflash_tap_layers.empty();
+  if (verifies_drafts && !Check(gufo::hip::PrepareBatchedGPUArgmax(),
+                                "MTP argmax preparation", error_msg))
     return nullptr;
   if (!Check(hipStreamCreate(&e->stream_), "hipStreamCreate", error_msg)) {
     return nullptr;
@@ -1265,7 +1269,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
-  if (model.has_mtp()) {
+  if (model.has_mtp() || !e->options_.dflash_tap_layers.empty()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
     // projections consume h/embd before the first mixer rewrites xn/mixed.
@@ -1331,7 +1335,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                                                  std::string* error_msg) const {
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
-  s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
+  // A speculative session drafts with MTP only when the sidecar is loaded;
+  // a DFlash-2 drafter keeps its state outside this session (engine.cpp).
+  s->mtp_enabled_ =
+      mode == core::SessionMode::kSpeculative && model_->has_mtp();
   if (s->mtp_enabled_ && !has_mtp()) {
     AssignError(error_msg, "MTP session requires a loaded predictor");
     return nullptr;

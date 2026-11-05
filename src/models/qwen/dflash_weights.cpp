@@ -160,6 +160,12 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
           values[0] <= std::numeric_limits<std::uint32_t>::max() / 2U) {
         rotary_dim = static_cast<std::uint32_t>(values[0] * 2U);
       }
+    } else if (head_dim.has_value() &&
+               !reader.GetMetadataString(prefix + "rope.scaling.type")) {
+      // incoai's Qwen3.8-Flash-Next DFlash-2 GGUF writes neither key; its
+      // config.json is rope_type "default" with no partial rotary factor,
+      // which rotates the whole head (item 2.1 T6).
+      rotary_dim = head_dim;
     }
   }
   const auto context_length =

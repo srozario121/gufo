@@ -872,9 +872,11 @@ bool QwenDFlashGpuExecutor::InjectTargetContextDevice(const float* features,
                 GetTargetFeaturesSize();
     num_tokens = end - injected_context_len_;
     position = injected_context_len_;
+  } else if (position > injected_context_len_) {
+    // The caller skips rows older than the window it will end with (a
+    // target's ring keeps only that window): they need no K/V.
+    injected_context_len_ = position;
   }
-  if (position != injected_context_len_)
-    return false;
   hipEvent_t ready = nullptr;
   struct DestroyEvent {
     hipEvent_t* event;

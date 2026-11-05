@@ -209,14 +209,18 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
     : model_(std::move(model)),
       mode_(mode),
       context_(context),
-      layout_(model_ ? model_->config() : Config{},
-              mode == core::SessionMode::kSpeculative, context,
-              model_ ? model_->executor_->max_speculative() : 0),
+      // MTP state is part of the layout only when the MTP sidecar drafts; a
+      // DFlash-2 session holds none (its draft state is not captured yet).
+      layout_(
+          model_ ? model_->config() : Config{},
+          mode == core::SessionMode::kSpeculative && model_ && model_->HasMtp(),
+          context, model_ ? model_->executor_->max_speculative() : 0),
       identity_(std::move(identity)) {
   if ((mode != core::SessionMode::kAutoregressive &&
        mode != core::SessionMode::kSpeculative) ||
       identity_.empty() || context > model_->MaxContext() ||
-      (mode == core::SessionMode::kSpeculative && !model_->HasMtp()))
+      (mode == core::SessionMode::kSpeculative && !model_->HasMtp() &&
+       !model_->HasDflash()))
     throw std::invalid_argument("invalid Flash-Next adapter configuration");
   const auto put = [&](std::uint32_t value) {
     for (unsigned i = 0; i < 4; ++i)
@@ -340,8 +344,11 @@ ContinuationAdapter::PrefillCheckpointPositions(const cache::Slot& slot,
     throw std::invalid_argument("unsupported Flash-Next in-pass boundary");
   const auto& native = *state.session->session_;
   const auto& config = model_->config();
+  // Only an MTP sidecar has a draft frontier (a DFlash-2 session has none).
   const auto draft =
-      mode_ == core::SessionMode::kSpeculative ? boundary - 1 : 0;
+      mode_ == core::SessionMode::kSpeculative && model_->HasMtp()
+          ? boundary - 1
+          : 0;
   return layout_.Positions(
       boundary, draft,
       boundary > config.indexer_top_k ? boundary / config.compress_ratio

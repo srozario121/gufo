@@ -3646,10 +3646,13 @@ bool InferenceBackend::load(
     return false;
   }
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-      (speculative_config.backend != TextSpeculativeBackend::kMtp ||
-       !model->HasMtp())) {
+      !(speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        model->HasMtp()) &&
+      !(speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+        model->HasDflash())) {
     SetError(error,
-             "Flash-Next MTP requires a model loaded with its draft sidecar");
+             "Flash-Next speculative decoding requires a model loaded with "
+             "its MTP sidecar or DFlash-2 drafter");
     return false;
   }
   if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
@@ -3680,7 +3683,8 @@ bool InferenceBackend::load(
     new_state->supports_images = model->VisionEncoder() != nullptr;
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
-        speculative_config.backend == TextSpeculativeBackend::kMtp,
+        speculative_config.backend == TextSpeculativeBackend::kMtp ||
+            speculative_config.backend == TextSpeculativeBackend::kDFlash,
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
