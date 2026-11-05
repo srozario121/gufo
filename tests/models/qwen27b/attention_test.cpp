@@ -260,10 +260,10 @@ void TestSelector(std::uint32_t vocab) {
       }
       gufo::test::Expect(d_selected.CopyToHost()[0] == sorted[selected],
                          "DFlash selector chose the wrong candidate");
+      // Sampled: the drawn candidate's probability. Greedy: the argmax's
+      // softmax share at temperature 1 (divisor 1), which the gate reads.
       const double confidence =
-          temperature > 0
-              ? std::exp((scores[selected] - maximum) / divisor) / denominator
-              : 1.0;
+          std::exp((scores[selected] - maximum) / divisor) / denominator;
       if (temperature == 0) {
         for (std::size_t c = 0; c < top_k; ++c)
           gufo::test::Expect(probabilities[c] == (c == selected ? 1.0F : 0.0F),

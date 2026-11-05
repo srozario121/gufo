@@ -4,8 +4,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -25,31 +23,6 @@
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
-
-namespace {
-// TEMPORARY (item 2.8 sweep, removed before landing): DFlash-2 length knobs.
-struct DflashKnobs {
-  bool full{false};
-  bool lookup{true};
-  float greedy_gate{0.0F};
-  float sampled_gate{0.0F};
-};
-const DflashKnobs& DflashExperiment() {
-  static const DflashKnobs knobs = [] {
-    DflashKnobs k;
-    const char* full = std::getenv("GUFO_DFLASH_FULL");
-    k.full = full != nullptr && full[0] == '1';
-    const char* lookup = std::getenv("GUFO_DFLASH_LOOKUP");
-    k.lookup = lookup == nullptr || lookup[0] != '0';
-    if (const char* g = std::getenv("GUFO_DFLASH_GREEDY_GATE"))
-      k.greedy_gate = std::strtof(g, nullptr);
-    if (const char* g = std::getenv("GUFO_DFLASH_SAMPLED_GATE"))
-      k.sampled_gate = std::strtof(g, nullptr);
-    return k;
-  }();
-  return knobs;
-}
-}  // namespace
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -1279,10 +1252,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                 static_cast<std::uint32_t>(cap - 1),
                                 static_cast<std::uint32_t>(tokens_.size()),
                                 pending->policy_concurrency);
-    // MTP chains draft to the budget and end at the gate. A DFlash-2 block
-    // has no gate, so it keeps the controller's priced length: verifying
-    // every block position cost more rows than its acceptance returned.
-    if (!batch_drafts && drafts != 0 && (!dflash_ || DflashExperiment().full))
+    if (!batch_drafts && drafts != 0)
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
@@ -1349,9 +1319,6 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
-  const bool dflash_lookup = dflash_ && DflashExperiment().lookup;
-  if (dflash_ && !dflash_lookup)
-    return DflashDraft(*pending, anchor, stop_at_eos, sampler, error_msg);
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
   // A request's first speculative step copies nothing (see
@@ -1646,20 +1613,6 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
                           const sampling::SamplerState& sampler,
                           std::string* error_msg) {
   auto& exec = *model_->executor_;
-  // TEMPORARY (item 2.8 stall trace, removed before landing).
-  static const bool trace = std::getenv("GUFO_DFLASH_TRACE") != nullptr;
-  const auto t_start = std::chrono::steady_clock::now();
-  struct TraceEnd {
-    bool on;
-    std::chrono::steady_clock::time_point t;
-    ~TraceEnd() {
-      if (on)
-        std::fprintf(stderr, "dflash-trace draft_ms=%.3f\n",
-                     std::chrono::duration<double, std::milli>(
-                         std::chrono::steady_clock::now() - t)
-                         .count());
-    }
-  } trace_end{trace, t_start};
   const auto position = static_cast<std::uint32_t>(tokens_.size());
   const float* ring = session_->dflash_ring();
   const std::uint32_t window = exec.dflash_window();
@@ -1739,8 +1692,8 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
       break;
     // As an MTP chain, the block ends after its first proposal below the
     // gate: the cut depends only on the drafter's own values.
-    const float gate = sampled ? DflashExperiment().sampled_gate
-                               : DflashExperiment().greedy_gate;
+    const float gate =
+        sampled ? kDflashSampledGateProbability : kDflashGateProbability;
     const float confidence = sampled ? pending.proposals.back().probability
                              : i < confidences.size() ? confidences[i]
                                                       : 1.0F;
