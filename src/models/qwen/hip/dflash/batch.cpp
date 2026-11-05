@@ -490,9 +490,11 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
   ProjectBlock(weights.selector_hidden, scratch.hidden, scratch.selector,
                proposal_rows, draft.selector_rank, hidden_size, stream);
   emit("selector_hidden", scratch.selector, draft.selector_rank, true);
+  const std::uint32_t head_rows =
+      requests[0].executor->GetModel().GetHeadRows();
   ProjectBlock(weights.output, scratch.hidden, scratch.logits, proposal_rows,
-               config.vocab_size, hidden_size, stream);
-  emit("logits", scratch.logits, config.vocab_size, true);
+               head_rows, hidden_size, stream);
+  emit("logits", scratch.logits, head_rows, true);
   std::array<kernels::DFlashSelectorSequence, 8> sequences{};
   for (std::size_t index = 0; index < requests.size(); ++index)
     sequences[index] = {counts[index], requests[index].temperature,
@@ -503,7 +505,7 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
       weights.selector_successor.data, scratch.tokens, scratch.confidences,
       scratch.partial_scores, scratch.partial_ids, scratch.uniforms,
       scratch.candidates, scratch.probabilities,
-      std::span(sequences).first(requests.size()), config.vocab_size,
+      std::span(sequences).first(requests.size()), head_rows,
       draft.selector_rank, draft.selector_top_k, stream);
   for (std::size_t index = 0; index < requests.size(); ++index) {
     const auto& request = requests[index];

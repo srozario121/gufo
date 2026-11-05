@@ -392,10 +392,13 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
           QuantizeDraftHead(weights.output, allocations, packed_bytes);
     }
 
-    return std::shared_ptr<const QwenDFlashGpuModel>(new QwenDFlashGpuModel(
+    auto created = std::shared_ptr<QwenDFlashGpuModel>(new QwenDFlashGpuModel(
         std::move(dflash_reader), std::move(target.keep_alive),
         target.tokenizer, std::move(weights), std::move(allocations),
         packed_bytes));
+    created->head_rows_ =
+        target.head_rows != 0 ? target.head_rows : target.vocab_size;
+    return created;
   } catch (const std::exception& ex) {
     for (void* ptr : allocations) {
       if (ptr != nullptr)

@@ -98,6 +98,10 @@ struct QwenDFlashTargetBinding {
   std::uint32_t hidden_size{0};
   std::uint32_t vocab_size{0};
   std::uint32_t num_layers{0};
+  /// Rows of `output` the draft head scores: the vocabulary, or a compact
+  /// subset (Flash-Next's trimmed head, whose row r is token row_ids[r]; see
+  /// QwenDFlashGpuExecutor::SetExactSelector). Zero means vocab_size.
+  std::uint32_t head_rows{0};
   models::QwenTensorRef token_embedding;
   models::QwenTensorRef output;
   const tokenization::QwenTokenizer* tokenizer{nullptr};
@@ -141,6 +145,10 @@ public:
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
   }
+  /// Rows the draft head scores (QwenDFlashTargetBinding::head_rows).
+  [[nodiscard]] std::uint32_t GetHeadRows() const noexcept {
+    return head_rows_;
+  }
 
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
@@ -153,6 +161,7 @@ private:
   std::shared_ptr<const core::GgufReader> dflash_reader_;
   std::shared_ptr<const void> target_keep_alive_;
   const tokenization::QwenTokenizer* tokenizer_{nullptr};
+  std::uint32_t head_rows_{0};
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};

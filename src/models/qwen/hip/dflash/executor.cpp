@@ -301,13 +301,13 @@ void QwenDFlashGpuExecutor::Allocate() {
   allocate_scratch(d_q_, block_size * q_dim);
   allocate_scratch(d_attn_out_, block_size * q_dim);
   const auto selector_scratch_elements =
-      kernels::DFlashSelectorScratchElements(cfg.vocab_size);
+      kernels::DFlashSelectorScratchElements(model_->GetHeadRows());
   const auto ffn_scratch_width =
       std::max(intermediate_size, selector_scratch_elements);
   allocate_scratch(d_ffn_gate_, block_size * ffn_scratch_width);
   allocate_scratch(d_ffn_up_, block_size * ffn_scratch_width);
   allocate_scratch(d_ffn_down_, block_size * hidden_size);
-  allocate_scratch(d_logits_, block_size * cfg.vocab_size);
+  allocate_scratch(d_logits_, block_size * model_->GetHeadRows());
   allocate_scratch(d_selector_hidden_, block_size * df_cfg.selector_rank);
   allocate_scratch(d_selector_candidate_ids_,
                    block_size * df_cfg.selector_top_k);
@@ -386,7 +386,7 @@ void QwenDFlashGpuExecutor::PrewarmBlockGemms() {
     prewarm(weights.selector_hidden, d_block_normed_, d_selector_hidden_,
             draft_count, df_cfg.selector_rank, hidden_size);
     prewarm(weights.output, d_block_normed_, d_logits_, draft_count,
-            cfg.vocab_size, hidden_size);
+            model_->GetHeadRows(), hidden_size);
   }
 
   HIP_CHECK(hipStreamSynchronize(stream_));
@@ -1210,9 +1210,10 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   TraceTensor(trace, "selector_hidden", d_selector_hidden_,
               draft_count * df_cfg.selector_rank, stream_);
 
+  const std::size_t head_rows = model_->GetHeadRows();
   RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
-               draft_count, vocab_size, hidden_size);
-  TraceTensor(trace, "logits", d_logits_, draft_count * vocab_size, stream_);
+               draft_count, head_rows, hidden_size);
+  TraceTensor(trace, "logits", d_logits_, draft_count * head_rows, stream_);
 
   if (temperature > 0.0F) {
     const auto uniform_copy = hipMemcpyAsync(
@@ -1243,7 +1244,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       out_candidate_probabilities != nullptr
           ? d_selector_candidate_probabilities_
           : nullptr,
-      sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
+      sequences, head_rows, df_cfg.selector_rank, df_cfg.selector_top_k,
       stream_);
 
   const auto token_copy =
