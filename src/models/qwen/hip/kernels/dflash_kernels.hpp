@@ -81,6 +81,13 @@ struct DFlashSampling {
   std::uint32_t penalty_count{0};
   const sampling::TokenId* history{nullptr};
   std::uint32_t history_count{0};
+  /// Draw a sampled slot from 2^24 integer masses (floor of each weight's
+  /// share, the remainder on candidate 0, as SampleMtpProposal does) and export
+  /// each candidate's probability as mass * 2^-24, exact in float. The exported
+  /// q is then the distribution actually sampled, bit for bit, which
+  /// Flash-Next's exact verifier requires. Off: the float draw the Qwen 27B
+  /// path uses.
+  std::uint32_t integer_masses{0};
 };
 
 struct DFlashSelectorSequence {

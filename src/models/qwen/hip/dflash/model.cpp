@@ -292,11 +292,13 @@ void PackDFlashWeights(speculative::QwenDFlashWeights& weights,
 
 QwenDFlashGpuModel::QwenDFlashGpuModel(
     std::shared_ptr<const core::GgufReader> dflash_reader,
-    std::shared_ptr<const QwenGpuModel> target_model,
+    std::shared_ptr<const void> target_keep_alive,
+    const tokenization::QwenTokenizer* tokenizer,
     speculative::QwenDFlashWeights weights, std::vector<void*> allocations,
     std::size_t packed_weight_bytes)
     : dflash_reader_(std::move(dflash_reader)),
-      target_model_(std::move(target_model)),
+      target_keep_alive_(std::move(target_keep_alive)),
+      tokenizer_(tokenizer),
       weights_(std::move(weights)),
       allocations_(std::move(allocations)),
       packed_weight_bytes_(packed_weight_bytes) {}
@@ -318,6 +320,30 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     }
     return nullptr;
   }
+  const auto& config = target_model->GetConfig();
+  QwenDFlashTargetBinding target;
+  target.hidden_size = config.hidden_size;
+  target.vocab_size = config.vocab_size;
+  target.num_layers = config.num_layers;
+  target.token_embedding = target_model->GetWeights().token_embd;
+  target.output = target_model->GetWeights().output;
+  target.tokenizer = &target_model->GetTokenizer();
+  target.keep_alive = target_model;
+  return Create(std::move(dflash_reader), std::move(target), error_msg);
+}
+
+std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
+    std::shared_ptr<const core::GgufReader> dflash_reader,
+    QwenDFlashTargetBinding target, std::string* error_msg) {
+  if (dflash_reader == nullptr || target.tokenizer == nullptr ||
+      target.token_embedding.empty() || target.output.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "DFlash reader, target tokenizer, embedding and output head are "
+          "required";
+    }
+    return nullptr;
+  }
 
   auto raw_weights =
       speculative::QwenDFlashWeights::LoadFromGguf(*dflash_reader, error_msg);
@@ -325,10 +351,9 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     return nullptr;
   }
 
-  const auto& target_config = target_model->GetConfig();
   const auto& draft_config = raw_weights->config;
-  if (target_config.hidden_size != draft_config.hidden_size ||
-      target_config.vocab_size != draft_config.vocab_size) {
+  if (target.hidden_size != draft_config.hidden_size ||
+      target.vocab_size != draft_config.vocab_size) {
     if (error_msg != nullptr) {
       *error_msg =
           "DFlash-2 target hidden/vocabulary dimensions do not match the "
@@ -337,8 +362,7 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     return nullptr;
   }
   if (raw_weights->dflash_config.target_layer_ids.empty() ||
-      raw_weights->dflash_config.target_layer_ids.back() >=
-          target_config.num_layers) {
+      raw_weights->dflash_config.target_layer_ids.back() >= target.num_layers) {
     if (error_msg != nullptr) {
       *error_msg =
           "DFlash-2 target layer taps exceed the target model layer count";
@@ -358,8 +382,8 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
 
     // Unconditionally bind GPU device pointers from the target model for tied
     // weights
-    weights.token_embedding = target_model->GetWeights().token_embd;
-    weights.output = target_model->GetWeights().output;
+    weights.token_embedding = target.token_embedding;
+    weights.output = target.output;
     if (weights.output.type == core::GgmlType::kBF16 &&
         weights.output.num_elements %
                 quant::QuantizedBlockElements(core::GgmlType::kQ8_0) ==
@@ -369,8 +393,9 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
     }
 
     return std::shared_ptr<const QwenDFlashGpuModel>(new QwenDFlashGpuModel(
-        std::move(dflash_reader), std::move(target_model), std::move(weights),
-        std::move(allocations), packed_bytes));
+        std::move(dflash_reader), std::move(target.keep_alive),
+        target.tokenizer, std::move(weights), std::move(allocations),
+        packed_bytes));
   } catch (const std::exception& ex) {
     for (void* ptr : allocations) {
       if (ptr != nullptr)

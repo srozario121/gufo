@@ -89,6 +89,21 @@ private:
 };
 
 /// Immutable GPU-visible DFlash / DFlash-2 model weights and topology.
+/// What a DFlash-2 draft needs from its target model: its dimensions, the tied
+/// embedding and output head, and its tokenizer. The draft binds these instead
+/// of a concrete target class, so a target other than the Qwen 27B GPU model
+/// (Qwen3.8 Flash-Next) can drive it. `keep_alive` owns whatever backs the
+/// tensors and tokenizer for the draft's lifetime.
+struct QwenDFlashTargetBinding {
+  std::uint32_t hidden_size{0};
+  std::uint32_t vocab_size{0};
+  std::uint32_t num_layers{0};
+  models::QwenTensorRef token_embedding;
+  models::QwenTensorRef output;
+  const tokenization::QwenTokenizer* tokenizer{nullptr};
+  std::shared_ptr<const void> keep_alive;
+};
+
 class QwenDFlashGpuModel final {
 public:
   ~QwenDFlashGpuModel();
@@ -102,6 +117,11 @@ public:
       std::shared_ptr<const core::GgufReader> dflash_reader,
       std::shared_ptr<const QwenGpuModel> target_model,
       std::string* error_msg = nullptr);
+  /// Binds the draft to any target through `target` (see
+  /// QwenDFlashTargetBinding). The QwenGpuModel overload forwards here.
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel> Create(
+      std::shared_ptr<const core::GgufReader> dflash_reader,
+      QwenDFlashTargetBinding target, std::string* error_msg = nullptr);
 
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
       const noexcept {
@@ -116,7 +136,7 @@ public:
   }
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
       const noexcept {
-    return target_model_->GetTokenizer();
+    return *tokenizer_;
   }
   [[nodiscard]] std::size_t GetPackedWeightBytes() const noexcept {
     return packed_weight_bytes_;
@@ -124,13 +144,15 @@ public:
 
 private:
   QwenDFlashGpuModel(std::shared_ptr<const core::GgufReader> dflash_reader,
-                     std::shared_ptr<const QwenGpuModel> target_model,
+                     std::shared_ptr<const void> target_keep_alive,
+                     const tokenization::QwenTokenizer* tokenizer,
                      speculative::QwenDFlashWeights weights,
                      std::vector<void*> allocations,
                      std::size_t packed_weight_bytes);
 
   std::shared_ptr<const core::GgufReader> dflash_reader_;
-  std::shared_ptr<const QwenGpuModel> target_model_;
+  std::shared_ptr<const void> target_keep_alive_;
+  const tokenization::QwenTokenizer* tokenizer_{nullptr};
   speculative::QwenDFlashWeights weights_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};

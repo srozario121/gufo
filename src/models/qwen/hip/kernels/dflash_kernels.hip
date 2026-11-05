@@ -685,6 +685,53 @@ __device__ __forceinline__ void FinalizeSelector(
       denominator += probability_weight;
     }
     const float inverse_denominator = 1.0F / fmaxf(denominator, 1e-30F);
+    if (sampling.integer_masses != 0U) {
+      constexpr uint32_t kUnits = 1U << 24;
+      uint32_t masses[kMaxSelectorTopK];
+      uint32_t total = 0;
+      for (uint32_t index = 0; index < selector_top_k; ++index) {
+        const float share = path_scores[index] * inverse_denominator;
+        masses[index] = static_cast<uint32_t>(
+            fminf(floorf(share * static_cast<float>(kUnits)),
+                  static_cast<float>(kUnits)));
+        total += masses[index];
+      }
+      if (total <= kUnits) {
+        masses[0] += kUnits - total;
+      } else {
+        // Float rounding can push the floored shares past 2^24: take the
+        // excess from the largest mass so the total is exactly 2^24.
+        uint32_t largest = 0;
+        for (uint32_t index = 1; index < selector_top_k; ++index)
+          if (masses[index] > masses[largest])
+            largest = index;
+        masses[largest] -= total - kUnits;
+      }
+      const uint32_t draw = min(
+          static_cast<uint32_t>(fminf(fmaxf(*sample_uniform, 0.0F),
+                                      0.99999994F) *
+                                static_cast<float>(kUnits)),
+          kUnits - 1U);
+      uint32_t cumulative = 0;
+      uint32_t sampled_index = 0;
+      bool selected = false;
+      for (uint32_t index = 0; index < selector_top_k; ++index) {
+        const float probability =
+            static_cast<float>(masses[index]) * (1.0F / kUnits);
+        if (candidate_probabilities != nullptr)
+          candidate_probabilities[index] = probability;
+        cumulative += masses[index];
+        if (!selected && draw < cumulative) {
+          sampled_index = index;
+          selected = true;
+        }
+      }
+      *output_token = top_ids[sampled_index];
+      if (output_confidence != nullptr)
+        *output_confidence =
+            static_cast<float>(masses[sampled_index]) * (1.0F / kUnits);
+      return;
+    }
     float threshold =
         fminf(fmaxf(*sample_uniform, 0.0F), 0.99999994F) * denominator;
     uint32_t sampled_index = best_index;
