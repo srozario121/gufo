@@ -1252,7 +1252,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                 static_cast<std::uint32_t>(cap - 1),
                                 static_cast<std::uint32_t>(tokens_.size()),
                                 pending->policy_concurrency);
-    if (!batch_drafts && drafts != 0)
+    // MTP chains draft to the budget and end at the gate. A DFlash-2 block
+    // has no gate, so it keeps the controller's priced length: verifying
+    // every block position cost more rows than its acceptance returned.
+    if (!batch_drafts && drafts != 0 && !dflash_)
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
