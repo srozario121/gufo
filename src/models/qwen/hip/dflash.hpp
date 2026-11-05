@@ -189,6 +189,14 @@ public:
   bool InjectTargetContextDevice(const float* features, std::uint32_t position,
                                  std::uint32_t num_tokens,
                                  hipStream_t producer);
+  /// Flash-Next's selector contract (item 2.1): draw sampled slots from exact
+  /// 2^24 integer masses and, when the draft head is a compact row subset,
+  /// map its rows to token ids (`row_ids`, device memory, or null). The Qwen
+  /// 27B path leaves both off.
+  void SetExactSelector(bool integer_masses, const std::int32_t* row_ids) {
+    integer_masses_ = integer_masses;
+    row_ids_ = row_ids;
+  }
   /// Rows of history the draft attends (its sliding window).
   [[nodiscard]] std::uint32_t GetHistoryCapacity() const noexcept {
     return history_capacity_;
@@ -273,6 +281,8 @@ private:
   std::shared_ptr<const QwenDFlashGpuModel> model_;
   std::uint32_t max_context_{4096};
   std::uint32_t injected_context_len_{0};
+  bool integer_masses_{false};
+  const std::int32_t* row_ids_{nullptr};
   std::uint32_t history_capacity_{0};
   std::uint32_t injection_capacity_{0};
   hipStream_t stream_{nullptr};

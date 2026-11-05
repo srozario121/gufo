@@ -88,6 +88,11 @@ struct DFlashSampling {
   /// Flash-Next's exact verifier requires. Off: the float draw the Qwen 27B
   /// path uses.
   std::uint32_t integer_masses{0};
+  /// The draft head scores a compact subset of the vocabulary (Flash-Next's
+  /// trimmed head, item 2.1): row r of the head is token row_ids[r]. The
+  /// selector maps its candidates to token ids before the codebooks,
+  /// penalties and output read them. Null: rows are token ids.
+  const std::int32_t* row_ids{nullptr};
 };
 
 struct DFlashSelectorSequence {

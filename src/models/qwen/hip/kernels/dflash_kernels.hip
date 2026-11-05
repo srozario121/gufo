@@ -572,6 +572,14 @@ __device__ __forceinline__ void FinalizeSelector(
 
   MergeSelectorLists(shared_scores, shared_ids, selector_top_k);
 
+  if (sampling.row_ids != nullptr) {
+    // Compact head rows to token ids, once, before anything reads them.
+    __syncthreads();
+    if (threadIdx.x < selector_top_k)
+      shared_ids[threadIdx.x] =
+          static_cast<uint32_t>(sampling.row_ids[shared_ids[threadIdx.x]]);
+    __syncthreads();
+  }
   const uint32_t predecessor = *predecessor_token;
   const hip_bfloat16* predecessor_row =
       predecessor_codebook + (uint64_t)predecessor * selector_rank;

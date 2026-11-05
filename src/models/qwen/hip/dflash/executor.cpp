@@ -978,6 +978,8 @@ void QwenDFlashGpuExecutor::InjectUploadedChunk(std::uint32_t position,
 kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
     const sampling::SamplerState* sampler, hipStream_t stream) {
   kernels::DFlashSampling result;
+  result.integer_masses = integer_masses_ ? 1U : 0U;
+  result.row_ids = row_ids_;
   if (sampler == nullptr)
     return result;
   const auto& config = sampler->config();
