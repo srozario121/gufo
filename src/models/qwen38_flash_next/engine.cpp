@@ -1140,6 +1140,8 @@ struct Session::PendingDecode {
   /// request's first speculative step.
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
+  /// A DFlash-2 block left for the cohort's shared pass (DflashDraftBatch).
+  bool dflash_deferred{false};
 };
 
 bool Session::GateStops(const PendingDecode& pending) {
@@ -1337,6 +1339,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return dflash_ || defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (dflash_) {
+    // A cohort drafts every block in one shared pass (DflashDraftBatch).
+    if (defer_head) {
+      pending->dflash_deferred = true;
+      return true;
+    }
     // Copies continue the drafted block up to the budget, as after a gated
     // MTP chain.
     if (!DflashDraft(*pending, anchor, stop_at_eos, sampler, error_msg))
@@ -1609,10 +1616,17 @@ bool Session::FinishDecode(const DecodeRequest& request,
   return true;
 }
 
-bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
-                          bool stop_at_eos,
+/// The drafter request and the draws it reads, kept alive until the block
+/// is drafted.
+struct Session::DflashBlock {
+  std::uint32_t drafts{0};
+  std::vector<float> uniforms;
+  hip::QwenDFlashBlockRequest request;
+};
+
+bool Session::DflashBegin(PendingDecode& pending, std::int32_t anchor,
                           const sampling::SamplerState& sampler,
-                          std::string* error_msg) {
+                          DflashBlock* block, std::string* error_msg) {
   auto& exec = *model_->executor_;
   const auto position = static_cast<std::uint32_t>(tokens_.size());
   const float* ring = session_->dflash_ring();
@@ -1639,56 +1653,62 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
     }
     from += count;
   }
-  const auto drafts = static_cast<std::uint32_t>(pending.width - 1);
+  block->drafts = static_cast<std::uint32_t>(pending.width - 1);
   // The drafter was trained on full blocks and its attention is non-causal:
   // a shorter block changes every earlier draft. Run the trained width
   // (bounded by the context) and keep the first `drafts` proposals.
-  const auto block = static_cast<std::uint32_t>(
+  const auto block_size = static_cast<std::uint32_t>(
       dflash_->GetModel().GetDFlashConfig().block_size);
   const std::uint32_t room = model_->MaxContext() > position + 1
                                  ? model_->MaxContext() - position - 1
                                  : 0;
-  const std::uint32_t forward =
-      std::max(drafts, std::min(block > 0 ? block - 1 : 0, room));
-  const bool sampled = pending.sampled;
-  std::vector<float> uniforms;
-  if (sampled) {
-    uniforms.reserve(forward);
+  const std::uint32_t forward = std::max(
+      block->drafts, std::min(block_size > 0 ? block_size - 1 : 0, room));
+  block->uniforms.clear();
+  if (pending.sampled) {
+    block->uniforms.reserve(forward);
     for (std::uint32_t i = 0; i < forward; ++i)
-      uniforms.push_back(
+      block->uniforms.push_back(
           static_cast<float>(sampling::Uniform(&pending.draft_rng)));
   }
-  std::vector<float> confidences;
-  std::vector<tokenization::TokenId> ids;
-  std::vector<float> probabilities;
-  std::vector<tokenization::TokenId> tokens;
-  try {
-    tokens = dflash_->ForwardBlock(
-        static_cast<tokenization::TokenId>(anchor), position, forward,
-        sampled ? sampler.config().temperature : 0.0F, uniforms, &confidences,
-        sampled ? &ids : nullptr, sampled ? &probabilities : nullptr, {},
-        sampled && pending.draft_sampler ? &*pending.draft_sampler : nullptr);
-  } catch (const std::exception& exception) {
-    AssignError(error_msg, exception.what());
-    return false;
-  }
+  block->request = {
+      .executor = dflash_.get(),
+      .anchor = static_cast<tokenization::TokenId>(anchor),
+      .position = position,
+      .draft_count = forward,
+      .temperature = pending.sampled ? sampler.config().temperature : 0.0F,
+      .uniforms = block->uniforms,
+      .sampler = pending.sampled && pending.draft_sampler
+                     ? &*pending.draft_sampler
+                     : nullptr,
+  };
+  return true;
+}
+
+void Session::DflashFinish(PendingDecode& pending, const DflashBlock& block,
+                           const speculative::DraftProposal& proposal,
+                           bool stop_at_eos) const {
+  const auto& tokens = proposal.tokens;
+  const auto& ids = proposal.candidate_ids;
+  const auto& probabilities = proposal.candidate_probabilities;
+  const bool sampled = pending.sampled;
   const std::size_t k = dflash_->GetModel().GetDFlashConfig().selector_top_k;
-  for (std::size_t i = 0; i < std::min<std::size_t>(tokens.size(), drafts);
-       ++i) {
+  for (std::size_t i = 0;
+       i < std::min<std::size_t>(tokens.size(), block.drafts); ++i) {
     pending.chain.push_back(static_cast<std::int32_t>(tokens[i]));
     if (sampled) {
-      MtpProposal proposal;
-      proposal.size = std::min(k, kMtpCandidates);
+      MtpProposal candidate;
+      candidate.size = std::min(k, kMtpCandidates);
       float selected = 0.0F;
-      for (std::size_t j = 0; j < proposal.size; ++j) {
-        proposal.ids[j] = ids[i * k + j];
-        proposal.probabilities[j] = probabilities[i * k + j];
-        if (proposal.ids[j] == tokens[i])
-          selected += proposal.probabilities[j];
+      for (std::size_t j = 0; j < candidate.size; ++j) {
+        candidate.ids[j] = ids[i * k + j];
+        candidate.probabilities[j] = probabilities[i * k + j];
+        if (candidate.ids[j] == tokens[i])
+          selected += candidate.probabilities[j];
       }
-      proposal.token = tokens[i];
-      proposal.probability = selected;
-      pending.proposals.push_back(proposal);
+      candidate.token = tokens[i];
+      candidate.probability = selected;
+      pending.proposals.push_back(candidate);
     }
     if (stop_at_eos && model_->IsStopToken(pending.chain.back()))
       break;
@@ -1697,13 +1717,78 @@ bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
     const float gate =
         sampled ? kDflashSampledGateProbability : kDflashGateProbability;
     const float confidence = sampled ? pending.proposals.back().probability
-                             : i < confidences.size() ? confidences[i]
-                                                      : 1.0F;
+                             : i < proposal.confidences.size()
+                                 ? proposal.confidences[i]
+                                 : 1.0F;
     if (confidence < gate)
       break;
   }
   pending.width = pending.chain.size();
   pending.gated = false;  // the block applied its gate above
+}
+
+bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
+                          bool stop_at_eos,
+                          const sampling::SamplerState& sampler,
+                          std::string* error_msg) {
+  DflashBlock block;
+  if (!DflashBegin(pending, anchor, sampler, &block, error_msg))
+    return false;
+  speculative::DraftProposal proposal;
+  const auto& r = block.request;
+  try {
+    proposal.tokens = dflash_->ForwardBlock(
+        r.anchor, r.position, r.draft_count, r.temperature, r.uniforms,
+        &proposal.confidences,
+        pending.sampled ? &proposal.candidate_ids : nullptr,
+        pending.sampled ? &proposal.candidate_probabilities : nullptr, {},
+        r.sampler);
+  } catch (const std::exception& exception) {
+    AssignError(error_msg, exception.what());
+    return false;
+  }
+  DflashFinish(pending, block, proposal, stop_at_eos);
+  return true;
+}
+
+bool Session::DflashDraftBatch(std::span<const DecodeRequest> requests,
+                               std::span<PendingDecode> pending,
+                               std::string* error_msg) {
+  // Sessions share the drafter's weight reads; each keeps its own context,
+  // draws and selector chain (ForwardBlockBatch reproduces single blocks).
+  std::vector<DflashBlock> blocks(requests.size());
+  std::vector<hip::QwenDFlashBlockRequest> batch;
+  std::vector<std::size_t> owners;
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    auto& p = pending[i];
+    if (!p.dflash_deferred)
+      continue;
+    p.dflash_deferred = false;
+    auto& session = *requests[i].session;
+    if (!session.DflashBegin(p, p.chain.front(), *requests[i].sampler,
+                             &blocks[i], &requests[i].outcome->error)) {
+      p = {};
+      continue;
+    }
+    batch.push_back(blocks[i].request);
+    owners.push_back(i);
+  }
+  if (batch.empty())
+    return true;
+  std::vector<speculative::DraftProposal> proposals;
+  try {
+    proposals = hip::QwenDFlashGpuExecutor::ForwardBlockBatch(batch);
+  } catch (const std::exception& exception) {
+    AssignError(error_msg, exception.what());
+    return false;
+  }
+  for (std::size_t j = 0; j < owners.size(); ++j) {
+    const auto i = owners[j];
+    auto& session = *requests[i].session;
+    session.DflashFinish(pending[i], blocks[i], proposals[j],
+                         requests[i].stop_at_eos);
+    (void)session.AppendLookup(pending[i], requests[i].stop_at_eos);
+  }
   return true;
 }
 
@@ -1921,6 +2006,9 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       pending[i] = {};
     }
   }
+  if (requests.front().session->dflash_ &&
+      !DflashDraftBatch(requests, pending, error_msg))
+    return false;
   std::vector<AdvanceRequest> catchup;
   std::vector<std::uint8_t> propose;
   for (std::size_t i = 0; i < requests.size(); ++i) {

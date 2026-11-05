@@ -30,6 +30,9 @@ namespace gufo::hip {
 class QwenDFlashGpuModel;
 class QwenDFlashGpuExecutor;
 }  // namespace gufo::hip
+namespace gufo::speculative {
+struct DraftProposal;
+}  // namespace gufo::speculative
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -430,10 +433,24 @@ private:
   MtpLengthController draft_length_;
   /// This session's DFlash-2 draft state (Model::HasDflash), or null.
   std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_;
+  /// One DFlash-2 block in flight (engine.cpp).
+  struct DflashBlock;
+  /// Injects the committed context and prepares the block after `anchor`.
+  bool DflashBegin(PendingDecode& pending, std::int32_t anchor,
+                   const sampling::SamplerState& sampler, DflashBlock* block,
+                   std::string* error_msg);
+  /// Appends the block's gated proposals to `pending`.
+  void DflashFinish(PendingDecode& pending, const DflashBlock& block,
+                    const speculative::DraftProposal& proposal,
+                    bool stop_at_eos) const;
   /// Drafts a DFlash-2 block after `anchor` into `pending` (PrepareDecode).
   bool DflashDraft(PendingDecode& pending, std::int32_t anchor,
                    bool stop_at_eos, const sampling::SamplerState& sampler,
                    std::string* error_msg);
+  /// Drafts every deferred DFlash-2 block of a cohort in one shared pass.
+  static bool DflashDraftBatch(std::span<const DecodeRequest> requests,
+                               std::span<PendingDecode> pending,
+                               std::string* error_msg);
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
   mutable SpeculativeStats stats_;

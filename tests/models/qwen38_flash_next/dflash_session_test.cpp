@@ -343,6 +343,94 @@ void CheckInPassContinuation(const std::shared_ptr<qfn::Model>& model,
             << std::flush;
 }
 
+// A cohort drafts its DFlash-2 blocks in one shared pass (DflashDraftBatch).
+// Each session's proposals, acceptance, RNG and target logits must equal the
+// same session decoding alone at the cohort's occupancy.
+void CheckBatch(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  constexpr std::size_t kWidth = 4;
+  const std::array<const char*, kWidth> texts{
+      "Write a Python function that merges two sorted lists, then test it.",
+      "Explain how a hash map handles collisions, with a short example.",
+      "List the steps to set up a git repository and push it to a remote.",
+      "Describe the water cycle in five sentences for a ten-year-old."};
+  std::vector<std::unique_ptr<qfn::Session>> serial, batched;
+  std::vector<sampling::SamplerState> samplers, twins;
+  for (std::size_t i = 0; i < kWidth; ++i) {
+    const auto prompt = Prompt(*model, texts[i]);
+    serial.push_back(model->CreateSession(gufo::core::SessionMode::kSpeculative,
+                                          2048, &error));
+    batched.push_back(model->CreateSession(
+        gufo::core::SessionMode::kSpeculative, 2048, &error));
+    Require(serial.back() && batched.back() &&
+                serial.back()->Sync(prompt, &error) &&
+                batched.back()->Sync(prompt, &error),
+            error);
+    sampling::SamplingConfig config{.temperature = i % 2 ? 1.0F : 0.0F,
+                                    .top_k = 20,
+                                    .top_p = 0.95F,
+                                    .seed = 31 + static_cast<unsigned>(i)};
+    samplers.emplace_back(
+        config, std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+    twins.push_back(samplers.back());
+  }
+  for (const std::size_t width : {std::size_t{2}, kWidth}) {
+    for (unsigned cycle = 0; cycle < 12; ++cycle) {
+      std::vector<qfn::Session::DecodeResult> expected(width), actual(width);
+      std::vector<qfn::Session::BatchOutcome> outcomes(width);
+      std::vector<qfn::Session::DecodeRequest> requests;
+      for (std::size_t i = 0; i < width; ++i) {
+        Require(serial[i]->DecodeStep(8, samplers[i], &expected[i], &error,
+                                      false, static_cast<std::uint32_t>(width)),
+                error);
+        requests.push_back(
+            {batched[i].get(), 8, &twins[i], &actual[i], false, &outcomes[i]});
+      }
+      if (cycle % 2)
+        std::reverse(requests.begin(), requests.end());
+      Require(qfn::Session::DecodeBatch(requests, &error), error);
+      for (std::size_t i = 0; i < width; ++i) {
+        const auto a = serial[i]->Statistics(), b = batched[i]->Statistics();
+        const auto join = [](const std::vector<std::int32_t>& v) {
+          std::string out;
+          for (const auto t : v)
+            out += std::to_string(t) + ",";
+          return out;
+        };
+        Require(expected[i].tokens == actual[i].tokens &&
+                    samplers[i].rng_state() == twins[i].rng_state() &&
+                    a.drafted == b.drafted && a.accepted == b.accepted,
+                "DFlash-2 cohort changed tokens, proposals or RNG (C" +
+                    std::to_string(width) + " cycle " + std::to_string(cycle) +
+                    " session " + std::to_string(i) + "): tokens " +
+                    join(expected[i].tokens) + " vs " + join(actual[i].tokens) +
+                    " rng_equal=" +
+                    std::to_string(samplers[i].rng_state() ==
+                                   twins[i].rng_state()) +
+                    " drafted " + std::to_string(a.drafted) + "/" +
+                    std::to_string(b.drafted) + " accepted " +
+                    std::to_string(a.accepted) + "/" +
+                    std::to_string(b.accepted) + " cycles " +
+                    std::to_string(a.cycles) + "/" + std::to_string(b.cycles));
+        const auto x = serial[i]->Logits(), y = batched[i]->Logits();
+        Require(
+            x.size() == y.size() && std::equal(x.begin(), x.end(), y.begin()),
+            "DFlash-2 cohort changed target logits");
+      }
+    }
+    std::uint64_t drafted = 0, accepted = 0;
+    for (std::size_t i = 0; i < width; ++i) {
+      drafted += batched[i]->Statistics().drafted;
+      accepted += batched[i]->Statistics().accepted;
+    }
+    Require(drafted > 0 && accepted > 0, "DFlash-2 cohort drafted nothing");
+    std::cout << "DFlash-2 cohort C" << width
+              << " cycles=12 drafted=" << drafted << " accepted=" << accepted
+              << " tokens_logits_RNG_exact=1\n"
+              << std::flush;
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -354,8 +442,11 @@ int main(int argc, char** argv) {
   }
   try {
     std::string error;
-    auto model = qfn::Model::Load(
-        argv[2], {.max_context = 4096, .dflash_model_path = argv[4]}, &error);
+    auto model = qfn::Model::Load(argv[2],
+                                  {.max_context = 4096,
+                                   .dflash_model_path = argv[4],
+                                   .decode_concurrency = 4},
+                                  &error);
     Require(model != nullptr, error);
     Require(model->HasDflash() && !model->HasMtp(),
             "expected a DFlash-2 model");
@@ -392,6 +483,7 @@ int main(int argc, char** argv) {
     CheckContinuation(model, long_prompt, other, 0, "long_prefill");
     CheckContinuation(model, long_prompt, other, 48, "long_decoded");
     CheckInPassContinuation(model, prompt, pattern, other);
+    CheckBatch(model);
     std::cout << "dflash_session_test: ALL TESTS PASSED\n";
     return 0;
   } catch (const std::exception& e) {

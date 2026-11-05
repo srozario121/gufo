@@ -1119,6 +1119,27 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       UseScratch(base);
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
+      // A DFlash-2 drafter reads each session's settled tap rows from its own
+      // capture ring, as the single-session forward writes them (ForwardBody).
+      // The combine above already folded the layer's update into res, so the
+      // tap reads it directly; the deferred and separate combines are
+      // byte-identical (moe_epilogue_ops_test).
+      const auto& taps = options_.dflash_tap_layers;
+      for (std::uint32_t slot = 0; slot < taps.size(); ++slot) {
+        if (taps[slot] != il)
+          continue;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          auto& session = *items[i].session;
+          if (session.dflash_ring_ == nullptr || session.Cancelled())
+            continue;
+          HcTapMeanToRing(base.res + std::size_t{offsets[i]} * c.HcDim(),
+                          nullptr, nullptr, session.dflash_ring_,
+                          &session.control_->position, dflash_ring_rows(), slot,
+                          static_cast<std::uint32_t>(taps.size()),
+                          static_cast<std::uint32_t>(items[i].tokens.size()),
+                          c.hidden_size, stream_);
+        }
+      }
     }
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());

@@ -24,6 +24,9 @@ struct DraftProposal {
   std::vector<tokenization::TokenId> tokens;
   std::vector<tokenization::TokenId> candidate_ids;
   std::vector<float> candidate_probabilities;
+  /// Per draft: the selected candidate's probability (sampled) or the
+  /// argmax's softmax share (greedy); filled where a drafter reports it.
+  std::vector<float> confidences;
   std::size_t candidates_per_token{0};
   std::uint32_t start_pos{0};
   bool from_lookup{false};

@@ -98,16 +98,31 @@ void TraceBlock(const DFlashTrace& trace, std::string_view name,
   trace(name, values);
 }
 
+// `segments` holds each session's consecutive row count. The exact BF16
+// kernel gives every row the same result at any row count, so it shares one
+// weight read across the cohort. The quantized route picks other kernels (and
+// so other per-row rounding) past eight rows; it runs each session's rows at
+// the shape a lone session uses, keeping proposals independent of peers.
 void ProjectBlock(const models::QwenTensorRef& weight, const float* input,
-                  float* output, std::size_t rows, std::size_t output_size,
-                  std::size_t input_size, hipStream_t stream) {
+                  float* output, std::span<const std::size_t> segments,
+                  std::size_t output_size, std::size_t input_size,
+                  hipStream_t stream) {
+  std::size_t rows = 0;
+  for (const auto count : segments)
+    rows += count;
   if (weight.type == core::GgmlType::kBF16) {
     LaunchExactBf16GEMMFp32SmallBatch(weight.data, input, output, rows,
                                       output_size, input_size, stream);
   } else if (weight.type == core::GgmlType::kQ8_0 ||
              detail::IsNativeWmmaQuant(weight.type)) {
-    LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output, rows,
-                               output_size, input_size, stream);
+    std::size_t row = 0;
+    for (const auto count : segments) {
+      if (count != 0)
+        LaunchBatchedQuantGEMMFp32(
+            weight.type, weight.data, input + row * input_size,
+            output + row * output_size, count, output_size, input_size, stream);
+      row += count;
+    }
   } else {
     LaunchBatchedGEMM(weight.data, false, input, output, rows, output_size,
                       input_size, stream);
@@ -307,7 +322,7 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           request.temperature > 0.0F ? draft.selector_top_k : 0;
       proposal.tokens = request.executor->ForwardBlock(
           request.anchor, request.position, request.draft_count,
-          request.temperature, request.uniforms, nullptr,
+          request.temperature, request.uniforms, &proposal.confidences,
           request.temperature > 0.0F ? &proposal.candidate_ids : nullptr,
           request.temperature > 0.0F ? &proposal.candidate_probabilities
                                      : nullptr,
@@ -368,10 +383,19 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
                                weights.token_embedding.type, scratch.tokens,
                                scratch.hidden, rows, hidden_size, stream);
   emit("embedding", scratch.hidden, hidden_size);
+  std::array<std::size_t, 8> block_rows{}, proposal_segments{};
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    block_rows[index] = counts[index] + 1U;
+    proposal_segments[index] = counts[index];
+  }
+  const auto block_segments = std::span(block_rows).first(requests.size());
+  const auto proposal_rows_by_session =
+      std::span(proposal_segments).first(requests.size());
   const auto project = [&](const models::QwenTensorRef& weight,
                            const float* input, float* output,
                            std::size_t output_size, std::size_t input_size) {
-    ProjectBlock(weight, input, output, rows, output_size, input_size, stream);
+    ProjectBlock(weight, input, output, block_segments, output_size, input_size,
+                 stream);
   };
   const auto convolve = [&](const float* input, const float* base,
                             std::uint32_t direction) {
@@ -488,12 +512,13 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
                        hipMemcpyDeviceToDevice, stream));
   }
   ProjectBlock(weights.selector_hidden, scratch.hidden, scratch.selector,
-               proposal_rows, draft.selector_rank, hidden_size, stream);
+               proposal_rows_by_session, draft.selector_rank, hidden_size,
+               stream);
   emit("selector_hidden", scratch.selector, draft.selector_rank, true);
   const std::uint32_t head_rows =
       requests[0].executor->GetModel().GetHeadRows();
-  ProjectBlock(weights.output, scratch.hidden, scratch.logits, proposal_rows,
-               head_rows, hidden_size, stream);
+  ProjectBlock(weights.output, scratch.hidden, scratch.logits,
+               proposal_rows_by_session, head_rows, hidden_size, stream);
   emit("logits", scratch.logits, head_rows, true);
   std::array<kernels::DFlashSelectorSequence, 8> sequences{};
   for (std::size_t index = 0; index < requests.size(); ++index)
@@ -515,6 +540,11 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
     HIP_CHECK(hipMemcpyAsync(proposal.tokens.data(),
                              scratch.tokens + offsets[index] + 1U,
                              counts[index] * sizeof(tokenization::TokenId),
+                             hipMemcpyDeviceToHost, stream));
+    proposal.confidences.resize(counts[index]);
+    HIP_CHECK(hipMemcpyAsync(proposal.confidences.data(),
+                             scratch.confidences + offsets[index] - index,
+                             counts[index] * sizeof(float),
                              hipMemcpyDeviceToHost, stream));
     if (request.temperature > 0.0F) {
       proposal.candidates_per_token = draft.selector_top_k;
