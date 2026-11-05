@@ -1732,9 +1732,11 @@ int RunServe(std::span<const char* const> args) {
           vocab_trim_tier2_threshold < 0.0 ||
           vocab_trim_tier2_threshold > 1.0)) ||
         (!vocab_trim_set.empty() &&
-         (speculative_config.backend != server::TextSpeculativeBackend::kMtp ||
+         ((speculative_config.backend != server::TextSpeculativeBackend::kMtp &&
+           speculative_config.backend !=
+               server::TextSpeculativeBackend::kDFlash) ||
           mtp_draft_vocab_prefix != 0 || !mtp_draft_vocab_set.empty()))) {
-      std::cerr << "Error: --vocab-trim-set needs --speculative mtp "
+      std::cerr << "Error: --vocab-trim-set needs --speculative mtp or dflash2 "
                    "(Qwen3.8-Flash-Next) and excludes --mtp-draft-vocab-prefix "
                    "and --mtp-draft-vocab-set; --vocab-trim-fallback-threshold "
                    "is in [0, 1]; --vocab-trim-timing and "

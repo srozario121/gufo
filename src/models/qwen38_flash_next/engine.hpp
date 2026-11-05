@@ -26,6 +26,10 @@
 namespace gufo::core {
 class GgufReader;
 }
+namespace gufo::hip {
+class QwenDFlashGpuModel;
+class QwenDFlashGpuExecutor;
+}  // namespace gufo::hip
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -47,6 +51,11 @@ struct ModelOptions {
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
   /// speculative decoding off.
   std::string mtp_model_path;
+  /// Optional DFlash-2 block drafter (item 2.1, `--speculative dflash2
+  /// --dflash-model`): it replaces MTP (the two exclude each other). It taps
+  /// the target's layers named in its GGUF, and drafts over the trimmed head's
+  /// rows when the head is trimmed.
+  std::string dflash_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
   std::string vision_model_path;
@@ -138,6 +147,10 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// A DFlash-2 drafter is loaded (ModelOptions::dflash_model_path).
+  [[nodiscard]] bool HasDflash() const noexcept {
+    return dflash_model_ != nullptr;
+  }
   /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
   /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
   /// inject as Q8_0, so the draft block is not counted.
@@ -189,6 +202,8 @@ private:
   MtpBatchController batch_policy_;
   bool head_trimmed_{false};
   bool head_count_once_{false};
+  std::shared_ptr<core::GgufReader> dflash_reader_;
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Static rows at the start of every session's draft table: the special
@@ -413,6 +428,12 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  /// This session's DFlash-2 draft state (Model::HasDflash), or null.
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> dflash_;
+  /// Drafts a DFlash-2 block after `anchor` into `pending` (PrepareDecode).
+  bool DflashDraft(PendingDecode& pending, std::int32_t anchor,
+                   bool stop_at_eos, const sampling::SamplerState& sampler,
+                   std::string* error_msg);
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
   mutable SpeculativeStats stats_;
@@ -430,6 +451,8 @@ private:
   /// Brings the draft table up to the committed tokens.
   bool SyncDraftVocab(std::string* error_msg);
   [[nodiscard]] bool MtpEnabled() const noexcept;
+  /// Some drafter is on: MTP or DFlash-2.
+  [[nodiscard]] bool SpeculativeEnabled() const noexcept;
 };
 
 /// Immutable session checkpoint. Committed cache rows may still reside in

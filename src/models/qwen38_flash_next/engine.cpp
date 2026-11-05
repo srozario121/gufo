@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -313,15 +314,57 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
       }
     }
   }
+  if (!options.dflash_model_path.empty()) {
+    if (m->mtp_weights_) {
+      AssignError(error_msg, "DFlash-2 and MTP drafting exclude each other");
+      return nullptr;
+    }
+    m->dflash_reader_ =
+        core::GgufReader::OpenFile(options.dflash_model_path, error_msg);
+    if (!m->dflash_reader_)
+      return nullptr;
+    const auto as_ref = [](const rocm::DeviceTensor& t) {
+      models::QwenTensorRef ref;
+      ref.data = t.data;
+      ref.type = t.type;
+      ref.num_elements = std::size_t{t.cols} * t.rows * t.experts;
+      ref.available_bytes = ref.EncodedSizeBytes();
+      return ref;
+    };
+    hip::QwenDFlashTargetBinding target;
+    target.hidden_size = c.hidden_size;
+    target.vocab_size = m->VocabSize();
+    target.num_layers = c.num_layers;
+    target.token_embedding = as_ref(m->device_->token_embd());
+    if (const auto* trim =
+            m->head_trimmed_ ? m->device_->head_trim() : nullptr) {
+      // The draft scores the trimmed head's real rows (row r is token
+      // trim->ids[r]); the selector maps them to token ids.
+      target.output = as_ref(trim->head);
+      target.head_rows = trim->scored;
+    } else {
+      target.output = as_ref(m->device_->output());
+    }
+    target.tokenizer = m->tokenizer_.get();
+    m->dflash_model_ = hip::QwenDFlashGpuModel::Create(
+        m->dflash_reader_, std::move(target), error_msg);
+    if (!m->dflash_model_)
+      return nullptr;
+  }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
   exec.max_logit_rows =
-      m->mtp_weights_
+      m->mtp_weights_ || m->dflash_model_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
+  if (m->dflash_model_) {
+    const auto& dcfg = m->dflash_model_->GetDFlashConfig();
+    exec.dflash_tap_layers = dcfg.target_layer_ids;
+    exec.dflash_window = dcfg.sliding_window;
+  }
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -352,8 +395,18 @@ std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
       return nullptr;
     }
   }
-  return std::unique_ptr<Session>(
+  auto session = std::unique_ptr<Session>(
       new Session(shared_from_this(), std::move(native)));
+  if (dflash_model_) {
+    session->dflash_ = hip::QwenDFlashGpuExecutor::Create(
+        dflash_model_, max_context, error_msg);
+    if (!session->dflash_)
+      return nullptr;
+    // Flash-Next verifies against exactly the masses the draft sampled.
+    session->dflash_->SetExactSelector(
+        true, head_trimmed_ ? device_->head_trim()->ids : nullptr);
+  }
+  return session;
 }
 
 std::vector<std::int32_t> Model::Tokenize(std::string_view text) const {
@@ -456,6 +509,10 @@ bool Session::MtpEnabled() const noexcept {
   return session_->mtp_enabled();
 }
 
+bool Session::SpeculativeEnabled() const noexcept {
+  return MtpEnabled() || dflash_ != nullptr;
+}
+
 Session::Session(std::shared_ptr<Model> model,
                  std::unique_ptr<rocm::Session> session)
     : model_(std::move(model)),
@@ -518,7 +575,10 @@ void Session::ResetImpl(bool reuse_mtp) {
   lookup_.Clear();
   hidden_base_ = 0;
   draft_length_.Reset();
-  model_->executor_->MtpRewind(*session_, 0);
+  if (MtpEnabled())
+    model_->executor_->MtpRewind(*session_, 0);
+  if (dflash_)
+    dflash_->Reset();
   if (continuation_hooks_)
     continuation_hooks_->AfterReset();
   valid_ = true;
@@ -658,6 +718,12 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
 bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                                   const rocm::SnapshotState* deferred,
                                   std::string* error_msg) {
+  if (dflash_) {
+    // The capture ring and the draft's window are not in the payload yet
+    // (item 2.1 T6, continuation): a restored DFlash-2 session prefills.
+    AssignError(error_msg, "DFlash-2 sessions do not restore snapshots yet");
+    return false;
+  }
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {
     AssignError(error_msg, "session snapshot is truncated");
@@ -1180,7 +1246,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // planned greedy batch keeps the planned width as its cap. The controller
   // still backs off to AR.
   std::uint32_t drafts = 0;
-  if (MtpEnabled() && cap > 1) {
+  if (SpeculativeEnabled() && cap > 1) {
     drafts = batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
                           : draft_length_.Choose(
                                 static_cast<std::uint32_t>(cap - 1),
@@ -1190,7 +1256,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
-  const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
+  const std::size_t width = SpeculativeEnabled() && cap > 1 ? 1 + drafts : cap;
   if (width == 0) {
     result->stop = true;
     return true;
@@ -1205,7 +1271,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   if (anchor_logprobs)
     result->logprobs.push_back(std::move(*anchor_logprobs));
-  if (!MtpEnabled() || width < 2) {
+  if (!SpeculativeEnabled() || width < 2) {
     if (MtpEnabled() && !defer_head &&
         !DraftCatchUp(anchor, false, error_msg)) {
       return false;
@@ -1253,6 +1319,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
+  if (dflash_)
+    return DflashDraft(*pending, anchor, stop_at_eos, sampler, error_msg);
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
   // A request's first speculative step copies nothing (see
@@ -1523,12 +1591,90 @@ bool Session::FinishDecode(const DecodeRequest& request,
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
-  exec.MtpRewind(*session_, base);
+  if (MtpEnabled())
+    exec.MtpRewind(*session_, base);
   if (correction) {
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
   }
+  return true;
+}
+
+bool Session::DflashDraft(PendingDecode& pending, std::int32_t anchor,
+                          bool stop_at_eos,
+                          const sampling::SamplerState& sampler,
+                          std::string* error_msg) {
+  auto& exec = *model_->executor_;
+  const auto position = static_cast<std::uint32_t>(tokens_.size());
+  const float* ring = session_->dflash_ring();
+  const std::uint32_t window = exec.dflash_window();
+  if (ring == nullptr || window == 0) {
+    AssignError(error_msg, "DFlash-2 session has no capture ring");
+    return false;
+  }
+  if (dflash_->GetInjectedContextLength() > position)
+    dflash_->Reset();  // the history was replaced: re-prime from the ring
+  // Every committed row the draft still attends: the last `window`.
+  const std::size_t row =
+      std::size_t{exec.dflash_taps()} * model_->config().hidden_size;
+  std::uint32_t from = std::max(dflash_->GetInjectedContextLength(),
+                                position > window ? position - window : 0U);
+  while (from < position) {
+    const std::uint32_t slot = from % window;
+    const std::uint32_t count = std::min(position - from, window - slot);
+    if (!dflash_->InjectTargetContextDevice(ring + slot * row, from, count,
+                                            exec.stream())) {
+      AssignError(error_msg, "DFlash-2 context injection failed");
+      return false;
+    }
+    from += count;
+  }
+  const auto drafts = static_cast<std::uint32_t>(pending.width - 1);
+  const bool sampled = pending.sampled;
+  std::vector<float> uniforms;
+  if (sampled) {
+    uniforms.reserve(drafts);
+    for (std::uint32_t i = 0; i < drafts; ++i)
+      uniforms.push_back(
+          static_cast<float>(sampling::Uniform(&pending.draft_rng)));
+  }
+  std::vector<float> confidences;
+  std::vector<tokenization::TokenId> ids;
+  std::vector<float> probabilities;
+  std::vector<tokenization::TokenId> tokens;
+  try {
+    tokens = dflash_->ForwardBlock(
+        static_cast<tokenization::TokenId>(anchor), position, drafts,
+        sampled ? sampler.config().temperature : 0.0F, uniforms, &confidences,
+        sampled ? &ids : nullptr, sampled ? &probabilities : nullptr, {},
+        sampled && pending.draft_sampler ? &*pending.draft_sampler : nullptr);
+  } catch (const std::exception& exception) {
+    AssignError(error_msg, exception.what());
+    return false;
+  }
+  const std::size_t k = dflash_->GetModel().GetDFlashConfig().selector_top_k;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    pending.chain.push_back(static_cast<std::int32_t>(tokens[i]));
+    if (sampled) {
+      MtpProposal proposal;
+      proposal.size = std::min(k, kMtpCandidates);
+      float selected = 0.0F;
+      for (std::size_t j = 0; j < proposal.size; ++j) {
+        proposal.ids[j] = ids[i * k + j];
+        proposal.probabilities[j] = probabilities[i * k + j];
+        if (proposal.ids[j] == tokens[i])
+          selected += proposal.probabilities[j];
+      }
+      proposal.token = tokens[i];
+      proposal.probability = selected;
+      pending.proposals.push_back(proposal);
+    }
+    if (stop_at_eos && model_->IsStopToken(pending.chain.back()))
+      break;
+  }
+  pending.width = pending.chain.size();
+  pending.gated = false;  // a DFlash-2 block has no per-draft confidence gate
   return true;
 }
 

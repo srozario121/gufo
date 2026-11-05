@@ -3224,10 +3224,20 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
-        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+        speculative_config.backend != TextSpeculativeBackend::kMtp &&
+        speculative_config.backend != TextSpeculativeBackend::kDFlash) {
       SetError(error,
-               "Qwen3.8-Flash-Next HTTP models support only MTP speculative "
-               "decoding (--speculative mtp --mtp-model)");
+               "Qwen3.8-Flash-Next HTTP models support MTP (--speculative mtp "
+               "--mtp-model) or DFlash-2 (--speculative dflash2 "
+               "--dflash-model) speculative decoding");
+      return false;
+    }
+    if (speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+        (speculative_config.draft_model_path.empty() ||
+         speculative_config.max_draft_tokens == 0)) {
+      SetError(error,
+               "Flash-Next DFlash-2 requires --dflash-model and a positive "
+               "draft limit");
       return false;
     }
     if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
@@ -3259,6 +3269,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .max_context = max_context,
             .mtp_model_path =
                 speculative_config.backend == TextSpeculativeBackend::kMtp
+                    ? speculative_config.draft_model_path
+                    : std::string{},
+            .dflash_model_path =
+                speculative_config.backend == TextSpeculativeBackend::kDFlash
                     ? speculative_config.draft_model_path
                     : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,

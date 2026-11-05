@@ -108,6 +108,10 @@ public:
 
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  /// The DFlash-2 capture ring (Options::dflash_tap_layers), or null.
+  [[nodiscard]] const float* dflash_ring() const noexcept {
+    return dflash_ring_;
+  }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
@@ -479,6 +483,12 @@ public:
   }
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
+  }
+  [[nodiscard]] std::uint32_t dflash_window() const noexcept {
+    return options_.dflash_window;
+  }
+  [[nodiscard]] std::uint32_t dflash_taps() const noexcept {
+    return static_cast<std::uint32_t>(options_.dflash_tap_layers.size());
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
 
