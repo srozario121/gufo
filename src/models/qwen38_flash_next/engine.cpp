@@ -30,6 +30,7 @@ namespace {
 // TEMPORARY (item 2.8 sweep, removed before landing): DFlash-2 length knobs.
 struct DflashKnobs {
   bool full{false};
+  bool lookup{true};
   float greedy_gate{0.0F};
   float sampled_gate{0.0F};
 };
@@ -38,6 +39,8 @@ const DflashKnobs& DflashExperiment() {
     DflashKnobs k;
     const char* full = std::getenv("GUFO_DFLASH_FULL");
     k.full = full != nullptr && full[0] == '1';
+    const char* lookup = std::getenv("GUFO_DFLASH_LOOKUP");
+    k.lookup = lookup == nullptr || lookup[0] != '0';
     if (const char* g = std::getenv("GUFO_DFLASH_GREEDY_GATE"))
       k.greedy_gate = std::strtof(g, nullptr);
     if (const char* g = std::getenv("GUFO_DFLASH_SAMPLED_GATE"))
@@ -1346,7 +1349,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
-  if (dflash_)
+  const bool dflash_lookup = dflash_ && DflashExperiment().lookup;
+  if (dflash_ && !dflash_lookup)
     return DflashDraft(*pending, anchor, stop_at_eos, sampler, error_msg);
   // Both execution paths use the same request-local copy rule. Scheduling
   // a peer must not change a sampled request's proposals or RNG sequence.
@@ -1361,7 +1365,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // short matches retain the neural proposal: replacing it based only on
   // shared syntax previously regressed an identical Pi code write by 9%.
   if (AppendLookup(*pending, stop_at_eos, 3, sampled)) {
-    return defer_head || DraftCatchUp(anchor, false, error_msg);
+    // A DFlash-2 drafter injects the skipped rows at its next block.
+    return dflash_ || defer_head || DraftCatchUp(anchor, false, error_msg);
+  }
+  if (dflash_) {
+    // Copies continue the drafted block up to the budget, as after a gated
+    // MTP chain.
+    if (!DflashDraft(*pending, anchor, stop_at_eos, sampler, error_msg))
+      return false;
+    (void)AppendLookup(*pending, stop_at_eos);
+    return true;
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
     return false;

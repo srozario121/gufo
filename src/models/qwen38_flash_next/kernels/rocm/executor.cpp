@@ -768,6 +768,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.index_capacity_ = source.index_capacity_;
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
+  view.speculative_ = source.speculative_;
   view.attention_ = source.attention_;
   view.linear_.resize(source.linear_.size());
   view.blocks_ = c.compress_ratio > 0 && view.position_ > c.indexer_top_k
@@ -866,7 +867,9 @@ void Session::Reset(bool reuse_mtp) {
   // addresses also retains the graphs; freeing it at every cache reassignment
   // makes later MTP requests allocate and record those shapes again. Its full
   // bound is already included in speculative SessionBytes and AllocatedBytes.
-  if (!reuse_mtp || !mtp_enabled_)
+  // Any speculative session keeps it: a DFlash-2 session verifies the same
+  // shapes as MTP, and releasing them re-recorded every width per request.
+  if (!reuse_mtp || !speculative_)
     TrimRollback(0);
   snapshot_lineage_.reset();
   position_ = 0;
@@ -1339,8 +1342,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->owner_ = this;
   // A speculative session drafts with MTP only when the sidecar is loaded;
   // a DFlash-2 drafter keeps its state outside this session (engine.cpp).
-  s->mtp_enabled_ =
-      mode == core::SessionMode::kSpeculative && model_->has_mtp();
+  s->speculative_ = mode == core::SessionMode::kSpeculative;
+  s->mtp_enabled_ = s->speculative_ && model_->has_mtp();
   if (s->mtp_enabled_ && !has_mtp()) {
     AssignError(error_msg, "MTP session requires a loaded predictor");
     return nullptr;

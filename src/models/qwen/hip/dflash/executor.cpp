@@ -78,6 +78,8 @@ void AllocateBuffer(T*& pointer, std::size_t elements) {
 
 /// Widest proposal block; BF16 context injection also uses sixteen rows.
 constexpr std::size_t kDFlashMaxSharedBatch = 8;
+// Context chunks at least this wide take the BF16 GEMM (RunInjectGemm).
+constexpr std::size_t kInjectGemmRows = 32;
 
 void NormalizeAndRotateQK(float* query, float* key, const float* query_weight,
                           const float* key_weight,
@@ -257,11 +259,10 @@ void QwenDFlashGpuExecutor::Allocate() {
   if (error != hipSuccess) {
     throw std::runtime_error("DFlash hipStreamCreate failed");
   }
-  if (block_size > kDFlashMaxSharedBatch) {
-    HIPBLAS_CHECK(hipblasCreate(&hipblas_handle_));
-    HIPBLAS_CHECK(hipblasSetStream(hipblas_handle_, stream_));
-    hipblaslt_gemm_ = std::make_unique<HipblasLtGemm>();
-  }
+  // Wide blocks and prompt-sized context injection both use the BF16 GEMM.
+  HIPBLAS_CHECK(hipblasCreate(&hipblas_handle_));
+  HIPBLAS_CHECK(hipblasSetStream(hipblas_handle_, stream_));
+  hipblaslt_gemm_ = std::make_unique<HipblasLtGemm>();
 
   // Attention only reads the sliding window. Preserve FP32 values and global
   // RoPE positions, but reuse physical slots as history advances.
@@ -318,6 +319,8 @@ void QwenDFlashGpuExecutor::Allocate() {
   allocate_scratch(d_out_token_, block_size);
   if (block_size > kDFlashMaxSharedBatch)
     allocate_scratch(d_bf16_input_, block_size * intermediate_size);
+  allocate_scratch(d_inject_bf16_,
+                   injection_capacity_ * std::max(enc_in_dim, hidden_size));
 
   PrewarmBlockGemms();
 }
@@ -464,6 +467,23 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
     return;
   }
 
+  // A prompt-sized chunk (the first block of a request injects up to the
+  // whole window) runs as one BF16 matrix-core GEMM: the exact FP32-feature
+  // kernel below re-read the 12800-wide projection once per 16 rows, about
+  // 100 ms per request. Per-cycle injections keep the exact kernel.
+  if (is_bf16 && num_tokens >= kInjectGemmRows) {
+    LaunchFloatToBfloat16(input, d_inject_bf16_, num_tokens * input_size,
+                          stream_);
+    if (hipblaslt_gemm_ != nullptr &&
+        hipblaslt_gemm_->RunBf16(weight.data, d_inject_bf16_, output,
+                                 num_tokens, output_size, input_size,
+                                 stream_)) {
+      return;
+    }
+    LaunchHipblasGEMMBF16(hipblas_handle_, weight.data, d_inject_bf16_, output,
+                          num_tokens, output_size, input_size, stream_);
+    return;
+  }
   for (std::size_t offset = 0; offset < num_tokens;) {
     const std::size_t chunk =
         is_bf16 && num_tokens - offset >= 16
@@ -545,6 +565,8 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     (void)hipFree(d_out_token_);
   if (d_bf16_input_ != nullptr)
     (void)hipFree(d_bf16_input_);
+  if (d_inject_bf16_ != nullptr)
+    (void)hipFree(d_inject_bf16_);
   if (d_batch_scratch_ != nullptr)
     (void)hipFree(d_batch_scratch_);
   hipblaslt_gemm_.reset();

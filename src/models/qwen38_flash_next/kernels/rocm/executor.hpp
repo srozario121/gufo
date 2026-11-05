@@ -193,6 +193,8 @@ private:
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
+  /// Created for speculative decoding (MTP or a DFlash-2 drafter).
+  bool speculative_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   ContinuationHooks* continuation_hooks_{nullptr};
