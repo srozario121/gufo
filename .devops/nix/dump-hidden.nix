@@ -11,6 +11,7 @@ let
     "tests/models/qwen38_flash_next"
     "tests/models/qwen38_flash_next/dump_hidden.cpp"
     "tests/models/qwen38_flash_next/dump_rows.hpp"
+    "tests/models/qwen38_flash_next/dflash_rows.hpp"
   ];
   production = gufo.src;
 in

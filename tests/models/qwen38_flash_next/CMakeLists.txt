@@ -26,6 +26,7 @@ add_qwen38_flash_next_test(head_trim gufo_core "cpu")
 add_qwen38_flash_next_test(logit_bias_default gufo_core "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 add_qwen38_flash_next_test(dump_rows gufo_core "cpu")
+add_qwen38_flash_next_test(dflash_rows gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -97,7 +98,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_routed_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
-  # Training-data dump for the MTP draft head (a long-lived stdin/stdout tool; its row logic is the CPU test dump_rows).
+  # Training-data dump for the MTP draft head (a long-lived stdin/stdout tool; its row logic is the CPU tests dump_rows and dflash_rows).
   add_executable(qwen38_flash_next_dump_hidden EXCLUDE_FROM_ALL dump_hidden.cpp)
   target_link_libraries(qwen38_flash_next_dump_hidden PRIVATE
     gufo_qwen38_flash_next)
