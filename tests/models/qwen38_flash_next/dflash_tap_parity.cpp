@@ -80,10 +80,11 @@ std::string SplitAt(std::string& list) {
 // "k keep" lines (sched=; k = 1 + drafted, or 1 for a plain decode step) and
 // the ring rows of positions [K, P) (out=), P the session's final position.
 // For decode4, seq=, out=, tokens= and sched= are four comma-separated paths.
+// temp= and seed= set the sampler (default greedy); session i uses seed + i.
 std::size_t ServeDecode(q::Model& model, std::size_t width,
                         std::string out_list, std::string seq_list, long first,
                         const std::string& feed, std::string tokens_list,
-                        std::string sched_list) {
+                        std::string sched_list, float temp, long long seed) {
   const bool batched = feed.rfind("decode4:", 0) == 0;
   if (!batched && feed.rfind("decode:", 0) != 0)
     throw Fail("feed must be decode:N or decode4:N");
@@ -103,7 +104,11 @@ std::size_t ServeDecode(q::Model& model, std::size_t width,
   };
   std::vector<One> all(sessions);
   std::string error;
-  for (auto& o : all) {
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    auto& o = all[i];
+    o.sampler = gufo::sampling::SamplerState(
+        {.temperature = temp,
+         .seed = seed < 0 ? -1 : seed + static_cast<long long>(i)});
     o.out = SplitAt(out_list);
     o.tokens = SplitAt(tokens_list);
     o.sched = SplitAt(sched_list);
@@ -191,6 +196,8 @@ std::size_t Serve(q::Model& model, std::size_t width, const std::string& line,
   std::stringstream ss(line);
   std::string tok, seq, feed, tokens_out, sched_out;
   long first = -1, end = -1;
+  float temp = 0.0F;
+  long long seed = -1;
   while (ss >> tok) {
     const auto eq = tok.find('=');
     if (eq == std::string::npos)
@@ -210,6 +217,10 @@ std::size_t Serve(q::Model& model, std::size_t width, const std::string& line,
       tokens_out = v;
     else if (k == "sched")
       sched_out = v;
+    else if (k == "temp")
+      temp = std::stof(v);
+    else if (k == "seed")
+      seed = std::stoll(v);
     else
       throw Fail("unknown field '" + k + "'");
   }
@@ -217,7 +228,7 @@ std::size_t Serve(q::Model& model, std::size_t width, const std::string& line,
     throw Fail("a request needs out=, seq=, first=, end= and feed=");
   if (feed.rfind("decode", 0) == 0)
     return ServeDecode(model, width, out_path, seq, first, feed, tokens_out,
-                       sched_out);
+                       sched_out, temp, seed);
   const auto x = ReadTokens(seq);
   if (first < 0 || end <= first || static_cast<std::size_t>(end) > x.size())
     throw Fail("first/end are outside the sequence");
