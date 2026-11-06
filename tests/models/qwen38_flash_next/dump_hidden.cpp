@@ -41,6 +41,13 @@
 // 25,608 bytes (see dflash_rows.hpp): the five taps' stream means at position t
 // as bf16, x[t] and the loss mask at t. --rows is the forward call width
 // (3..512, at most the ring).
+//
+// The verify path (todo 2.10): a sequence's fields may continue with
+//   verify=s:e,...  the output spans, fed as serving decodes them, and
+//   sched=k:keep,... their decode cycles (taken cyclically): a kVerify forward
+//                    of k true tokens, rolled back to the first keep, as
+//                    Session::DecodeStep and FinishDecode do (k = 1: kDecode).
+// Every other position stays on the prompt path (see DumpDflashSequence).
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
@@ -147,6 +154,26 @@ public:
                        q::rocm::Executor::ForwardMode::kPrefill, &error))
       throw Fail("prefill failed: " + error);
   }
+  // The verify path (item 2.10), as Session::DecodeStep and FinishDecode
+  // drive the executor: a kVerify forward of the chain, then a rollback to the
+  // committed rows; a chain of one is a kDecode step.
+  void Verify(std::span<const std::int32_t> tokens, std::size_t keep) {
+    std::string error;
+    const auto n = static_cast<std::uint32_t>(tokens.size());
+    if (!exec_.Forward(session_, tokens, n, nullptr,
+                       q::rocm::Executor::ForwardMode::kVerify, &error))
+      throw Fail("verify forward failed: " + error);
+    if (!exec_.Rollback(session_, static_cast<std::uint32_t>(keep), &error))
+      throw Fail("rollback failed: " + error);
+  }
+  void Decode(std::int32_t token) {
+    std::string error;
+    logits_.resize(exec_.config().vocab_size);
+    if (!exec_.Forward(session_, std::span<const std::int32_t>(&token, 1), 1,
+                       logits_.data(), q::rocm::Executor::ForwardMode::kDecode,
+                       &error))
+      throw Fail("decode forward failed: " + error);
+  }
   void ReadRing(std::size_t first, std::size_t n, float* out) {
     const std::size_t row =
         std::size_t{exec_.dflash_taps()} * exec_.config().hidden_size;
@@ -167,6 +194,7 @@ public:
 private:
   const q::rocm::Executor& exec_;
   q::rocm::Session& session_;
+  std::vector<float> logits_;
 };
 
 std::vector<d::Span> ParseSpans(const std::string& spec) {
@@ -300,6 +328,8 @@ std::size_t Serve(Rig& r, const std::string& line, std::string& out_path) {
     std::vector<t::Window> windows;
     std::vector<d::Span> loss;
     bool has_loss = false;
+    std::vector<d::Span> verify;  // verify path (item 2.10): output spans
+    std::vector<d::Cycle> sched;  // and their decode cycles k:keep
   };
   std::vector<Job> jobs;
   while (ss >> tok) {
@@ -319,6 +349,17 @@ std::size_t Serve(Rig& r, const std::string& line, std::string& out_path) {
         throw Fail("loss= must follow its seq= win= pair");
       jobs.back().loss = ParseSpans(tok.substr(5));
       jobs.back().has_loss = true;
+    } else if (tok.rfind("verify=", 0) == 0 || tok.rfind("sched=", 0) == 0) {
+      if (!r.dflash || jobs.empty() || !jobs.back().has_loss || !seq.empty())
+        throw Fail("verify= and sched= follow their seq= win= loss= fields");
+      const bool v = tok[0] == 'v';
+      const auto ranges = ParseWindowsRaw(tok.substr(v ? 7 : 6));
+      for (const auto& [a, b] : ranges) {
+        if (v)
+          jobs.back().verify.push_back({a, b});
+        else
+          jobs.back().sched.push_back({a, b});
+      }
     } else
       throw Fail("unknown field '" + tok + "'");
   }
@@ -346,9 +387,9 @@ std::size_t Serve(Rig& r, const std::string& line, std::string& out_path) {
       try {
         if (r.dflash) {
           DflashTrunk trunk(*r.exec, *session);
-          bytes = d::DumpDflashSequence(trunk, x, job.windows, job.loss,
-                                        r.slots, r.hidden, r.rows,
-                                        r.exec->dflash_ring_rows());
+          bytes = d::DumpDflashSequence(
+              trunk, x, job.windows, job.loss, r.slots, r.hidden, r.rows,
+              r.exec->dflash_ring_rows(), job.verify, job.sched);
         } else {
           GpuTrunk trunk(*r.exec, *session, r.hc);
           bytes = t::DumpSequence(trunk, x, job.windows, r.hc, r.vocab, r.top_k,

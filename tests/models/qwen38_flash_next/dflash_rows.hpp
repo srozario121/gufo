@@ -25,6 +25,10 @@
 //   ReadRing(size_t first, size_t n, float* out)
 //                                        n x slots x hidden floats, positions
 //                                        [first, first + n), from the ring
+//   Verify(span<const int32_t> tokens, size_t keep)  (verify path only)
+//                                        a kVerify forward of the tokens, then
+//                                        a rollback to the first `keep`
+//   Decode(int32_t token)                (verify path only) a kDecode step
 #pragma once
 
 #include <algorithm>
@@ -161,29 +165,66 @@ inline void AppendRow(std::string& out, std::span<const float> features,
 // Every forward call is 2..call_width positions (never one: a one-position
 // prefill takes another arithmetic route) and at most ring_rows, so each
 // call's taps are all still in the ring when they are read.
+// One decode cycle of the verify path (item 2.10): a kVerify forward of k
+// rows (the anchor and k - 1 drafts), of which the first `keep` are committed
+// and the rest rolled back, as Session::FinishDecode does. k = 1 is an
+// ordinary kDecode step.
+struct Cycle {
+  std::uint32_t k;
+  std::uint32_t keep;
+};
+inline constexpr std::uint32_t kMaxChain =
+    8;  // the drafter's block (verify width)
+
+inline void ValidateSchedule(std::span<const Cycle> schedule) {
+  for (std::size_t i = 0; i < schedule.size(); ++i)
+    if (schedule[i].k < 1 || schedule[i].k > kMaxChain ||
+        schedule[i].keep < 1 || schedule[i].keep > schedule[i].k)
+      throw std::invalid_argument("cycle " + std::to_string(i) +
+                                  " needs 1 <= keep <= k <= 8");
+}
+
+// Walks one sequence and returns the packed rows of every window, in order.
+// Prompt positions are forwarded in kPrefill calls of 2..call_width positions
+// (never one: a one-position prefill takes another arithmetic route), each at
+// most ring_rows, so each call's taps are all still in the ring when read.
+//
+// Positions inside a `verify` span are fed the way serving decodes them
+// (Trunk::Verify(tokens, keep) / Trunk::Decode(token)), cycle by cycle from
+// `schedule`, taken cyclically and restarted for every sequence. The true
+// next tokens stand in for the drafts: a committed row only sees the tokens
+// before it, so its arithmetic is the served cycle's. A cycle's k is clipped
+// to the tokens left in the sequence, its keep to the verify span. A prompt
+// segment of one position is widened by one (prefill rows do not depend on
+// the call width), and refused if the sequence ends there.
 template<class Trunk>
 std::string DumpDflashSequence(Trunk& trunk, std::span<const std::int32_t> x,
                                std::span<const Window> windows,
                                std::span<const Span> loss, std::size_t slots,
                                std::size_t hidden, std::size_t call_width,
                                std::size_t ring_rows,
+                               std::span<const Span> verify = {},
+                               std::span<const Cycle> schedule = {},
                                std::size_t max_rows = 2000) {
   ValidateWindows(windows, x.size(), max_rows);
   ValidateLoss(loss, x.size());
-  if (call_width > ring_rows)
+  ValidateLoss(verify, x.size());
+  ValidateSchedule(schedule);
+  if (!verify.empty() && schedule.empty())
+    throw std::invalid_argument("verify spans need a cycle schedule");
+  if (call_width > ring_rows || (!verify.empty() && kMaxChain > ring_rows))
     throw std::invalid_argument("a forward call wider than the capture ring");
   std::string out;
   if (windows.empty())
     return out;
   const std::size_t width = slots * hidden;
-  std::vector<float> feats(call_width * width);
+  std::vector<float> feats(std::max<std::size_t>(call_width, kMaxChain) *
+                           width);
   const std::size_t last = windows.back().end;
-  std::size_t pos = 0;
-  for (const auto n : Split(last, call_width)) {
-    trunk.Forward(x.subspan(pos, n));
-    for (const auto& w : windows) {  // the windows' rows inside this call
-      const std::size_t a = std::max<std::size_t>(w.begin, pos);
-      const std::size_t b = std::min<std::size_t>(w.end, pos + n);
+  const auto emit = [&](std::size_t lo, std::size_t hi) {
+    for (const auto& w : windows) {  // the windows' rows inside [lo, hi)
+      const std::size_t a = std::max<std::size_t>(w.begin, lo);
+      const std::size_t b = std::min<std::size_t>(w.end, hi);
       if (a >= b)
         continue;
       trunk.ReadRing(a, b - a, feats.data());
@@ -192,7 +233,38 @@ std::string DumpDflashSequence(Trunk& trunk, std::span<const std::int32_t> x,
                   std::span<const float>(feats.data() + (t - a) * width, width),
                   x[t], InLoss(loss, t) ? 1 : 0);
     }
-    pos += n;
+  };
+  std::size_t pos = 0, cycle = 0, vi = 0;
+  while (pos < last) {
+    while (vi < verify.size() && verify[vi].end <= pos)
+      ++vi;
+    if (vi < verify.size() && verify[vi].begin <= pos) {
+      const Cycle c = schedule[cycle++ % schedule.size()];
+      const std::size_t k = std::min<std::size_t>(c.k, x.size() - pos);
+      const std::size_t keep =
+          std::min<std::size_t>({c.keep, k, verify[vi].end - pos});
+      if (k == 1)
+        trunk.Decode(x[pos]);
+      else
+        trunk.Verify(x.subspan(pos, k), keep);
+      emit(pos, pos + keep);
+      pos += keep;
+      continue;
+    }
+    std::size_t end = vi < verify.size()
+                          ? std::min<std::size_t>(verify[vi].begin, last)
+                          : last;
+    if (end - pos == 1) {
+      if (pos + 2 > x.size() ||
+          (vi < verify.size() && verify[vi].begin == pos + 1))
+        throw std::invalid_argument("a one-position prompt segment");
+      end = pos + 2;
+    }
+    for (const auto n : Split(end - pos, call_width)) {
+      trunk.Forward(x.subspan(pos, n));
+      emit(pos, pos + n);
+      pos += n;
+    }
   }
   return out;
 }

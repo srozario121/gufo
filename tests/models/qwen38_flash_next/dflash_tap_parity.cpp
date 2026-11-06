@@ -19,10 +19,14 @@
 // written: bf16 features[taps x hidden] | int32 x[t] | int32 0. B - A must fit
 // the ring (the drafter's window + 8 rows). Reply `ok <out> <rows>` or
 // `err <message>`.
+//
+// feed=decode:N and feed=decode4:N (item 2.10, the verify path) decode for
+// real, with the drafter, and record each step's cycle; see ServeDecode.
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -53,10 +57,139 @@ std::vector<std::int32_t> ReadTokens(const std::string& path) {
   return x;
 }
 
+void WriteTokens(const std::string& path, std::span<const std::int32_t> x) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(x.data()),
+            static_cast<std::streamsize>(x.size() * sizeof(std::int32_t)));
+  if (!out)
+    throw Fail("write failed on " + path);
+}
+
+std::string SplitAt(std::string& list) {
+  const auto comma = list.find(',');
+  std::string head = list.substr(0, comma);
+  list = comma == std::string::npos ? std::string() : list.substr(comma + 1);
+  return head;
+}
+
+// feed=decode:N (one session, Session::DecodeStep) or feed=decode4:N (four
+// sessions, Session::DecodeBatch, as serving decodes four requests): x[0, K)
+// is synced (K = first), then the engine decodes greedily with its drafter
+// until a session holds N generated positions (stop tokens do not stop it).
+// Written per session: the committed tokens (tokens=), each step's cycle as
+// "k keep" lines (sched=; k = 1 + drafted, or 1 for a plain decode step) and
+// the ring rows of positions [K, P) (out=), P the session's final position.
+// For decode4, seq=, out=, tokens= and sched= are four comma-separated paths.
+std::size_t ServeDecode(q::Model& model, std::size_t width,
+                        std::string out_list, std::string seq_list, long first,
+                        const std::string& feed, std::string tokens_list,
+                        std::string sched_list) {
+  const bool batched = feed.rfind("decode4:", 0) == 0;
+  if (!batched && feed.rfind("decode:", 0) != 0)
+    throw Fail("feed must be decode:N or decode4:N");
+  const std::size_t n_gen = std::stoul(feed.substr(batched ? 8 : 7));
+  const std::size_t sessions = batched ? 4 : 1;
+  if (tokens_list.empty() || sched_list.empty() || first < 1 || n_gen < 1)
+    throw Fail("decode needs first=K, tokens= and sched=");
+  struct One {
+    std::string out, tokens, sched;
+    std::vector<std::int32_t> x;
+    std::unique_ptr<q::Session> session;
+    gufo::sampling::SamplerState sampler;
+    q::Session::DecodeResult result;
+    q::Session::BatchOutcome outcome;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> steps;
+    std::uint64_t cycles = 0, drafted = 0;
+  };
+  std::vector<One> all(sessions);
+  std::string error;
+  for (auto& o : all) {
+    o.out = SplitAt(out_list);
+    o.tokens = SplitAt(tokens_list);
+    o.sched = SplitAt(sched_list);
+    o.x = ReadTokens(SplitAt(seq_list));
+    if (o.out.empty() || static_cast<std::size_t>(first) > o.x.size())
+      throw Fail("each session needs out=, tokens=, sched= and seq= of >= K");
+    o.session = model.CreateSession(
+        gufo::core::SessionMode::kSpeculative,
+        static_cast<std::uint32_t>(first + n_gen + 64), &error);
+    if (!o.session)
+      throw Fail("session failed: " + error);
+    if (!o.session->Sync(std::span<const std::int32_t>(
+                             o.x.data(), static_cast<std::size_t>(first)),
+                         &error))
+      throw Fail("sync failed: " + error);
+  }
+  const auto generated = [&](const One& o) {
+    return o.session->Position() - static_cast<std::uint32_t>(first);
+  };
+  const auto done = [&] {
+    for (const auto& o : all)
+      if (generated(o) >= n_gen)
+        return true;
+    return false;
+  };
+  while (!done()) {
+    for (auto& o : all) {
+      o.cycles = o.session->Statistics().cycles;
+      o.drafted = o.session->Statistics().drafted;
+    }
+    if (batched) {
+      std::vector<q::Session::DecodeRequest> reqs;
+      for (auto& o : all)
+        reqs.push_back(
+            {o.session.get(), 64, &o.sampler, &o.result, false, &o.outcome});
+      if (!q::Session::DecodeBatch(reqs, &error))
+        throw Fail("decode batch failed: " + error);
+    } else if (!all[0].session->DecodeStep(64, all[0].sampler, &all[0].result,
+                                           &error, false)) {
+      throw Fail("decode step failed: " + error);
+    }
+    for (auto& o : all) {
+      const auto& st = o.session->Statistics();
+      const auto keep = static_cast<std::uint32_t>(o.result.tokens.size());
+      const auto k =
+          st.cycles != o.cycles
+              ? static_cast<std::uint32_t>(1 + st.drafted - o.drafted)
+              : 1U;
+      if (keep == 0)
+        throw Fail("a decode step committed nothing");
+      o.steps.emplace_back(k, keep);
+    }
+  }
+  std::size_t rows = 0;
+  for (auto& o : all) {
+    const std::uint32_t p = o.session->Position();
+    const auto n = p - static_cast<std::uint32_t>(first);
+    std::vector<float> feats(std::size_t{n} * width);
+    if (!o.session->CopyDflashTaps(static_cast<std::uint32_t>(first), n, feats,
+                                   &error))
+      throw Fail(error);
+    const auto toks = o.session->Tokens();
+    WriteTokens(o.tokens, toks);
+    {
+      std::ofstream sf(o.sched);
+      for (const auto& [k, keep] : o.steps)
+        sf << k << ' ' << keep << '\n';
+    }
+    std::string bytes;
+    for (std::uint32_t r = 0; r < n; ++r)
+      d::AppendRow(bytes,
+                   std::span<const float>(feats.data() + r * width, width),
+                   toks[static_cast<std::size_t>(first) + r], 0);
+    std::ofstream out(o.out, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!out)
+      throw Fail("write failed on " + o.out);
+    rows += n;
+  }
+  return rows;
+}
+
 std::size_t Serve(q::Model& model, std::size_t width, const std::string& line,
                   std::string& out_path) {
   std::stringstream ss(line);
-  std::string tok, seq, feed;
+  std::string tok, seq, feed, tokens_out, sched_out;
   long first = -1, end = -1;
   while (ss >> tok) {
     const auto eq = tok.find('=');
@@ -73,11 +206,18 @@ std::size_t Serve(q::Model& model, std::size_t width, const std::string& line,
       end = std::stol(v);
     else if (k == "feed")
       feed = v;
+    else if (k == "tokens")
+      tokens_out = v;
+    else if (k == "sched")
+      sched_out = v;
     else
       throw Fail("unknown field '" + k + "'");
   }
   if (out_path.empty() || seq.empty() || feed.empty())
     throw Fail("a request needs out=, seq=, first=, end= and feed=");
+  if (feed.rfind("decode", 0) == 0)
+    return ServeDecode(model, width, out_path, seq, first, feed, tokens_out,
+                       sched_out);
   const auto x = ReadTokens(seq);
   if (first < 0 || end <= first || static_cast<std::size_t>(end) > x.size())
     throw Fail("first/end are outside the sequence");

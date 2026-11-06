@@ -28,6 +28,15 @@ float Out(std::uint32_t layer, std::uint32_t s, std::size_t p, std::size_t c) {
   return static_cast<float>(std::round(v * 4096.0) / 4096.0);
 }
 
+// The fake's mode-dependent arithmetic: exact multiples of 2^-6.
+float Bias(char mode, std::uint32_t n, std::uint32_t j) {
+  if (mode == 'p')
+    return 0.0F;
+  if (mode == 'd')
+    return 1.0F;
+  return 0.5F + 0.015625F * static_cast<float>(n * 8 + j);
+}
+
 struct FakeTrunk {
   // the capture under test; the defaults are the engine's contract
   std::vector<std::uint32_t> taps{d::kDrafterTaps.begin(),
@@ -42,11 +51,27 @@ struct FakeTrunk {
   std::vector<float> ring;
   std::size_t position = 0, calls = 0, narrowest = 1 << 30, widest = 0;
 
+  // verify path: the arithmetic of a row may depend on the mode, the call
+  // width and its offset in the call (Bias); prefill rows are unbiased
+  bool ignore_keep = false;  // breakage: commit every row of a verify call
+  std::size_t verifies = 0, decodes = 0;
+  void Verify(std::span<const std::int32_t> tokens, std::size_t keep) {
+    ++verifies;
+    Write(static_cast<std::uint32_t>(tokens.size()), 'v');
+    position -= tokens.size() - (ignore_keep ? tokens.size() : keep);
+  }
+  void Decode(std::int32_t) {
+    ++decodes;
+    Write(1, 'd');
+  }
   void Forward(std::span<const std::int32_t> tokens) {
     const auto n = static_cast<std::uint32_t>(tokens.size());
     ++calls;
     narrowest = std::min<std::size_t>(narrowest, n);
     widest = std::max<std::size_t>(widest, n);
+    Write(n, 'p');
+  }
+  void Write(std::uint32_t n, char mode) {
     if (ring.empty())
       ring.assign(std::size_t{rows} * kSlots * kHidden, NAN);
     for (std::uint32_t slot = 0; slot < taps.size(); ++slot) {
@@ -58,7 +83,7 @@ struct FakeTrunk {
         for (std::uint32_t s = 0; s < d::kStreams; ++s)
           for (std::uint32_t c = 0; c < kHidden; ++c) {
             const std::uint32_t src = stream0_only ? 0 : s;
-            float v = Out(layer, src, position + j, c);
+            float v = Out(layer, src, position + j, c) + Bias(mode, n, j);
             if (deferred)
               v -= 0.5F * 0.25F;
             res[(std::size_t{j} * d::kStreams + s) * kHidden + c] = v;
@@ -109,6 +134,58 @@ std::string Run(FakeTrunk& tr, const std::vector<std::int32_t>& x,
                 const std::vector<d::Span>& loss, std::size_t width) {
   return d::DumpDflashSequence(tr, x, ws, loss, kSlots, kHidden, width,
                                tr.rows);
+}
+
+// The verify-path contract, computed independently of the walk: every
+// committed position's mode, call width and offset under the schedule.
+std::string ExpectedVerify(const std::vector<std::int32_t>& x,
+                           const std::vector<t::Window>& ws,
+                           const std::vector<d::Span>& loss,
+                           const std::vector<d::Span>& verify,
+                           const std::vector<d::Cycle>& sched) {
+  struct Info {
+    char mode = 'p';
+    std::uint32_t n = 0, j = 0;
+  };
+  std::vector<Info> info(x.size());
+  std::size_t cycle = 0;
+  for (const auto& v : verify)
+    for (std::size_t p = v.begin; p < v.end;) {
+      const auto c = sched[cycle++ % sched.size()];
+      const std::size_t k = std::min<std::size_t>(c.k, x.size() - p);
+      const std::size_t keep = std::min<std::size_t>({c.keep, k, v.end - p});
+      for (std::size_t j = 0; j < keep; ++j)
+        info[p + j] = {k == 1 ? 'd' : 'v', static_cast<std::uint32_t>(k),
+                       static_cast<std::uint32_t>(j)};
+      p += keep;
+    }
+  std::string out;
+  for (const auto& w : ws)
+    for (std::size_t p = w.begin; p < w.end; ++p) {
+      std::vector<float> f;
+      for (auto layer : d::kDrafterTaps)
+        for (std::size_t c = 0; c < kHidden; ++c) {
+          float sum = 0.0F;
+          for (std::uint32_t st = 0; st < d::kStreams; ++st)
+            sum +=
+                Out(layer, st, p, c) + Bias(info[p].mode, info[p].n, info[p].j);
+          f.push_back(sum * 0.25F);
+        }
+      bool m = false;
+      for (const auto& sp : loss)
+        m |= p >= sp.begin && p < sp.end;
+      d::AppendRow(out, f, x[p], m ? 1 : 0);
+    }
+  return out;
+}
+
+std::string RunVerify(FakeTrunk& tr, const std::vector<std::int32_t>& x,
+                      const std::vector<t::Window>& ws,
+                      const std::vector<d::Span>& loss,
+                      const std::vector<d::Span>& verify,
+                      const std::vector<d::Cycle>& sched, std::size_t width) {
+  return d::DumpDflashSequence(tr, x, ws, loss, kSlots, kHidden, width, tr.rows,
+                               verify, sched);
 }
 
 template<class F>
@@ -242,6 +319,70 @@ int main() {
        "a loss span past the sequence is refused");
     ok(Throws([&] { Run(tr, x, {{0, 5}}, loss, 7); }),
        "a window at position 0 is refused (as in MTP mode)");
+  }
+
+  // ---- the verify path (item 2.10): prompt rows prefilled, output rows in
+  // decode cycles of the schedule, committed keep rows at a time
+  {
+    const std::vector<d::Span> vspans{{20, 59}, {150, 229}};
+    const std::vector<d::Cycle> served{{6, 4}, {8, 8}, {1, 1}, {5, 2}, {7, 7}};
+    const auto vwant = ExpectedVerify(x, ws, loss, vspans, served);
+    for (std::uint32_t rows : {16u, 64u, 2056u})
+      for (std::size_t width : {3u, 7u, 16u}) {
+        FakeTrunk tr;
+        tr.rows = rows;
+        ok(RunVerify(tr, x, ws, loss, vspans, served, width) == vwant,
+           "verify rows carry their cycle's mode, width and offset; prompt "
+           "rows stay prefill rows");
+        // the last window's final prompt segment [229, 230) is one position,
+        // widened to two: the trunk ends at 231
+        ok(tr.position == 231 && tr.verifies > 0 && tr.decodes > 0 &&
+               tr.narrowest >= 2,
+           "a one-position prompt segment is widened to two, and the walk used "
+           "verify and decode steps");
+      }
+    FakeTrunk plain;
+    ok(RunVerify(plain, x, ws, loss, {}, {}, 7) == want,
+       "control: without verify spans the walk is the prompt path, unchanged");
+    const std::vector<d::Cycle> fixed{{8, 8}};
+    FakeTrunk f8;
+    ok(RunVerify(f8, x, ws, loss, vspans, fixed, 7) ==
+           ExpectedVerify(x, ws, loss, vspans, fixed),
+       "a fixed 8:8 schedule commits every row of each width-8 call");
+    // negative controls
+    FakeTrunk nk;
+    nk.ignore_keep = true;
+    ok(RunVerify(nk, x, ws, loss, vspans, served, 7) != vwant,
+       "caught: a verify call whose rejected rows are not rolled back");
+    std::vector<d::Cycle> rotated(served.begin() + 1, served.end());
+    rotated.push_back(served.front());
+    FakeTrunk r1;
+    ok(RunVerify(r1, x, ws, loss, vspans, served, 7) !=
+           ExpectedVerify(x, ws, loss, vspans, rotated),
+       "caught: the schedule consumed one cycle off");
+    FakeTrunk r2;
+    ok(RunVerify(r2, x, ws, loss, vspans, served, 7) != want,
+       "caught: output rows fed through the prompt path");
+    std::vector<d::Span> shifted{{21, 59}, {151, 229}};
+    FakeTrunk r3;
+    ok(RunVerify(r3, x, ws, loss, vspans, served, 7) !=
+           ExpectedVerify(x, ws, loss, shifted, served),
+       "caught: verify spans one position off");
+    FakeTrunk r4;
+    ok(Throws([&] {
+         RunVerify(r4, x, ws, loss, vspans, std::vector<d::Cycle>{{9, 9}}, 7);
+       }),
+       "a cycle wider than the drafter's block (8) is refused");
+    ok(Throws([&] {
+         RunVerify(r4, x, ws, loss, vspans, std::vector<d::Cycle>{{4, 5}}, 7);
+       }),
+       "a cycle keeping more rows than it forwarded is refused");
+    ok(Throws([&] { RunVerify(r4, x, ws, loss, vspans, {}, 7); }),
+       "verify spans without a schedule are refused");
+    ok(Throws([&] {
+         RunVerify(r4, x, ws, loss, {{20, 59}, {60, 229}}, served, 7);
+       }),
+       "a one-position prompt segment before a verify span is refused");
   }
 
   std::printf("dflash_rows_test: %d checks passed\n", checks);
