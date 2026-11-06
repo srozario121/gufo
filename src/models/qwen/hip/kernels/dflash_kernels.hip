@@ -140,7 +140,48 @@ __global__ void dflash_noncausal_attention_wave_kernel(
                  wave = threadIdx.x >> 5U, waves = blockDim.x >> 5U;
   extern __shared__ float scores[];
   __shared__ float reduce[QueryHeads][256];
-  for (uint32_t local = wave; local < history_count; local += waves) {
+  // A wave scores kKeys history keys at a time: their row loads are issued
+  // together so the latency overlaps, then each key keeps its own lane
+  // partials, FMA expression and xor reduction exactly as when scored alone.
+  constexpr uint32_t kKeys = 4;
+  const bool one_vec_per_lane = num_vec == 32U;
+  uint32_t local = wave;
+  for (; one_vec_per_lane && local + (kKeys - 1U) * waves < history_count;
+       local += kKeys * waves) {
+    float4 kv[kKeys];
+#pragma unroll
+    for (unsigned j = 0; j < kKeys; ++j) {
+      const uint32_t position = history_start + local + j * waves;
+      kv[j] = reinterpret_cast<const float4*>(
+          injected_k + uint64_t(position % history_capacity) * kv_dim +
+          uint64_t(kv_h) * head_dim)[lane];
+    }
+#pragma unroll
+    for (unsigned j = 0; j < kKeys; ++j) {
+      const uint32_t key_local = local + j * waves;
+      const uint32_t position = history_start + key_local;
+      float dot[QueryHeads] = {};
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g) {
+        const float4 qv = q_vec[g * num_vec + lane];
+        dot[g] += (qv.x * kv[j].x) + (qv.y * kv[j].y) + (qv.z * kv[j].z) +
+                  (qv.w * kv[j].w);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g)
+          dot[g] += __shfl_xor(dot[g], offset);
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g)
+          scores[g * total_k + key_local] =
+              query_position - position < sliding_window ? dot[g] * scale
+                                                         : -1e20F;
+      }
+    }
+  }
+  for (; local < history_count; local += waves) {
     const uint32_t position = history_start + local;
     const float4* key = reinterpret_cast<const float4*>(
         injected_k + uint64_t(position % history_capacity) * kv_dim +
