@@ -12,6 +12,7 @@ let
     "tests/models/qwen38_flash_next/dump_hidden.cpp"
     "tests/models/qwen38_flash_next/dump_rows.hpp"
     "tests/models/qwen38_flash_next/dflash_rows.hpp"
+    "tests/models/qwen38_flash_next/dflash_tap_parity.cpp"
   ];
   production = gufo.src;
 in
@@ -29,15 +30,21 @@ gufo.overrideAttrs (old: {
     name = "gufo-dump-hidden-source";
   };
   cmakeFlags = old.cmakeFlags ++ [ "-DGUFO_BUILD_DUMP_HIDDEN=ON" ];
-  ninjaFlags = [ "gufo_dump_hidden" ];
+  ninjaFlags = [
+    "gufo_dump_hidden"
+    "gufo_dflash_tap_parity"
+  ];
   doInstallCheck = false;
   installPhase = ''
     runHook preInstall
     install -Dm755 gufo_dump_hidden $out/bin/gufo_dump_hidden
+    install -Dm755 gufo_dflash_tap_parity $out/bin/gufo_dflash_tap_parity
     runHook postInstall
   '';
   postFixup = ''
-    wrapProgram "$out/bin/gufo_dump_hidden" \
-      --prefix LD_LIBRARY_PATH : "${old.passthru.rocmRuntime}/lib"
+    for p in gufo_dump_hidden gufo_dflash_tap_parity; do
+      wrapProgram "$out/bin/$p" \
+        --prefix LD_LIBRARY_PATH : "${old.passthru.rocmRuntime}/lib"
+    done
   '';
 })

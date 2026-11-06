@@ -561,6 +561,41 @@ std::uint32_t Session::ContextSize() const noexcept {
   return session_->max_context();
 }
 
+bool Session::CopyDflashTaps(std::uint32_t first, std::uint32_t n,
+                             std::span<float> out,
+                             std::string* error_msg) const {
+  const rocm::Executor& exec = *model_->executor_;
+  const std::uint32_t rows = exec.dflash_ring_rows();
+  const std::size_t width =
+      std::size_t{exec.dflash_taps()} * exec.config().hidden_size;
+  const float* ring = session_->dflash_ring();
+  const std::uint32_t position = session_->position();
+  // The ring holds positions [position - rows, position) at row p % rows.
+  if (ring == nullptr || rows == 0 || n == 0 ||
+      std::uint64_t{first} + n > position || position - first > rows ||
+      out.size() != std::size_t{n} * width) {
+    AssignError(error_msg, "DFlash-2 tap rows are outside the capture ring");
+    return false;
+  }
+  if (hipStreamSynchronize(exec.stream()) != hipSuccess) {
+    AssignError(error_msg, "DFlash-2 tap rows: stream synchronize failed");
+    return false;
+  }
+  for (std::uint32_t done = 0; done < n;) {
+    const std::uint32_t row = (first + done) % rows;
+    const std::uint32_t count = std::min(n - done, rows - row);
+    if (hipMemcpy(out.data() + std::size_t{done} * width,
+                  ring + std::size_t{row} * width,
+                  std::size_t{count} * width * sizeof(float),
+                  hipMemcpyDeviceToHost) != hipSuccess) {
+      AssignError(error_msg, "DFlash-2 tap rows: download failed");
+      return false;
+    }
+    done += count;
+  }
+  return true;
+}
+
 void Session::Reset() {
   ResetImpl(false);
 }

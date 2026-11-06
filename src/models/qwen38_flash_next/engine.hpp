@@ -297,6 +297,14 @@ public:
   }
   [[nodiscard]] std::uint32_t Position() const noexcept;
   [[nodiscard]] std::uint32_t ContextSize() const noexcept;
+  /// Diagnostic only (DFlash-2 tap parity, gufo-mtp todo 2.4 T3): copies the
+  /// capture ring's rows of positions [first, first + n), each the drafter's
+  /// [taps][hidden] float features, as the drafter reads them. Fails without
+  /// a drafter, for positions not yet forwarded, or for rows the ring no
+  /// longer holds. Serving never calls it; it does not change any state.
+  [[nodiscard]] bool CopyDflashTaps(std::uint32_t first, std::uint32_t n,
+                                    std::span<float> out,
+                                    std::string* error_msg = nullptr) const;
   [[nodiscard]] std::span<const std::int32_t> Tokens() const noexcept {
     return valid_ ? std::span<const std::int32_t>(tokens_)
                   : std::span<const std::int32_t>{};

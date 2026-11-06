@@ -472,6 +472,9 @@ option(GUFO_BUILD_DUMP_HIDDEN "Build the MTP draft-head training-data dump tool"
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_DUMP_HIDDEN)
   add_executable(gufo_dump_hidden tests/models/qwen38_flash_next/dump_hidden.cpp)
   target_link_libraries(gufo_dump_hidden PRIVATE gufo_qwen38_flash_next)
+  # DFlash-2 tap parity probe (todo 2.4 T3): the engine's own capture in the tool's row layout.
+  add_executable(gufo_dflash_tap_parity tests/models/qwen38_flash_next/dflash_tap_parity.cpp)
+  target_link_libraries(gufo_dflash_tap_parity PRIVATE gufo_qwen38_flash_next)
 endif()
 
 # CPU reference of the MTP draft block over dumped rows (G2's parity comparator); no GPU. .devops/nix/ref-mtp.nix builds it.
