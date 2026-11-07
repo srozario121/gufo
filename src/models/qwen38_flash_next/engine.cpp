@@ -1714,8 +1714,11 @@ void Session::DflashFinish(PendingDecode& pending, const DflashBlock& block,
       break;
     // As an MTP chain, the block ends after its first proposal below the
     // gate: the cut depends only on the drafter's own values.
+    // The drafter's own calibrated gates, when its GGUF carries them.
+    const auto& df_cfg = dflash_->GetModel().GetDFlashConfig();
     const float gate =
-        sampled ? kDflashSampledGateProbability : kDflashGateProbability;
+        sampled ? df_cfg.gate_sampled.value_or(kDflashSampledGateProbability)
+                : df_cfg.gate_greedy.value_or(kDflashGateProbability);
     const float confidence = sampled ? pending.proposals.back().probability
                              : i < proposal.confidences.size()
                                  ? proposal.confidences[i]

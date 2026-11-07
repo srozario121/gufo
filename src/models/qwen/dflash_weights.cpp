@@ -249,6 +249,14 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
   df_cfg.sliding_window = *sliding_window;
   df_cfg.mask_token_id = *mask_token_id;
   df_cfg.num_layers = config.num_layers;
+  df_cfg.gate_greedy = reader.GetMetadataFloat32(prefix + "gate.greedy");
+  df_cfg.gate_sampled = reader.GetMetadataFloat32(prefix + "gate.sampled");
+  for (const auto& gate : {df_cfg.gate_greedy, df_cfg.gate_sampled}) {
+    if (gate && !(*gate >= 0.0F && *gate <= 1.0F)) {
+      SetError(error_msg, "DFlash-2 GGUF gate metadata must lie in [0, 1]");
+      return std::nullopt;
+    }
+  }
 
   if (df_cfg.block_size < 2 || df_cfg.conv_kernel_size == 0 ||
       df_cfg.conv_group_size == 0 ||

@@ -38,6 +38,13 @@ struct QwenDFlashConfig {
 
   /// Number of transformer blocks in the draft model.
   std::uint32_t num_layers{0};
+
+  /// The drafter's own confidence gates (`dflash.gate.greedy`,
+  /// `dflash.gate.sampled`): a block ends after its first proposal below
+  /// them. An artifact calibrated on its own drafts carries them; absent,
+  /// the engine's defaults apply.
+  std::optional<float> gate_greedy;
+  std::optional<float> gate_sampled;
 };
 
 /// DFlash-2 transformer weights plus the layer-local dynamic convolutions.
