@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## MTP at one request under `--sessions 4` (November 8, 2026)
+
+Served configuration G with the MTP head (`--draft-tokens 7`) at C1, development turns, d432612b.
+
+| Experiment | Outcome |
+| --- | --- |
+| Seeded sampled drafts priced as one session | Rejected. The C1 gap between `--sessions 4` and `--sessions 1` (0.951× in an earlier ABBA headbench run, 3 of 20 outputs identical, not 20) is the documented draft policy. A seeded sampled request prices its draft length at the configured session count, so at `--sessions 4` it uses the C4 full-head cost curve (one draft costs 1.40 cycles) instead of the C1 smaller-head curve (1.23). It drafts less and falls back to plain decoding more often. Reported tokens per round are higher at `--sessions 4` (3.12 against 2.92) only because zero-draft cycles are not counted as rounds: they make 6.1% of its tokens against 0.3%. The decode path itself does not change. Greedy and unseeded requests price at the live occupancy, so they draft the same at both session counts. In s1/s4/s4/s1 legs, 8 greedy turns had identical drafts, and 9 of 12 seeded turns drafted alike. Profiling the 19.6K-token turn twice at each count: identical drafts, the same 32,762 decode GEMV launches, and 3,044.8 against 3,030.3 ms of GEMV time. Deep turns 1 and 3 (15K and 19.6K tokens), best of three per leg pair: 1,930 against 1,943 ms and 1,951 against 1,946 ms. One earlier run of turn 3 was 14% slower at `--sessions 4` in both legs, after three other turns ran first; it did not reproduce on its own. Pricing seeded requests as one session reproduced the `--sessions 1` draft counts on all 12 seeded turns at `--sessions 4`. It drafted 10-13% more at C4, though, and C4 sum of rates fell from 127.8 and 118.5 to 118.9 and 114.8 tok/s (order A F F A, 16 seeded turns). Seeded replay would also stop depending on the configured count. The managed engine's requests are unseeded, so they do not have this gap. |
+
 ## DFlash-2 drafter attention (November 8, 2026)
 
 Served configuration at C1, fine-tuned Q8_0 DFlash-2 drafter (32 query heads, 8 KV heads, head dimension 128, 2,048-token window, 8-token blocks), eight development turns.
