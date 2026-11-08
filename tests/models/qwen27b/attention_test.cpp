@@ -33,7 +33,7 @@ float Sample(std::size_t index, std::size_t salt) {
   return std::sin(static_cast<float>((index * 7U) + (salt * 13U) + 1U)) * 0.5F;
 }
 
-enum class Route { kScalar, kWave };
+enum class Route { kScalar, kPairs };
 
 // Independent equations from z-lab/dflash model_mlx.py, pinned in eval/README.
 // Keep these small operator checks with the ring/attention checks.
@@ -490,11 +490,20 @@ float MaxRouteDifference(Route route, std::uint32_t current_pos,
       d_q, d_injected_k, d_injected_v, d_block_k, d_block_v, d_scalar_out,
       current_pos, history_length, block_count, kSlidingWindow, kNumQueryHeads,
       kNumKvHeads, kHeadDim, scale, nullptr, current_pos + block_count);
-  if (route == Route::kWave) {
-    gufo::hip::kernels::LaunchDFlashNonCausalAttentionWave(
+  if (route == Route::kPairs) {
+    // The production scratch size for the widest block.
+    const std::size_t score_elements =
+        gufo::hip::kernels::DFlashAttentionScratchElements(
+            kBlockCount, kNumQueryHeads, kNumKvHeads, kSlidingWindow);
+    float* d_scores = nullptr;
+    HIP_CHECK(hipMalloc(&d_scores, score_elements * sizeof(float)));
+    gufo::hip::kernels::LaunchDFlashNonCausalAttentionPairs(
         d_q, d_ring_k, d_ring_v, d_block_k, d_block_v, d_wave_out, current_pos,
         history_length, block_count, kSlidingWindow, kNumQueryHeads,
-        kNumKvHeads, kHeadDim, scale, nullptr, kSlidingWindow);
+        kNumKvHeads, kHeadDim, scale, nullptr, kSlidingWindow, d_scores,
+        score_elements);
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipFree(d_scores));
   }
   if (route == Route::kScalar) {
     gufo::hip::kernels::LaunchDFlashNonCausalAttentionScalar(
@@ -580,7 +589,7 @@ void TestRouteEquivalence(std::uint32_t current_pos,
   gufo::test::Expect(MaxRouteDifference(Route::kScalar, current_pos,
                                         history_length, block_count) == 0.0F,
                      "ring addressing must preserve scalar attention exactly");
-  const float wave = MaxRouteDifference(Route::kWave, current_pos,
+  const float wave = MaxRouteDifference(Route::kPairs, current_pos,
                                         history_length, block_count);
   std::cout << "DFlash non-causal attention " << label
             << ": max |scalar - wave| = " << wave << "\n";

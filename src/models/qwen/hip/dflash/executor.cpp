@@ -301,6 +301,10 @@ void QwenDFlashGpuExecutor::Allocate() {
   allocate_scratch(d_dynamic_coefficients_, block_size * dynamic_size);
   allocate_scratch(d_q_, block_size * q_dim);
   allocate_scratch(d_attn_out_, block_size * q_dim);
+  attention_scores_elements_ = kernels::DFlashAttentionScratchElements(
+      static_cast<std::uint32_t>(block_size), cfg.num_attention_heads,
+      cfg.num_key_value_heads, history_capacity_);
+  allocate_scratch(d_attention_scores_, attention_scores_elements_);
   const auto selector_scratch_elements =
       kernels::DFlashSelectorScratchElements(model_->GetHeadRows());
   const auto ffn_scratch_width =
@@ -540,6 +544,8 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     (void)hipFree(d_v_block_);
   if (d_attn_out_ != nullptr)
     (void)hipFree(d_attn_out_);
+  if (d_attention_scores_ != nullptr)
+    (void)hipFree(d_attention_scores_);
   if (d_ffn_gate_ != nullptr)
     (void)hipFree(d_ffn_gate_);
   if (d_ffn_up_ != nullptr)
@@ -617,12 +623,16 @@ QwenGpuMemoryUsage QwenDFlashGpuExecutor::EstimateMemoryUsage(
       block * (3U * hidden + dynamic + 2U * config.AttentionSize() +
                2U * ffn_scratch_width + config.vocab_size +
                draft.selector_rank + 2U * draft.selector_top_k + 3U);
+  const std::size_t attention_scores = kernels::DFlashAttentionScratchElements(
+      draft.block_size, config.num_attention_heads, config.num_key_value_heads,
+      std::min(max_context, draft.sliding_window));
   QwenGpuMemoryUsage usage{
       .request_state_bytes = 2U * draft.num_layers *
                              static_cast<std::size_t>(
                                  std::min(max_context, draft.sliding_window)) *
                              kv * sizeof(float),
-      .temporary_scratch_bytes = scratch_elements * sizeof(float),
+      .temporary_scratch_bytes =
+          (scratch_elements + attention_scores) * sizeof(float),
   };
   if (block > kDFlashMaxSharedBatch)
     usage.temporary_scratch_bytes +=
@@ -1173,8 +1183,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
         block_count, df_cfg.sliding_window,
         static_cast<std::uint32_t>(num_q_heads),
         static_cast<std::uint32_t>(num_kv_heads),
-        static_cast<std::uint32_t>(head_dim), scale, stream_,
-        history_capacity_);
+        static_cast<std::uint32_t>(head_dim), scale, stream_, history_capacity_,
+        d_attention_scores_, attention_scores_elements_);
     emit("attention", d_attn_out_, q_dim);
 
     RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,

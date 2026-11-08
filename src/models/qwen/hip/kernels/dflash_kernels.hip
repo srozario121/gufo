@@ -109,231 +109,329 @@ __global__ void dflash_silu_mul_kernel(float* __restrict__ gate,
   gate[idx] = silu_g * up[idx];
 }
 
-// Coalesced QK loads and shared K/V reads for adjacent query heads. Each
-// head retains its original dot-product and 256-thread softmax reduction.
-template<uint32_t QueryHeads>
-__global__ void dflash_noncausal_attention_wave_kernel(
-    const float* __restrict__ q, const float* __restrict__ injected_k,
-    const float* __restrict__ injected_v, const float* __restrict__ block_k,
-    const float* __restrict__ block_v, float* __restrict__ out,
-    uint32_t current_pos, uint32_t history_length, uint32_t block_count,
-    uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
-    uint32_t head_dim, float scale, uint32_t history_capacity) {
-  constexpr uint32_t kPrefetch = 32;
-  const uint32_t tok = blockIdx.x, h = blockIdx.y * QueryHeads;
-  if (tok >= block_count || h + QueryHeads > num_q_heads)
-    return;
-  const uint32_t kv_h = h / (num_q_heads / num_kv_heads),
+// Non-causal draft attention in three passes over one KV head's 32
+// (draft token, query head) pairs, so every K and V row is read once instead
+// of once per workgroup of a token and two query heads, sixteen times per KV
+// head. Each pair keeps the arithmetic of that former kernel bit for bit: the
+// same per-lane QK expression and offset-16..1 xor sum, the same 256-thread
+// max and sum trees, and the same ascending FMA sequence over the values.
+// Scores live in a [kv head][pair chunk][key][32 pairs] scratch between the
+// passes.
+constexpr uint32_t kAttentionPairs = 32;
+constexpr uint32_t kAttentionScoreKeys = 64;
+constexpr uint32_t kAttentionSoftmaxPairs = 8;
+constexpr uint32_t kAttentionValuePairs = 4;
+constexpr uint32_t kAttentionValueKeys = 128;
+constexpr uint32_t kAttentionThreads = 256;
+
+__device__ __forceinline__ uint32_t AttentionPairChunks(uint32_t block_count,
+                                                        uint32_t group) {
+  return (block_count * group + kAttentionPairs - 1U) / kAttentionPairs;
+}
+
+// One step of the transposed xor sum: lanes with bit `Width` set keep the upper
+// half of the live pairs, and each kept pair adds its partner lane's partial.
+template <uint32_t Width>
+__device__ __forceinline__ void HalvePairSums(float (&dot)[kAttentionPairs],
+                                              uint32_t lane) {
+  const bool upper = (lane & Width) != 0U;
+#pragma unroll
+  for (uint32_t g = 0; g < Width; ++g) {
+    const float keep = upper ? dot[g + Width] : dot[g];
+    const float send = upper ? dot[g] : dot[g + Width];
+    dot[g] = keep + __shfl_xor(send, static_cast<int>(Width));
+  }
+}
+
+// One wave per key: lane i holds the QK partial of dimensions 4i..4i+3 for all
+// 32 pairs. Halving the pair set at each xor offset leaves lane i with pair
+// i's sum, the value every lane of the per-pair xor butterfly converges to.
+__global__ void __launch_bounds__(kAttentionThreads)
+    dflash_attention_scores_kernel(
+        const float* __restrict__ q, const float* __restrict__ injected_k,
+        const float* __restrict__ block_k, float* __restrict__ scores,
+        uint32_t current_pos, uint32_t history_start, uint32_t history_count,
+        uint32_t block_count, uint32_t sliding_window, uint32_t num_q_heads,
+        uint32_t num_kv_heads, uint32_t head_dim, float scale,
+        uint32_t history_capacity) {
+  // KV heads vary fastest across workgroups, so the resident ones read whole
+  // K rows of the same keys together.
+  const uint32_t kv_h = blockIdx.x, keys = blockIdx.y, chunk = blockIdx.z;
+  const uint32_t group = num_q_heads / num_kv_heads,
+                 pairs = block_count * group,
+                 total_k = history_count + block_count,
                  q_dim = num_q_heads * head_dim,
-                 kv_dim = num_kv_heads * head_dim;
-  const uint32_t query_position = current_pos + tok;
-  const uint32_t history_start = current_pos + 1U > sliding_window
-                                     ? current_pos + 1U - sliding_window
-                                     : 0U;
-  const uint32_t history_count = history_length > history_start
-                                     ? history_length - history_start
-                                     : 0U,
-                 total_k = history_count + block_count;
-  const float4* q_vec = reinterpret_cast<const float4*>(
-      q + uint64_t(tok) * q_dim + uint64_t(h) * head_dim);
-  const uint32_t num_vec = head_dim / 4U, lane = threadIdx.x & 31U,
-                 wave = threadIdx.x >> 5U, waves = blockDim.x >> 5U;
-  extern __shared__ float scores[];
-  __shared__ float reduce[QueryHeads][256];
-  // A wave scores kKeys history keys at a time: their row loads are issued
-  // together so the latency overlaps, then each key keeps its own lane
-  // partials, FMA expression and xor reduction exactly as when scored alone.
-  constexpr uint32_t kKeys = 4;
-  const bool one_vec_per_lane = num_vec == 32U;
-  uint32_t local = wave;
-  for (; one_vec_per_lane && local + (kKeys - 1U) * waves < history_count;
-       local += kKeys * waves) {
-    float4 kv[kKeys];
-#pragma unroll
-    for (unsigned j = 0; j < kKeys; ++j) {
-      const uint32_t position = history_start + local + j * waves;
-      kv[j] = reinterpret_cast<const float4*>(
-          injected_k + uint64_t(position % history_capacity) * kv_dim +
-          uint64_t(kv_h) * head_dim)[lane];
+                 kv_dim = num_kv_heads * head_dim, num_vec = head_dim / 4U;
+  const uint32_t lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+  __shared__ float4 query[kAttentionPairs][32];
+  for (uint32_t index = threadIdx.x; index < kAttentionPairs * 32U;
+       index += kAttentionThreads) {
+    const uint32_t pair = chunk * kAttentionPairs + index / 32U,
+                   vec = index % 32U;
+    float4 value = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+    if (pair < pairs && vec < num_vec) {
+      const uint32_t tok = pair / group, h = kv_h * group + pair % group;
+      value = reinterpret_cast<const float4*>(
+          q + uint64_t(tok) * q_dim + uint64_t(h) * head_dim)[vec];
     }
-#pragma unroll
-    for (unsigned j = 0; j < kKeys; ++j) {
-      const uint32_t key_local = local + j * waves;
-      const uint32_t position = history_start + key_local;
-      float dot[QueryHeads] = {};
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g) {
-        const float4 qv = q_vec[g * num_vec + lane];
-        dot[g] += (qv.x * kv[j].x) + (qv.y * kv[j].y) + (qv.z * kv[j].z) +
-                  (qv.w * kv[j].w);
-      }
-      for (int offset = 16; offset > 0; offset >>= 1) {
-#pragma unroll
-        for (unsigned g = 0; g < QueryHeads; ++g)
-          dot[g] += __shfl_xor(dot[g], offset);
-      }
-      if (lane == 0) {
-#pragma unroll
-        for (unsigned g = 0; g < QueryHeads; ++g)
-          scores[g * total_k + key_local] =
-              query_position - position < sliding_window ? dot[g] * scale
-                                                         : -1e20F;
-      }
-    }
-  }
-  for (; local < history_count; local += waves) {
-    const uint32_t position = history_start + local;
-    const float4* key = reinterpret_cast<const float4*>(
-        injected_k + uint64_t(position % history_capacity) * kv_dim +
-        uint64_t(kv_h) * head_dim);
-    float dot[QueryHeads] = {};
-    for (uint32_t d = lane; d < num_vec; d += 32U) {
-      const float4 kv = key[d];
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g) {
-        const float4 qv = q_vec[g * num_vec + d];
-        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
-      }
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        dot[g] += __shfl_xor(dot[g], offset);
-    }
-    if (lane == 0) {
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        scores[g * total_k + local] = query_position - position < sliding_window
-                                          ? dot[g] * scale
-                                          : -1e20F;
-    }
-  }
-  for (uint32_t p = wave; p < block_count; p += waves) {
-    const float4* key = reinterpret_cast<const float4*>(
-        block_k + uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim);
-    float dot[QueryHeads] = {};
-    for (uint32_t d = lane; d < num_vec; d += 32U) {
-      const float4 kv = key[d];
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g) {
-        const float4 qv = q_vec[g * num_vec + d];
-        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
-      }
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        dot[g] += __shfl_xor(dot[g], offset);
-    }
-    if (lane == 0) {
-      const uint32_t key_position = current_pos + p;
-      const uint32_t distance = query_position > key_position
-                                    ? query_position - key_position
-                                    : key_position - query_position;
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        scores[g * total_k + history_count + p] =
-            distance < sliding_window ? dot[g] * scale : -1e20F;
-    }
+    query[index / 32U][vec] = value;
   }
   __syncthreads();
-  float maxima[QueryHeads];
+  float4 qv[kAttentionPairs];
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
+  for (uint32_t pair = 0; pair < kAttentionPairs; ++pair)
+    qv[pair] = query[pair][lane];
+
+  const uint32_t pair = chunk * kAttentionPairs + lane;
+  const uint32_t query_position = current_pos + pair / group;
+  float* pair_scores =
+      scores +
+      (uint64_t(kv_h) * AttentionPairChunks(block_count, group) + chunk) *
+          total_k * kAttentionPairs;
+  constexpr uint32_t kWaves = kAttentionThreads / 32U;
+  constexpr uint32_t kKeys = kAttentionScoreKeys / kWaves;
+  // Issue the wave's key rows together, then score them one at a time.
+  float4 rows[kKeys];
+#pragma unroll
+  for (uint32_t j = 0; j < kKeys; ++j) {
+    const uint32_t local = keys * kAttentionScoreKeys + wave + j * kWaves;
+    rows[j] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+    if (local < total_k && lane < num_vec) {
+      const uint32_t position = history_start + local;
+      rows[j] = reinterpret_cast<const float4*>(
+          local < history_count
+              ? injected_k + uint64_t(position % history_capacity) * kv_dim +
+                    uint64_t(kv_h) * head_dim
+              : block_k + uint64_t(local - history_count) * kv_dim +
+                    uint64_t(kv_h) * head_dim)[lane];
+    }
+  }
+#pragma unroll
+  for (uint32_t j = 0; j < kKeys; ++j) {
+    const uint32_t local = keys * kAttentionScoreKeys + wave + j * kWaves;
+    if (local >= total_k)
+      break;
+    const float4 kv = rows[j];
+    float dot[kAttentionPairs] = {};
+    if (lane < num_vec) {
+#pragma unroll
+      for (unsigned g = 0; g < kAttentionPairs; ++g) {
+        dot[g] += (qv[g].x * kv.x) + (qv[g].y * kv.y) + (qv[g].z * kv.z) +
+                  (qv[g].w * kv.w);
+      }
+    }
+    HalvePairSums<16>(dot, lane);
+    HalvePairSums<8>(dot, lane);
+    HalvePairSums<4>(dot, lane);
+    HalvePairSums<2>(dot, lane);
+    HalvePairSums<1>(dot, lane);
+    if (pair < pairs) {
+      const uint32_t position = history_start + local;
+      bool visible;
+      if (local < history_count) {
+        visible = query_position - position < sliding_window;
+      } else {
+        const uint32_t key_position = current_pos + (local - history_count);
+        const uint32_t distance = query_position > key_position
+                                      ? query_position - key_position
+                                      : key_position - query_position;
+        visible = distance < sliding_window;
+      }
+      pair_scores[uint64_t(local) * kAttentionPairs + lane] =
+          visible ? dot[0] * scale : -1e20F;
+    }
+  }
+}
+
+// Turns eight pairs' scores into probabilities with the former kernel's
+// thread-strided partials and halving trees.
+__global__ void __launch_bounds__(kAttentionThreads)
+    dflash_attention_softmax_kernel(float* __restrict__ scores,
+                                    uint32_t history_count,
+                                    uint32_t block_count, uint32_t group) {
+  const uint32_t kv_h = blockIdx.y, chunk = blockIdx.z,
+                 total_k = history_count + block_count;
+  float* base =
+      scores +
+      (uint64_t(kv_h) * AttentionPairChunks(block_count, group) + chunk) *
+          total_k * kAttentionPairs +
+      blockIdx.x * kAttentionSoftmaxPairs;
+  constexpr uint32_t kPairs = kAttentionSoftmaxPairs;
+  __shared__ float reduce[kPairs][kAttentionThreads];
+  float maxima[kPairs];
+#pragma unroll
+  for (unsigned g = 0; g < kPairs; ++g)
     maxima[g] = -1e20F;
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g)
-      maxima[g] = fmaxf(maxima[g], scores[g * total_k + p]);
+    for (unsigned g = 0; g < kPairs; ++g)
+      maxima[g] = fmaxf(maxima[g], base[uint64_t(p) * kAttentionPairs + g]);
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
+  for (unsigned g = 0; g < kPairs; ++g)
     reduce[g][threadIdx.x] = maxima[g];
   __syncthreads();
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
+      for (unsigned g = 0; g < kPairs; ++g)
         reduce[g][threadIdx.x] =
             fmaxf(reduce[g][threadIdx.x], reduce[g][threadIdx.x + stride]);
     }
     __syncthreads();
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
+  for (unsigned g = 0; g < kPairs; ++g)
     maxima[g] = reduce[g][0];
   __syncthreads();
-  float sums[QueryHeads] = {};
+  float sums[kPairs] = {};
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g) {
-      const float e = expf(scores[g * total_k + p] - maxima[g]);
-      scores[g * total_k + p] = e;
+    for (unsigned g = 0; g < kPairs; ++g) {
+      const float e =
+          expf(base[uint64_t(p) * kAttentionPairs + g] - maxima[g]);
+      base[uint64_t(p) * kAttentionPairs + g] = e;
       sums[g] += e;
     }
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
+  for (unsigned g = 0; g < kPairs; ++g)
     reduce[g][threadIdx.x] = sums[g];
   __syncthreads();
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
+      for (unsigned g = 0; g < kPairs; ++g)
         reduce[g][threadIdx.x] += reduce[g][threadIdx.x + stride];
     }
     __syncthreads();
   }
 #pragma unroll
-  for (unsigned g = 0; g < QueryHeads; ++g)
+  for (unsigned g = 0; g < kPairs; ++g)
     sums[g] = 1.f / (reduce[g][0] + 1e-9F);
-  __syncthreads();
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
 #pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g)
-      scores[g * total_k + p] *= sums[g];
+    for (unsigned g = 0; g < kPairs; ++g)
+      base[uint64_t(p) * kAttentionPairs + g] *= sums[g];
   }
-  __syncthreads();
-  for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-    float acc[QueryHeads] = {};
-    uint32_t slot = history_count > 0 ? history_start % history_capacity : 0;
-    // Issue independent value loads together, then retain the original
-    // ascending-key FMA sequence. Advancing the ring slot avoids a division
-    // for every value without changing the persistent KV layout.
-    uint32_t local = 0;
-    for (; history_count - local >= kPrefetch; local += kPrefetch) {
-      float values[kPrefetch];
+}
+
+// Lane d of wave w accumulates pairs 4w..4w+3 of a 32-dimension slice, each
+// in its ascending FMA chain. The workgroup stages a tile of V rows and
+// probabilities in LDS, loading the next tile while it accumulates this one.
+__global__ void __launch_bounds__(kAttentionThreads)
+    dflash_attention_values_kernel(
+        const float* __restrict__ scores, const float* __restrict__ injected_v,
+        const float* __restrict__ block_v, float* __restrict__ out,
+        uint32_t history_start, uint32_t history_count, uint32_t block_count,
+        uint32_t num_q_heads, uint32_t num_kv_heads, uint32_t head_dim,
+        uint32_t history_capacity) {
+  constexpr uint32_t kTile = kAttentionValueKeys;
+  constexpr uint32_t kRowVectors = 8;  // 32 floats per key
+  constexpr uint32_t kLoads = kTile * kRowVectors / kAttentionThreads;
+  const uint32_t kv_h = blockIdx.y, chunk = blockIdx.z;
+  const uint32_t first_pair = (threadIdx.x >> 5U) * kAttentionValuePairs;
+  const uint32_t group = num_q_heads / num_kv_heads,
+                 pairs = block_count * group,
+                 total_k = history_count + block_count,
+                 q_dim = num_q_heads * head_dim,
+                 kv_dim = num_kv_heads * head_dim;
+  const uint32_t lane = threadIdx.x & 31U;
+  const uint32_t slice = blockIdx.x * 32U, d = slice + lane;
+  const float4* weights = reinterpret_cast<const float4*>(
+      scores +
+      (uint64_t(kv_h) * AttentionPairChunks(block_count, group) + chunk) *
+          total_k * kAttentionPairs);
+  __shared__ float4 tile_values[kTile][kRowVectors];
+  __shared__ float4 tile_weights[kTile][kRowVectors];
+  // Two register stages keep the next two tiles' loads in flight. Loads are
+  // unconditional, with addresses clamped into the operands, so the compiler
+  // waits only for the older stage; clamped keys are never accumulated and
+  // clamped dimensions never stored.
+  static_assert(kLoads == 4U, "a stage holds four rows per thread");
+  struct Stage {
+    float4 v0, v1, v2, v3, w0, w1, w2, w3;
+  };
+  const auto fetch = [&](uint32_t first, uint32_t i, float4& value,
+                         float4& weight) {
+    const uint32_t index = threadIdx.x + i * kAttentionThreads;
+    const uint32_t wanted = first + index / kRowVectors,
+                   vec = index % kRowVectors;
+    const uint32_t key = wanted < total_k ? wanted : total_k - 1U;
+    const uint32_t dim = slice + vec * 4U;
+    const float* row =
+        key < history_count
+            ? injected_v +
+                  uint64_t((history_start + key) % history_capacity) * kv_dim
+            : block_v + uint64_t(key - history_count) * kv_dim;
+    value = *reinterpret_cast<const float4*>(
+        row + uint64_t(kv_h) * head_dim + (dim < head_dim ? dim : 0U));
+    weight = weights[uint64_t(key) * kRowVectors + vec];
+  };
+  const auto load = [&](uint32_t first) {
+    Stage stage;
+    fetch(first, 0, stage.v0, stage.w0);
+    fetch(first, 1, stage.v1, stage.w1);
+    fetch(first, 2, stage.v2, stage.w2);
+    fetch(first, 3, stage.v3, stage.w3);
+    return stage;
+  };
+  const auto put = [&](uint32_t i, const float4& value, const float4& weight) {
+    const uint32_t index = threadIdx.x + i * kAttentionThreads;
+    tile_values[index / kRowVectors][index % kRowVectors] = value;
+    tile_weights[index / kRowVectors][index % kRowVectors] = weight;
+  };
+  const float* lds_values = reinterpret_cast<const float*>(tile_values);
+  const float* lds_weights =
+      reinterpret_cast<const float*>(tile_weights) + first_pair;
+  float acc[kAttentionValuePairs] = {};
+  const auto stage_tile = [&](const Stage& stage) {
+    __syncthreads();
+    put(0, stage.v0, stage.w0);
+    put(1, stage.v1, stage.w1);
+    put(2, stage.v2, stage.w2);
+    put(3, stage.v3, stage.w3);
+    __syncthreads();
+  };
+  const auto consume = [&](uint32_t first) {
+    const uint32_t count = total_k - first < kTile ? total_k - first : kTile;
+    if (count == kTile) {
+#pragma unroll 16
+      for (unsigned i = 0; i < kTile; ++i) {
+        const float value = lds_values[i * 32U + lane];
 #pragma unroll
-      for (unsigned i = 0; i < kPrefetch; ++i) {
-        values[i] =
-            injected_v[uint64_t(slot) * kv_dim + uint64_t(kv_h) * head_dim + d];
-        slot = slot + 1 == history_capacity ? 0 : slot + 1;
+        for (unsigned g = 0; g < kAttentionValuePairs; ++g)
+          acc[g] += lds_weights[i * kAttentionPairs + g] * value;
       }
+    } else {
+      for (unsigned i = 0; i < count; ++i) {
+        const float value = lds_values[i * 32U + lane];
 #pragma unroll
-      for (unsigned i = 0; i < kPrefetch; ++i) {
-#pragma unroll
-        for (unsigned g = 0; g < QueryHeads; ++g)
-          acc[g] += scores[g * total_k + local + i] * values[i];
+        for (unsigned g = 0; g < kAttentionValuePairs; ++g)
+          acc[g] += lds_weights[i * kAttentionPairs + g] * value;
       }
     }
-    for (; local < history_count; ++local) {
-      const float value =
-          injected_v[uint64_t(slot) * kv_dim + uint64_t(kv_h) * head_dim + d];
-#pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        acc[g] += scores[g * total_k + local] * value;
-      slot = slot + 1 == history_capacity ? 0 : slot + 1;
+  };
+  Stage even = load(0), odd = load(kTile);
+  for (uint32_t first = 0; first < total_k; first += 2U * kTile) {
+    stage_tile(even);
+    even = load(first + 2U * kTile);
+    consume(first);
+    if (first + kTile < total_k) {
+      stage_tile(odd);
+      odd = load(first + 3U * kTile);
+      consume(first + kTile);
     }
-    for (uint32_t p = 0; p < block_count; ++p) {
-      const float value =
-          block_v[uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim + d];
+  }
+  if (d >= head_dim)
+    return;
 #pragma unroll
-      for (unsigned g = 0; g < QueryHeads; ++g)
-        acc[g] += scores[g * total_k + history_count + p] * value;
+  for (unsigned g = 0; g < kAttentionValuePairs; ++g) {
+    const uint32_t pair = chunk * kAttentionPairs + first_pair + g;
+    if (pair < pairs) {
+      const uint32_t tok = pair / group, h = kv_h * group + pair % group;
+      out[uint64_t(tok) * q_dim + uint64_t(h) * head_dim + d] = acc[g];
     }
-#pragma unroll
-    for (unsigned g = 0; g < QueryHeads; ++g)
-      out[uint64_t(tok) * q_dim + uint64_t(h + g) * head_dim + d] = acc[g];
   }
 }
 
@@ -936,35 +1034,55 @@ void LaunchDFlashNonCausalAttentionScalar(
       head_dim, scale, history_capacity);
 }
 
-void LaunchDFlashNonCausalAttentionWave(
+std::size_t DFlashAttentionScratchElements(
+    std::uint32_t block_size, std::uint32_t num_q_heads,
+    std::uint32_t num_kv_heads, std::uint32_t history_capacity) noexcept {
+  const std::size_t group = num_q_heads / num_kv_heads;
+  const std::size_t chunks =
+      (block_size * group + kAttentionPairs - 1U) / kAttentionPairs;
+  return static_cast<std::size_t>(num_kv_heads) * chunks *
+         (static_cast<std::size_t>(history_capacity) + block_size) *
+         kAttentionPairs;
+}
+
+void LaunchDFlashNonCausalAttentionPairs(
     const float* q, const float* injected_k, const float* injected_v,
     const float* block_k, const float* block_v, float* out,
     std::uint32_t current_pos, std::uint32_t history_length,
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
-  const auto geometry = DFlashAttentionGeometry(
-      current_pos, history_length, block_count, sliding_window, num_q_heads);
-  // Wider blocks benefit from two query heads per CTA. Keep narrow blocks
-  // independent and leave enough LDS for both 256-thread reduction rows.
-  const auto heads_per_kv = num_q_heads / num_kv_heads;
-  if (block_count >= 4 && (heads_per_kv % 2U) == 0U &&
-      geometry.shared_bytes <= (64U * 1024U - 2U * 256U * sizeof(float)) / 2U) {
-    auto grid = geometry.grid;
-    grid.y /= 2U;
-    dflash_noncausal_attention_wave_kernel<2>
-        <<<grid, 256, 2U * geometry.shared_bytes, stream>>>(
-            q, injected_k, injected_v, block_k, block_v, out, current_pos,
-            history_length, block_count, sliding_window, num_q_heads,
-            num_kv_heads, head_dim, scale, history_capacity);
-    return;
-  }
-  dflash_noncausal_attention_wave_kernel<1>
-      <<<geometry.grid, 256, geometry.shared_bytes, stream>>>(
-          q, injected_k, injected_v, block_k, block_v, out, current_pos,
-          history_length, block_count, sliding_window, num_q_heads,
-          num_kv_heads, head_dim, scale, history_capacity);
+    std::uint32_t history_capacity, float* scores,
+    std::size_t scores_elements) {
+  const std::uint32_t history_start = current_pos + 1U > sliding_window
+                                          ? current_pos + 1U - sliding_window
+                                          : 0U;
+  const std::uint32_t history_count =
+      history_length > history_start ? history_length - history_start : 0U;
+  const std::uint32_t group = num_q_heads / num_kv_heads;
+  const std::uint32_t chunks =
+      (block_count * group + kAttentionPairs - 1U) / kAttentionPairs;
+  const std::uint32_t total_k = history_count + block_count;
+  if (scores == nullptr || static_cast<std::size_t>(num_kv_heads) * chunks *
+                                   total_k * kAttentionPairs >
+                               scores_elements)
+    throw std::invalid_argument("DFlash attention score scratch is too small");
+  dflash_attention_scores_kernel<<<
+      dim3(num_kv_heads,
+           (total_k + kAttentionScoreKeys - 1U) / kAttentionScoreKeys, chunks),
+      kAttentionThreads, 0, stream>>>(
+      q, injected_k, block_k, scores, current_pos, history_start,
+      history_count, block_count, sliding_window, num_q_heads, num_kv_heads,
+      head_dim, scale, history_capacity);
+  dflash_attention_softmax_kernel<<<
+      dim3(kAttentionPairs / kAttentionSoftmaxPairs, num_kv_heads, chunks),
+      kAttentionThreads, 0, stream>>>(scores, history_count, block_count,
+                                      group);
+  dflash_attention_values_kernel<<<dim3((head_dim + 31U) / 32U, num_kv_heads,
+                                        chunks),
+                                   kAttentionThreads, 0, stream>>>(
+      scores, injected_v, block_v, out, history_start, history_count,
+      block_count, num_q_heads, num_kv_heads, head_dim, history_capacity);
 }
 
 void LaunchDFlashNonCausalAttention(
@@ -974,13 +1092,15 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity) {
-  // Coalesced float4 reads cover all shipped DFlash2 head dimensions.
-  if ((head_dim % 4U) == 0U) {
-    LaunchDFlashNonCausalAttentionWave(
+    std::uint32_t history_capacity, float* scores,
+    std::size_t scores_elements) {
+  // One float4 per lane covers all shipped DFlash2 head dimensions.
+  if ((head_dim % 4U) == 0U && head_dim <= 128U &&
+      (num_q_heads % num_kv_heads) == 0U) {
+    LaunchDFlashNonCausalAttentionPairs(
         q, injected_k, injected_v, block_k, block_v, out, current_pos,
         history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-        head_dim, scale, stream, history_capacity);
+        head_dim, scale, stream, history_capacity, scores, scores_elements);
     return;
   }
   LaunchDFlashNonCausalAttentionScalar(

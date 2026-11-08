@@ -1,5 +1,13 @@
 # Qwen3.8 Flash-Next experiments
 
+## DFlash-2 drafter attention (November 8, 2026)
+
+Served configuration at C1, fine-tuned Q8_0 DFlash-2 drafter (32 query heads, 8 KV heads, head dimension 128, 2,048-token window, 8-token blocks), eight development turns.
+
+| Experiment | Outcome |
+| --- | --- |
+| Drafter attention reading each K/V row once per KV head | Retained. The former kernel ran one workgroup per draft token and query-head pair, so every FP32 K and V row of the window was read 16 times per KV head. Three passes now share them across the KV head's 32 (token, head) pairs: a score pass keeps each pair's lane QK expression and its offset-16..1 xor sum (transposed, so lane i ends with pair i's sum), a softmax pass keeps the 256-thread strided partials and halving trees, and a value pass keeps each pair's ascending FMA chain over LDS-staged tiles with two register stages in flight. Score scratch is 2.1 MB per drafter. `tools/bench/dflash_attn_bench.hip` against the former kernel: 0 of 352 shapes differ in any byte (blocks 1-8; histories 0, 1, prefetch and tile tails, window edges, wrapped rings, history shorter than the position; two query scales). With K/V rotated through five layers, as in the drafter: 8 rows at position 3,000 take 328-337 → 155 µs, 1,500 156-160 → 121 µs, 300 31-32 → 33 µs; 1 and 4 rows also improve deep. In the model profile (same 925 calls): 402.4 µs → 72.4 + 16.5 + 79.0 = 167.9 µs per layer, 2.01 → 0.84 ms per round. Eight alternating baseline/candidate server legs after a discarded warm-up: drafts, acceptances and rounds identical on every request (sampled 3.498 tokens/round, acceptance 0.730). Leg totals are dominated by stalls of single requests in both arms; best-of-four per request, decode is 1.0181× (16 of 16 turns faster, 56.65 → 57.67 tok/s). Rejected along the way, all byte-exact: keys walked fastest within one KV head in the score grid (cold K at 45 GB/s, 187 µs), one or two pairs per value wave (106 and 78 µs against 72 µs for four). |
+
 ## Prefill route independence (October 23, 2026)
 
 A prompt restored from a checkpoint and finished by a short prefill pass must

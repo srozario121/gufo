@@ -461,7 +461,8 @@ QwenDFlashGpuExecutor::ForwardBlockBatch(
           draft.sliding_window, config.num_attention_heads,
           config.num_key_value_heads, config.head_dim,
           1.0F / std::sqrt(static_cast<float>(config.head_dim)), stream,
-          executor.history_capacity_);
+          executor.history_capacity_, executor.d_attention_scores_,
+          executor.attention_scores_elements_);
     }
     stage("attention", scratch.attention, query_size);
     project(layer.attn_output, scratch.attention, scratch.projected,

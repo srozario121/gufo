@@ -21,6 +21,14 @@ void LaunchDFlashGroupedDynamicConv(
 void LaunchDFlashSiLUMul(float* gate, const float* up,
                          std::uint32_t total_elements, hipStream_t stream);
 
+/// Score scratch, in floats, that `LaunchDFlashNonCausalAttention` needs for
+/// blocks of up to `block_size` tokens over a `history_capacity` ring.
+[[nodiscard]] std::size_t DFlashAttentionScratchElements(
+    std::uint32_t block_size, std::uint32_t num_q_heads,
+    std::uint32_t num_kv_heads, std::uint32_t history_capacity) noexcept;
+
+/// `scores` holds `scores_elements` floats of stream-ordered scratch, sized by
+/// `DFlashAttentionScratchElements`.
 void LaunchDFlashNonCausalAttention(
     const float* q, const float* injected_k, const float* injected_v,
     const float* block_k, const float* block_v, float* out,
@@ -28,7 +36,7 @@ void LaunchDFlashNonCausalAttention(
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, float* scores, std::size_t scores_elements);
 
 /// Thread-per-key reference route of the call above. Exposed so an equivalence
 /// test can run both routes in one process; the production entry point picks
@@ -42,16 +50,17 @@ void LaunchDFlashNonCausalAttentionScalar(
     std::uint32_t head_dim, float scale, hipStream_t stream,
     std::uint32_t history_capacity);
 
-/// Wave-per-key route of the call above. Requires `head_dim` to be a multiple
-/// of four so a K row can be read as `float4`.
-void LaunchDFlashNonCausalAttentionWave(
+/// Pair-sharing route of the call above: three passes that read every K and
+/// V row once per KV head. Requires `head_dim` to be a multiple of four, at
+/// most 128.
+void LaunchDFlashNonCausalAttentionPairs(
     const float* q, const float* injected_k, const float* injected_v,
     const float* block_k, const float* block_v, float* out,
     std::uint32_t current_pos, std::uint32_t history_length,
     std::uint32_t block_count, std::uint32_t sliding_window,
     std::uint32_t num_q_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim, float scale, hipStream_t stream,
-    std::uint32_t history_capacity);
+    std::uint32_t history_capacity, float* scores, std::size_t scores_elements);
 
 /// Quantizes a BF16 weight matrix into a Q8_0 copy for the draft-only LM head.
 /// `total_elements` must be a multiple of the Q8_0 block size.

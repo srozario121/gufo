@@ -335,6 +335,8 @@ private:
   float* d_k_block_{nullptr};
   float* d_v_block_{nullptr};
   float* d_attn_out_{nullptr};
+  float* d_attention_scores_{nullptr};
+  std::size_t attention_scores_elements_{0};
   float* d_ffn_gate_{nullptr};
   float* d_ffn_up_{nullptr};
   float* d_ffn_down_{nullptr};
