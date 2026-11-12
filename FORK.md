@@ -19,6 +19,21 @@ well (`LICENSE-NOTE`).
 > re-cuts it before item 85.5 makes `SERVE_GUFO_FORK=required` true; a miss is a
 > hard error then, so the fork must exist by then. What follows is the procedure
 > and the v0.10.0 evidence, unchanged.
+>
+> **2026-11-12 (deployment item 185.1): prepared for gufo v0.34.0.** `build.conf`
+> names `v0.34.0` (`2845939b2a7d61243d407c8816c6d42652512e50`, the newest release
+> at the cut, frozen) and the toolboxes commit `a48188fd713ece381bbf64033b25bb535c171510`
+> (release run 43113225326, 7 s after the release). `ai-sdlc/v0.34.0` is cut on the
+> release commit with **no patches**: no v0.28.1 patch is carried (#876 is upstream
+> as `2e6aa96c`; the vocab-trim series and `logit_bias` are unserved, and their
+> re-port is this fork's item 185.4). `ai-sdlc/v0.28.1` stays as the rollback and
+> the served pin until the deployment's cutover. A build of a v0.28.1-based branch
+> with this `build.conf` is refused (HEAD not descended from the base): pass a
+> v0.28.1 config with `GF_CONF=<file>` for that build. The stock image is
+> `ghcr.io/gufo-org/toolboxes/gufo-runtime@sha256:49b1fce40cb43e33c46d91595e300cb320cdec768fcd976f8c8da24b402fc133`
+> (0.34.0) and `EXPECTED_DRV` is the drv its release run built,
+> `/nix/store/29j3b2hfngyn0h223fc6jrz0cjdg77s0-gufo-runtime.tar.gz.drv`
+> (from the run's log; the first build's drv check confirms it).
 
 | Branch | What it holds |
 |---|---|
