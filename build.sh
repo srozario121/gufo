@@ -30,7 +30,8 @@
 #      host code and the HIP fatbin). So a build NEVER bit-reproduces the
 #      stock image, and two of these builds differ from each other. Inside: a
 #      bare clone of the patch branch, toolboxes at TOOLBOXES_COMMIT exported
-#      with `git archive` as a path: flake, the drv evaluated first (EXPECTED_DRV
+#      with `git archive` as a path: flake (every path's mtime pinned to the commit's committer time, so
+#      lastModifiedDate is the release CI's), the drv evaluated first (EXPECTED_DRV
 #      set and different: stop before building), then
 #      `nix build --override-input gufo-engine git+file:///work/gufo.git?ref=…&rev=<HEAD>`.
 #   3. A host-side watcher stops the container at MemAvailable < MEM_FLOOR_MIB,
@@ -224,8 +225,21 @@ git init -q --bare /work/tb.git
 git -C /work/tb.git fetch -q --depth 1 "$TOOLBOXES_REPO" "$TOOLBOXES_COMMIT"
 got="$(git -C /work/tb.git rev-parse FETCH_HEAD)"
 [ "$got" = "$TOOLBOXES_COMMIT" ] || { echo "inner: toolboxes FETCH_HEAD is $got, not $TOOLBOXES_COMMIT" >&2; exit 3; }
-mkdir -p /work/toolboxes
-git -C /work/tb.git archive "$TOOLBOXES_COMMIT" | tar -x -C /work/toolboxes
+# >>> tb_unpack (gufo_fork_selftest.sh B18 runs this block on a fixture)
+# Toolboxes is given to Nix as a path: flake, whose lastModified is the newest mtime in the tree, so an unpacked
+# tree reads as "now". Since toolboxes a48188fd the image's org.opencontainers.image.created label is
+# self.lastModifiedDate, so the drv moved with the time of unpacking (deployment item 185.2, 2026-11-13: axsymr1r...
+# instead of the release's 29j3b2hf...). The release CI read toolboxes from git, where lastModified is the commit's
+# committer time; every unpacked path is pinned to that time, read from git, so the drv is the release's.
+tb_unpack() {  # <bare repo> <commit> <dir>
+  local ct
+  ct="$(git -C "$1" log -1 --format=%ct "$2")" && [ -n "$ct" ] || return 1
+  mkdir -p "$3" && git -C "$1" archive "$2" | tar -x -C "$3" || return 1
+  find "$3" -exec touch -h -d "@$ct" {} + || return 1
+  echo "inner: toolboxes source date $ct (the commit's committer time)" >&2
+}
+# <<< tb_unpack
+tb_unpack /work/tb.git "$TOOLBOXES_COMMIT" /work/toolboxes || { echo "inner: could not unpack toolboxes at $TOOLBOXES_COMMIT" >&2; exit 3; }
 drv="$(nix eval --raw --no-write-lock-file --override-input gufo-engine "$GF_REF" "path:/work/toolboxes#$TOOLBOXES_ATTR.drvPath")"
 printf "%s\n" "$drv" > /out/drv
 echo "inner: drv $drv" >&2
