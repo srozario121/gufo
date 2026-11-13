@@ -104,8 +104,13 @@ public:
   // With `trimmed` (a chat template rendered the prompt), whitespace it trimmed
   // from the edges of a reply stays as the model generated it; whitespace
   // missing anywhere else is an edit. A frontier ending inside a prompt token
-  // continues with the rest of that token. `stable` follows the rewrite, and
-  // the prompt stays below `max_tokens`. Returns whether the prompt changed.
+  // continues with the rest of that token. A prompt whose own tokens already
+  // begin an idle live frontier, or that a checkpoint retains whole, as an
+  // unchanged retry's do, stays as it is;
+  // one whose whole text ends inside a frontier takes that frontier prefix
+  // only when a checkpoint retains it exactly (an unchanged retry of an
+  // aligned prompt). `stable` follows the rewrite, and the prompt stays below
+  // `max_tokens`. Returns whether the prompt changed.
   bool AlignToLiveFrontier(std::vector<ContinuationToken>& prompt,
                            std::size_t& stable, std::size_t max_tokens,
                            bool trimmed) const;

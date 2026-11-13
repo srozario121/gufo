@@ -2823,6 +2823,111 @@ void RetokenizedAnswerContinuesTheLiveFrontier() {
   std::size_t busy_stable = 0;
   assert(!cache.AlignToLiveFrontier(busy, busy_stable, 4096, true));
   lease->Invalidate();
+  {
+    // An unchanged retry after the interrupted turn's continuation (#1213):
+    // the prompt's own tokens begin the newer frontier. Rewriting it to the
+    // interrupted frontier's tokens would change the identical request's
+    // sampled output.
+    ComponentTextCache retry_cache(runner, 2, 0, {}, false, 0, false);
+    commit(retry_cache, Tokens{1, 2, 20, 21, 50}, 2);
+    commit(retry_cache, Tokens{1, 2, 22, 50, 6, 7}, 5);
+    Tokens retry{1, 2, 22, 50, 6};
+    std::size_t retry_stable = 0;
+    assert(!retry_cache.AlignToLiveFrontier(retry, retry_stable, 4096, false));
+    assert((retry == Tokens{1, 2, 22, 50, 6}) && retry_stable == 0);
+  }
+  {
+    // The same retry after a later request (the replayed interrupted turn)
+    // took the slot that held its live frontier: a checkpoint still retains
+    // the whole prompt in its own tokens, so it is not rewritten either.
+    ComponentTextCache retry_cache(runner, 2, 1 << 22, {});
+    commit(retry_cache, Tokens{1, 2, 20, 21, 50}, 2);
+    const Tokens plain{1, 2, 22, 50, 6};
+    auto turn = retry_cache.Acquire(plain, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(turn->state());
+    turn->PreparePrefill(plain.size());
+    runner->adapter->Append(state.slot, plain, plain);
+    assert(turn->TryReserveSnapshot(turn->CaptureBytes(), plain.size(), false,
+                                    SnapshotPurpose::kRetry, plain));
+    assert(turn->PublishSnapshot(plain, turn->Capture(), false));
+    turn->Invalidate();
+    Tokens retry = plain;
+    std::size_t retry_stable = 0;
+    assert(!retry_cache.AlignToLiveFrontier(retry, retry_stable, 4096, true));
+    assert(retry == plain && retry_stable == 0);
+    // The interrupted frontier is still offered to a prompt nothing retains.
+    Tokens next{1, 2, 22, 50, 6, 8};
+    assert(retry_cache.AlignToLiveFrontier(next, retry_stable, 4096, true));
+    assert((next == Tokens{1, 2, 20, 21, 50, 6, 8}));
+  }
+  {
+    // An unchanged retry of an aligned prompt: the live frontier now ends
+    // after the retried reply, and a checkpoint retains the aligned prompt.
+    // A fresh tokenization would diverge from it and change sampled output.
+    ComponentTextCache retry_cache(runner, 1, 1 << 22, {});
+    const Tokens aligned{1, 2, 20, 21, 50, 6};
+    auto turn = retry_cache.Acquire(aligned, {}, {}, true, 5, true);
+    auto& state = dynamic_cast<State&>(turn->state());
+    turn->PreparePrefill(aligned.size());
+    runner->adapter->Append(state.slot, aligned, aligned);
+    assert(turn->TryReserveSnapshot(turn->CaptureBytes(), aligned.size(), false,
+                                    SnapshotPurpose::kRetry, aligned));
+    assert(turn->PublishSnapshot(aligned, turn->Capture(), false));
+    const Tokens reply{7};
+    runner->adapter->Append(state.slot, reply, reply);
+    Tokens frontier = aligned;
+    frontier.push_back(7);
+    (void)turn->Commit({}, {}, frontier);
+    // "ský" ends at the same text as the frontier's "sk" "ý".
+    Tokens retry{1, 2, 22, 50, 6};
+    std::size_t retry_stable = 3;
+    assert(retry_cache.AlignToLiveFrontier(retry, retry_stable, 4096, true));
+    assert(retry == aligned && retry_stable == 4);
+    // Without that checkpoint a prompt ending inside the frontier stays.
+    Tokens shorter{1, 2, 22, 50};
+    retry_stable = 0;
+    assert(!retry_cache.AlignToLiveFrontier(shorter, retry_stable, 4096, true));
+    assert((shorter == Tokens{1, 2, 22, 50}));
+    // The stable boundary before the user turn moves with the rewrite, and
+    // the aligned retry restores the retained checkpoint.
+    retry = {1, 2, 22, 50, 6};
+    retry_stable = 4;
+    assert(retry_cache.AlignToLiveFrontier(retry, retry_stable, 4096, true));
+    assert(retry == aligned && retry_stable == 5);
+    auto again = retry_cache.Acquire(retry, {}, {}, true, retry_stable, true);
+    assert(again->cache_hit());
+    again->Invalidate();
+  }
+  {
+    // The aligned prompt restored whitespace the template trimmed from a
+    // reply's end. Its unchanged retry trims it again and must align too.
+    ComponentTextCache retry_cache(runner, 1, 1 << 22, {});
+    commit(retry_cache, {1, 40, 42, 50}, 1);
+    Tokens prompt{1, 40, 50, 6};
+    std::size_t retry_stable = 0;
+    assert(retry_cache.AlignToLiveFrontier(prompt, retry_stable, 4096, true));
+    const Tokens aligned{1, 40, 42, 50, 6};
+    assert(prompt == aligned);
+    auto turn = retry_cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(turn->state());
+    turn->PreparePrefill(prompt.size());
+    const Tokens user{6};
+    runner->adapter->Append(state.slot, user, user);
+    assert(turn->TryReserveSnapshot(turn->CaptureBytes(), aligned.size(), false,
+                                    SnapshotPurpose::kRetry, aligned));
+    assert(turn->PublishSnapshot(aligned, turn->Capture(), false));
+    const Tokens reply{7};
+    runner->adapter->Append(state.slot, reply, reply);
+    (void)turn->Commit({}, {}, Tokens{1, 40, 42, 50, 6, 7});
+    // The stable boundary after the trimmed edge maps across it.
+    Tokens retry{1, 40, 50, 6};
+    retry_stable = 3;
+    assert(retry_cache.AlignToLiveFrontier(retry, retry_stable, 4096, true));
+    assert(retry == aligned && retry_stable == 4);
+    auto again = retry_cache.Acquire(retry, {}, {}, true, 0, true);
+    assert(again->cache_hit() && again->cached_tokens() == aligned.size());
+    again->Invalidate();
+  }
 }
 // Disk metadata admission is independent of the RAM and disk budgets.
 // Account for a fully committed disk-capture pool without allocating its bytes.
