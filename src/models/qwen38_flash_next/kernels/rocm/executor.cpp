@@ -1237,7 +1237,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->head_flags_ = Alloc<std::int32_t>(a, head_rows, error_msg);
     e->head_counters_ = Alloc<unsigned long long>(a, 3, error_msg);
     e->head_quantized_ = Alloc<std::uint8_t>(
-        a, std::size_t{head_rows} * (trim->head.cols / 32) * 34, error_msg);
+        a, std::size_t{head_rows} * (trim->head.cols / 32) * 36, error_msg);
     if (e->head_compact_ == nullptr || e->head_flags_ == nullptr ||
         e->head_counters_ == nullptr || e->head_quantized_ == nullptr)
       return nullptr;
@@ -3476,30 +3476,45 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
   const std::uint32_t prefix = model_->draft_output().rows;
+  // Under the trimmed head the draft reads the compact rows and never builds
+  // the full-vocabulary row: the candidates and the argmax run over the
+  // scored rows (ascending token IDs, so ties break exactly as over the full
+  // row) and the winners are mapped back to token IDs.
+  const auto* trim = draft == nullptr ? model_->head_trim() : nullptr;
   const std::uint32_t rows = draft != nullptr
                                  ? prefix + speculative::kDraftVocabExtraRows
-                                 : model_->output().rows;
+                             : trim != nullptr ? trim->scored
+                                               : model_->output().rows;
+  const float* logits = trim != nullptr ? head_compact_ : s_.logits;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !(draft != nullptr
-            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+      !(draft != nullptr ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+        : trim != nullptr
+            ? Dense(trim->head, s_.mixed, head_compact_, 1, error_msg)
             : HeadProject(s_.mixed, s_.logits, 1, false, false, error_msg))) {
     return false;
   }
+  // Candidate IDs at or above `remap_from` go through `remap_table`.
+  const std::uint32_t remap_from = trim != nullptr ? 0 : prefix;
+  const std::int32_t* remap_table =
+      trim != nullptr ? trim->ids
+                      : (draft != nullptr ? draft->mtp_.draft_ids : nullptr);
+  const std::uint32_t remap_rows =
+      trim != nullptr ? trim->scored : speculative::kDraftVocabExtraRows;
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
   if (candidates) {
-    MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
+    MtpTopCandidates(logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
                      rows, stream_);
-    if (draft != nullptr)
-      RemapDraftIds(s_.mtp_ids, count, prefix, draft->mtp_.draft_ids,
-                    speculative::kDraftVocabExtraRows, stream_);
+    if (remap_table != nullptr)
+      RemapDraftIds(s_.mtp_ids, count, remap_from, remap_table, remap_rows,
+                    stream_);
   }
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
-    ArgmaxConfidence(s_.logits, s_.mtp_token, rows, stream_);
-    if (draft != nullptr)
-      RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
-                    draft->mtp_.draft_ids, speculative::kDraftVocabExtraRows,
-                    stream_);
+    // The token and its confidence (float bits) land in mtp_token[0..1].
+    Argmax(logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+    ArgmaxConfidence(logits, s_.mtp_token, rows, stream_);
+    if (remap_table != nullptr)
+      RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
+                    remap_from, remap_table, remap_rows, stream_);
     if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token,
                               2 * sizeof(std::int32_t), hipMemcpyDeviceToHost,
                               stream_),
