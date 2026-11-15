@@ -312,7 +312,9 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
   device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
   if (!device_->SetHeadTrimTier2(options.head_trim_tier2_rows,
                                  options.head_trim_tier2_threshold, plan.ids,
-                                 error_msg))
+                                 error_msg) ||
+      !device_->SetHeadTrimSkipScored(options.head_trim_skip_scored,
+                                      plan.inverse, error_msg))
     return false;
   head_trimmed_ = true;
   std::cerr << "[head-trim] set_ids=" << plan.from_set
@@ -323,6 +325,7 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
             << " timing=" << (options.head_trim_timing ? 1 : 0)
             << " counters=" << (options.head_trim_counters ? 1 : 0)
             << " discard_aware=" << (HeadDiscardAware() ? 1 : 0)
+            << " skip_scored=" << (options.head_trim_skip_scored ? 1 : 0)
             << " tier2_rows=" << options.head_trim_tier2_rows
             << " tier2_threshold="
             << (device_->head_trim()->tier2_rows != 0

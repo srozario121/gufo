@@ -144,6 +144,17 @@
         "flash-next-q4"
       ],
       "help": "With --vocab-trim-tier2: the second tier's threshold (default: --vocab-trim-fallback-threshold)"
+    },
+    {
+      "name": "--vocab-trim-fallback-skip-scored",
+      "type": "boolean",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set and a fallback threshold above 0: the full-head pass reads only the rows the scored set does not hold and keeps the scored values for the rest (not bit-identical to a full pass)"
     }
   ],
   "targets": {
