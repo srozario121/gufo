@@ -861,12 +861,16 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
   };
   model_options->head_trim_timing = flag("--vocab-trim-timing");
   model_options->head_trim_counters = flag("--vocab-trim-counters");
-  if (set == nullptr &&
-      (model_options->head_trim_timing || model_options->head_trim_counters)) {
+  model_options->head_trim_discard_aware = flag("--vocab-trim-discard-aware");
+  if ((set == nullptr && (model_options->head_trim_timing ||
+                          model_options->head_trim_counters)) ||
+      (model_options->head_trim_discard_aware &&
+       (set == nullptr || model_options->head_trim_threshold <= 0.0F))) {
     if (error)
       *error =
           "--vocab-trim-timing and --vocab-trim-counters need "
-          "--vocab-trim-set";
+          "--vocab-trim-set; --vocab-trim-discard-aware needs it and a "
+          "fallback threshold above 0";
     return false;
   }
   return true;

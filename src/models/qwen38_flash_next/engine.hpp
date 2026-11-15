@@ -77,6 +77,11 @@ struct ModelOptions {
   bool head_trim_timing = false;
   /// Count what the fallback buys (--vocab-trim-counters); measurement only.
   bool head_trim_counters = false;
+  /// Do not pay a full-head read for rows a verification chain cannot use
+  /// (--vocab-trim-discard-aware): greedy chains drop the flags after the
+  /// first unflagged rejected draft, sampled chains read a flagged row only
+  /// when the verification loop reaches it. Output unchanged.
+  bool head_trim_discard_aware = false;
 };
 
 class Session;
@@ -116,6 +121,8 @@ public:
   [[nodiscard]] std::size_t ExpandedQ8_0Tensors() const noexcept;
   /// The target head scores a token subset (ModelOptions::head_trim_set_path).
   [[nodiscard]] bool HeadTrimmed() const noexcept { return head_trimmed_; }
+  /// The trimmed head defers or drops fallback reads of unusable chain rows.
+  [[nodiscard]] bool HeadDiscardAware() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }

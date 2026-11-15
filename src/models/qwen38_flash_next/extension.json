@@ -111,6 +111,17 @@
         "flash-next-q4"
       ],
       "help": "With --vocab-trim-set: count what the full-head fallback changes (argmax changes, unscored mass, discarded rows) and report it per request (head_trim_ctr_*)"
+    },
+    {
+      "name": "--vocab-trim-discard-aware",
+      "type": "boolean",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set and a fallback threshold above 0: do not pay a full-head read for chain rows that cannot be used. Greedy chains drop the flags after the first unflagged rejected draft token; other chains read a flagged row only when verification reaches it. Output unchanged"
     }
   ],
   "targets": {
