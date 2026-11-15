@@ -1654,8 +1654,20 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "# TYPE gufo_spec_lookup_accepted_tokens_total counter\n"
       << "gufo_spec_lookup_accepted_tokens_total "
       << detail::TotalLookupAcceptedTokens().load(std::memory_order_relaxed)
-      << "\n"
-      << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
+      << "\n";
+  {
+    // Model-specific counters (TextDecodeStep::counters), summed over every
+    // request; none until a runner reports one.
+    auto& registry = detail::TotalRunnerCounters();
+    const std::lock_guard lock(registry.mutex);
+    for (const auto& [name, total] : registry.totals) {
+      out << "# TYPE gufo_" << name << "_total counter\n"
+          << "gufo_" << name << "_total ";
+      WriteRunnerCounter(out, total);
+      out << "\n";
+    }
+  }
+  out << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
       << "llamacpp:prompt_tokens_seconds "

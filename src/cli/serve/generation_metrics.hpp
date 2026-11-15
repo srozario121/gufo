@@ -5,7 +5,12 @@
 #include <atomic>
 #include <cstdint>
 #include <iomanip>
+#include <mutex>
+#include <ostream>
 #include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/core/json.hpp"
@@ -94,6 +99,39 @@ inline double PrefillTokensPerSecond(
 /// Adds one finished request to the request totals and speed gauges. The
 /// scheduler calls this when a request ends, whether or not its client reads
 /// the result; failed requests are not added.
+/// Writes a runner counter: a whole number as an integer, anything else as
+/// the stream formats a double.
+inline void WriteRunnerCounter(std::ostream& out, double value) {
+  if (value >= 0.0 && value < 9007199254740992.0 &&
+      value == static_cast<double>(static_cast<std::uint64_t>(value))) {
+    out << static_cast<std::uint64_t>(value);
+  } else {
+    out << value;
+  }
+}
+
+/// The value a usage object reports for a runner counter: an integer for a
+/// whole number.
+inline json::Value RunnerCounterJson(double value) {
+  if (value >= 0.0 && value < 9007199254740992.0 &&
+      value == static_cast<double>(static_cast<std::uint64_t>(value)))
+    return json::Value(static_cast<std::size_t>(value));
+  return json::Value(value);
+}
+
+namespace detail {
+/// Plain runner counters (TextDecodeStep::counters) summed over every
+/// request, in first-reported order; empty until a runner reports one.
+struct RunnerCounterTotals {
+  std::mutex mutex;
+  std::vector<std::pair<std::string, double>> totals;
+};
+inline RunnerCounterTotals& TotalRunnerCounters() {
+  static RunnerCounterTotals totals;
+  return totals;
+}
+}  // namespace detail
+
 inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   const auto add_seconds = [](std::atomic<double>& total, double ms) {
     double current = total.load(std::memory_order_relaxed);
@@ -124,6 +162,22 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
                                         std::memory_order_relaxed);
   detail::TotalLookupAcceptedTokens().fetch_add(result.lookup_accepted_tokens,
                                                 std::memory_order_relaxed);
+  if (!result.runner_counters.empty()) {
+    auto& registry = detail::TotalRunnerCounters();
+    const std::lock_guard lock(registry.mutex);
+    for (const auto& counter : result.runner_counters) {
+      if (!counter.rate_of.empty())
+        continue;
+      const auto found = std::find_if(
+          registry.totals.begin(), registry.totals.end(),
+          [&](const auto& total) { return total.first == counter.name; });
+      if (found == registry.totals.end()) {
+        registry.totals.emplace_back(counter.name, counter.value);
+      } else {
+        found->second += counter.value;
+      }
+    }
+  }
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
@@ -188,6 +242,12 @@ inline std::string GenerationLogDetails(
   if (result.lookup_tokens > 0)
     out << " lookup_accepted=" << result.lookup_accepted_tokens
         << " lookup_proposed=" << result.lookup_tokens;
+  for (const auto& counter : result.runner_counters) {
+    if (!counter.rate_of.empty())
+      continue;
+    out << ' ' << counter.name << '=';
+    WriteRunnerCounter(out, counter.value);
+  }
   if (result.ngram_rows > 0)
     out << " ngram_rows=" << result.ngram_rows
         << " ngram_dedup_rows=" << result.ngram_dedup_rows

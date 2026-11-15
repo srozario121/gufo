@@ -156,13 +156,17 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
-  const bool draft_plan =
-      m->mtp_weights_ && (options.draft_vocab_prefix != 0 ||
-                          !options.draft_vocab_set_path.empty());
+  if (!options.head_trim_set_path.empty()) {
+    if (!m->LoadHeadTrim(options, error_msg))
+      return nullptr;
+  }
+  const bool draft_plan = m->mtp_weights_ && !m->head_trimmed_ &&
+                          (options.draft_vocab_prefix != 0 ||
+                           !options.draft_vocab_set_path.empty());
   if (draft_plan) {
     if (!m->LoadDraftPlan(options, error_msg))
       return nullptr;
-  } else if (m->mtp_weights_ &&
+  } else if (m->mtp_weights_ && !m->head_trimmed_ &&
              m->device_->output().rows > speculative::kDraftVocabPrefix) {
     std::vector<std::int32_t> specials;
     for (std::uint32_t id = speculative::kDraftVocabPrefix;
@@ -270,6 +274,46 @@ std::size_t Model::ExpandedQ8_0Tensors() const noexcept {
     count += qwen38_flash_next::ExpandedQ8_0Tensors(layer);
   }
   return count;
+}
+
+bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
+  if (options.draft_vocab_prefix != 0 ||
+      !options.draft_vocab_set_path.empty()) {
+    AssignError(error_msg,
+                "the trimmed head and the draft vocabulary options exclude "
+                "each other: the draft reads the trimmed head's rows");
+    return false;
+  }
+  const std::uint32_t vocab = device_->output().rows;
+  std::ifstream in(options.head_trim_set_path, std::ios::binary);
+  std::ostringstream text;
+  text << in.rdbuf();
+  if (!in.is_open() || in.bad()) {
+    AssignError(error_msg, "cannot read the trimmed head set file");
+    return false;
+  }
+  std::string parse_error;
+  auto ids = speculative::ParseTokenIdList(text.str(), vocab, &parse_error);
+  if (!ids) {
+    AssignError(error_msg, "trimmed head set: " + parse_error);
+    return false;
+  }
+  std::vector<std::int32_t> special;
+  for (std::uint32_t id = 0; id < vocab; ++id)
+    if (tokenizer_->IsSpecialToken(id) ||
+        tokenizer_->IsStopToken(static_cast<tokenization::TokenId>(id)))
+      special.push_back(static_cast<std::int32_t>(id));
+  const auto plan = PlanHeadTrim(vocab, *ids, special);
+  if (!device_->SetHeadTrim(plan.ids, plan.inverse, plan.padded_rows,
+                            options.head_trim_threshold, error_msg))
+    return false;
+  head_trimmed_ = true;
+  std::cerr << "[head-trim] set_ids=" << plan.from_set
+            << " special_added=" << plan.added_special
+            << " rows=" << plan.ids.size() << " padded=" << plan.padded_rows
+            << " of=" << vocab
+            << " fallback_threshold=" << options.head_trim_threshold << '\n';
+  return true;
 }
 
 bool Model::LoadDraftPlan(const ModelOptions& options, std::string* error_msg) {
@@ -690,6 +734,16 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   // decode moves the session to the factor its positions need.
   model_->executor_->AdoptYarnFactor(*session_, header.yarn_factor);
   return true;
+}
+
+const Session::SpeculativeStats& Session::Statistics() const noexcept {
+  if (model_->head_trimmed_) {
+    const auto head = model_->executor_->HeadStatistics();
+    stats_.head_rows = head.rows;
+    stats_.head_fallbacks = head.fallbacks;
+    stats_.head_full_reads = head.full_reads;
+  }
+  return stats_;
 }
 
 SessionSnapshot::SessionSnapshot(std::uint64_t size)

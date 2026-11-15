@@ -581,7 +581,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     static_assert(speculative::kDraftVocabExtraRows <= 1024,
                   "GatherDraftLogits is one block");
     if (mixed) {
-      if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+      if (!HeadProject(base.mixed, batch_logits_, n, true, false, error))
         return false;
       for (std::uint32_t i = 0; i < n; ++i) {
         if (slot[i] < subset_rows)
@@ -612,7 +612,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       }
     }
     if (subset_rows == 0 &&
-        !DenseBatch(full_head, base.mixed, batch_logits_, n, error))
+        !HeadProject(base.mixed, batch_logits_, n, true, false, error))
       return false;
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
@@ -1289,7 +1289,7 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
     UseScratch(base);
     return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
                       rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+           HeadProject(base.mixed, batch_logits_, rows, true, true, error);
   };
   bool ok = false;
   try {

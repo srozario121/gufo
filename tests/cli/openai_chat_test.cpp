@@ -169,6 +169,7 @@ public:
     result.execution_plan = "serial-fallback";
     result.cache_hit = cache_miss_reason.empty();
     result.cache_miss_reason = cache_miss_reason;
+    result.runner_counters = runner_counters;
     if (!result.cache_hit) {
       result.cached_prompt_tokens = 0;
       result.prefill_tokens = result.prompt_tokens;
@@ -252,6 +253,7 @@ public:
   std::optional<std::string> tool_dialect;
   gufo::ext::ReasoningMarkup reasoning{"<think>", "</think>"};
   std::string cache_miss_reason;
+  std::vector<gufo::ext::TextRunnerCounter> runner_counters;
   FinishReason finish_reason{FinishReason::kStop};
   std::string stop_sequence;
   bool block_after_first_piece{false};
@@ -651,6 +653,47 @@ void TestCachedPrefillMetrics() {
              metrics->member_size("cache_common_prefix_tokens") == 2 &&
              metrics->member_size("cache_checkpoint_tokens") == 5,
          "Usage explains cache misses without exposing prompt text");
+
+  // Runner counters (TextDecodeStep::counters): none by default; summed by
+  // name per request; a rate divides by the counter it names.
+  Expect(metrics->find("head_trim_rows") == nullptr &&
+             metrics->find("head_trim_fallback_rate") == nullptr,
+         "Usage carries no runner counters when the runner reports none");
+  std::vector<gufo::ext::TextRunnerCounter> sums;
+  const std::vector<gufo::ext::TextRunnerCounter> step = {
+      {.name = "head_trim_rows", .value = 20.0},
+      {.name = "head_trim_fallbacks", .value = 5.0},
+      {.name = "head_trim_full_reads", .value = 3.0},
+      {.name = "head_trim_fallback_rate",
+       .value = 5.0,
+       .rate_of = "head_trim_rows"}};
+  gufo::server::AddRunnerCounters(step, &sums);
+  gufo::server::AddRunnerCounters(step, &sums);
+  Expect(sums.size() == 4 && sums[0].name == "head_trim_rows" &&
+             sums[0].value == 40.0 && sums[3].value == 10.0,
+         "Runner counters are summed by name in first-reported order");
+  backend.runner_counters = sums;
+  const auto counted = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"x"}]})"),
+      backend);
+  const auto counted_body = gufo::json::parse(counted.body);
+  const auto* counted_usage = counted_body.find("usage");
+  const auto* counted_metrics =
+      counted_usage ? counted_usage->find("gufo") : nullptr;
+  Expect(counted_metrics &&
+             counted_metrics->member_size("head_trim_rows") == 40 &&
+             counted_metrics->member_size("head_trim_fallbacks") == 10 &&
+             counted_metrics->member_size("head_trim_full_reads") == 6 &&
+             counted_metrics->member_double("head_trim_fallback_rate") == 0.25,
+         "Usage reports runner counters and their rates");
+  gufo::server::TextGenerationBackend::Result logged;
+  logged.runner_counters = sums;
+  const auto line = gufo::server::GenerationLogDetails(logged);
+  Expect(line.find(" head_trim_rows=40 ") != std::string::npos &&
+             line.find("head_trim_fallback_rate") == std::string::npos,
+         "The generation log lists plain runner counters only");
+  backend.runner_counters.clear();
 }
 
 void TestToolCallsAreStructured() {

@@ -42,6 +42,30 @@ using namespace gufo::ext;
 using QwenFlashNextModel = models::qwen38_flash_next::Model;
 using QwenFlashNextSession = models::qwen38_flash_next::Session;
 
+/// The trimmed head's counters (head_trim.hpp) over one decode step, as
+/// TextDecodeStep::counters. The counters are the model's, so a batched step
+/// reports the whole step's to each of its requests. Nothing without a
+/// trimmed head.
+void AddHeadTrimCounters(const Model& model,
+                         const Session::SpeculativeStats& before,
+                         const Session::SpeculativeStats& after,
+                         TextDecodeStep* step) {
+  if (!model.HeadTrimmed())
+    return;
+  const auto rows = static_cast<double>(after.head_rows - before.head_rows);
+  const auto fallbacks =
+      static_cast<double>(after.head_fallbacks - before.head_fallbacks);
+  step->counters.push_back({.name = "head_trim_rows", .value = rows});
+  step->counters.push_back({.name = "head_trim_fallbacks", .value = fallbacks});
+  step->counters.push_back(
+      {.name = "head_trim_full_reads",
+       .value = static_cast<double>(after.head_full_reads -
+                                    before.head_full_reads)});
+  step->counters.push_back({.name = "head_trim_fallback_rate",
+                            .value = fallbacks,
+                            .rate_of = "head_trim_rows"});
+}
+
 std::vector<std::int32_t> QwenFlashNextEngineTokens(
     std::span<const TextRunnerToken> tokens) {
   std::vector<std::int32_t> converted;
@@ -659,6 +683,7 @@ public:
     step.lookup_tokens = stats_after.lookup - stats_before.lookup;
     step.lookup_accepted_tokens =
         stats_after.lookup_accepted - stats_before.lookup_accepted;
+    AddHeadTrimCounters(*model_, stats_before, stats_after, &step);
     return step;
   }
 
@@ -751,6 +776,7 @@ public:
       step.lookup_tokens = stats.lookup - before[i].lookup;
       step.lookup_accepted_tokens =
           stats.lookup_accepted - before[i].lookup_accepted;
+      AddHeadTrimCounters(*model_, before[i], stats, &step);
     }
     return steps;
   }
@@ -792,6 +818,31 @@ private:
   std::uint32_t max_draft_tokens_;
   cache::Identity component_identity_;
 };
+
+bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
+                          ModelOptions* model_options, std::string* error) {
+  const auto* set = ext::FindOption<std::string>(given, "--vocab-trim-set");
+  const auto* threshold =
+      ext::FindOption<double>(given, "--vocab-trim-fallback-threshold");
+  const bool draft_vocab =
+      ext::FindOption<std::int64_t>(given, "--mtp-draft-vocab-prefix") !=
+          nullptr ||
+      ext::FindOption<std::string>(given, "--mtp-draft-vocab-set") != nullptr;
+  if ((threshold != nullptr && !(*threshold >= 0.0 && *threshold <= 1.0)) ||
+      (set != nullptr && (!use_mtp || draft_vocab))) {
+    if (error)
+      *error =
+          "--vocab-trim-set needs --speculative mtp and excludes "
+          "--mtp-draft-vocab-prefix and --mtp-draft-vocab-set; "
+          "--vocab-trim-fallback-threshold is in [0, 1]";
+    return false;
+  }
+  if (set != nullptr)
+    model_options->head_trim_set_path = *set;
+  if (threshold != nullptr)
+    model_options->head_trim_threshold = static_cast<float>(*threshold);
+  return true;
+}
 
 bool ApplyDraftVocabOptions(const ext::ParsedOptions& given, bool use_mtp,
                             ModelOptions* model_options, std::string* error) {
@@ -892,7 +943,9 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
       .rope_scaling = rope_scaling,
   };
   if (!ApplyDraftVocabOptions(options.provider_options, use_mtp, &model_options,
-                              error))
+                              error) ||
+      !ApplyHeadTrimOptions(options.provider_options, use_mtp, &model_options,
+                            error))
     return nullptr;
   std::string load_error;
   auto model = Model::Load(options.model_path, model_options, &load_error);

@@ -23,6 +23,7 @@
 #include "src/families/qwen/kernels/ops/token.hpp"
 #include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -276,6 +277,11 @@ public:
     /// above it require YaRN (Config::MaxContextLength()).
     std::uint32_t max_context{0};
   };
+
+  /// Target rows the trimmed head scored and how many fell back to the full
+  /// head, since the executor was created. Zero without a trimmed head.
+  /// Waits for the stream.
+  [[nodiscard]] HeadTrimStats HeadStatistics() const;
 
   ~Executor();
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
@@ -659,6 +665,14 @@ private:
   /// The session's draft table as a weight of speculative::kDraftVocabExtraRows
   /// rows.
   DeviceTensor DraftTable(const Session& session) const noexcept;
+  /// The output head over `rows` rows of x (x[r] is cols floats), written as
+  /// full-vocabulary logits: out[r * vocab + id]. With the trimmed head
+  /// (head_trim.hpp) only the scored tokens are projected and every other
+  /// token is -infinity; `fallback` also re-runs the full head, for the
+  /// rows whose best probability is under the threshold. Draft heads pass
+  /// false: a draft only proposes. `batch` selects DenseBatch.
+  bool HeadProject(const float* x, float* out, std::uint32_t rows, bool batch,
+                   bool fallback, std::string* error_msg) const;
   /// Small-head draft logits: prefix rows, then the table rows with empty
   /// slots at -infinity.
   bool DraftLogits(const Session& session, const float* x, float* logits,
@@ -947,6 +961,12 @@ private:
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
+  /// Trimmed head scratch (see HeadProject): compact logits, one flag per
+  /// row, and the counters (rows, fallback rows, full-head passes).
+  float* head_compact_{nullptr};
+  std::int32_t* head_flags_{nullptr};
+  unsigned long long* head_counters_{nullptr};
+  void* head_quantized_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

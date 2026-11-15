@@ -1589,6 +1589,8 @@ struct TextGenerationScheduler::Impl {
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
       request->result.lookup_tokens += step.lookup_tokens;
       request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
+      if (!step.counters.empty())
+        AddRunnerCounters(step.counters, &request->result.runner_counters);
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1899,6 +1901,8 @@ struct TextGenerationScheduler::Impl {
       item.request->result.lookup_tokens += step.lookup_tokens;
       item.request->result.lookup_accepted_tokens +=
           step.lookup_accepted_tokens;
+      if (!step.counters.empty())
+        AddRunnerCounters(step.counters, &item.request->result.runner_counters);
 
       bool published = true;
       try {

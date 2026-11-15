@@ -237,6 +237,20 @@ struct TextDecodeSelection {
   std::optional<sampling::TokenLogprobs> logprobs;
 };
 
+/// A model-specific counter a runner reports for one decode step.
+struct TextRunnerCounter {
+  /// Lower-case name of letters, digits and underscores; the host publishes
+  /// it under this name.
+  std::string name;
+  /// The step's amount; the host sums a request's steps by name.
+  double value{0.0};
+  /// Empty for a plain counter. Otherwise this is a rate: the host publishes
+  /// it in the usage object only, as the request's sum of `value` divided by
+  /// its sum of the plain counter named here, and leaves it out while that
+  /// sum is zero.
+  std::string rate_of{};
+};
+
 struct TextDecodeStep {
   std::vector<TextDecodeSelection> selections;
   std::size_t draft_rounds{0};
@@ -244,6 +258,11 @@ struct TextDecodeStep {
   std::size_t draft_accepted_tokens{0};
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
+  /// Model-specific counters of this step. The host sums them per request by
+  /// name, in first-reported order, and publishes the sums in the usage
+  /// `gufo` object, the generation log line and, for plain counters, /metrics
+  /// as `gufo_<name>_total`. Empty when the runner reports none.
+  std::vector<TextRunnerCounter> counters{};
   bool stop{false};
   std::optional<sampling::TokenLogprobs> terminal_logprobs;
   TextExecutionPlan execution_plan{};

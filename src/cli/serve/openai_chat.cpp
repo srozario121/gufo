@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "gufo/ext/text.hpp"
+#include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/quote_tracker.hpp"
 #include "src/cli/serve/response_format.hpp"
@@ -2224,6 +2225,21 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["cache_disk_enqueue_ms"] = result.cache_disk_enqueue_ms;
   metrics["cache_disk_hit"] = result.cache_disk_hit;
   metrics["draft_rounds"] = result.draft_rounds;
+  // Model-specific counters (TextDecodeStep::counters), summed over the
+  // request's steps; a rate divides by the sum of the counter it names.
+  for (const auto& counter : result.runner_counters) {
+    if (counter.rate_of.empty()) {
+      metrics[counter.name] = RunnerCounterJson(counter.value);
+      continue;
+    }
+    const auto denominator =
+        std::find_if(result.runner_counters.begin(),
+                     result.runner_counters.end(), [&](const auto& c) {
+                       return c.rate_of.empty() && c.name == counter.rate_of;
+                     });
+    if (denominator != result.runner_counters.end() && denominator->value > 0.0)
+      metrics[counter.name] = counter.value / denominator->value;
+  }
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

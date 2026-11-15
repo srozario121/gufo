@@ -1220,6 +1220,28 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg);
   s.logits =
       f32(static_cast<std::size_t>(e->options_.max_logit_rows) * c.vocab_size);
+  if (const auto* trim = model.head_trim()) {
+    // One projection can carry a decode batch of 8 sessions by 8 rows, one
+    // verification chain or a wide copy verification (up to kWideRows); the
+    // fallback kernel flags at most kHeadTrimMaxRows, so the scratch holds
+    // that many rows.
+    static_assert(kWideRows <= kHeadTrimMaxRows);
+    const std::uint32_t head_rows = kHeadTrimMaxRows;
+    if (e->options_.max_logit_rows > kHeadTrimMaxRows) {
+      AssignError(error_msg,
+                  "the trimmed head scores at most 64 logit rows per pass "
+                  "(draft tokens up to 63)");
+      return nullptr;
+    }
+    e->head_compact_ = f32(std::size_t{head_rows} * trim->head.rows);
+    e->head_flags_ = Alloc<std::int32_t>(a, head_rows, error_msg);
+    e->head_counters_ = Alloc<unsigned long long>(a, 3, error_msg);
+    e->head_quantized_ = Alloc<std::uint8_t>(
+        a, std::size_t{head_rows} * (trim->head.cols / 32) * 34, error_msg);
+    if (e->head_compact_ == nullptr || e->head_flags_ == nullptr ||
+        e->head_counters_ == nullptr || e->head_quantized_ == nullptr)
+      return nullptr;
+  }
   {
     void* control = nullptr;
     void* tokens = nullptr;
@@ -1548,6 +1570,49 @@ DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
   table.data = session.mtp_.draft_rows;
   table.rows = speculative::kDraftVocabExtraRows;
   return table;
+}
+
+bool Executor::HeadProject(const float* x, float* out, std::uint32_t rows,
+                           bool batch, bool fallback,
+                           std::string* error_msg) const {
+  const auto& full = model_->output();
+  const auto* trim = model_->head_trim();
+  if (trim == nullptr)
+    return batch ? DenseBatch(full, x, out, rows, error_msg)
+                 : Dense(full, x, out, rows, error_msg);
+  if (rows == 0 || rows > kHeadTrimMaxRows) {
+    AssignError(error_msg, "trimmed head: logit rows outside 1..64");
+    return false;
+  }
+  const std::uint32_t vocab = full.rows;
+  if (!(batch ? DenseBatch(trim->head, x, head_compact_, rows, error_msg)
+              : Dense(trim->head, x, head_compact_, rows, error_msg)))
+    return false;
+  ExpandHeadLogits(head_compact_, trim->inverse, out, rows, vocab,
+                   trim->head.rows, stream_);
+  if (fallback && trim->threshold > 0.0F) {
+    HeadConfidence(head_compact_, rows, trim->scored, trim->head.rows,
+                   trim->threshold, head_flags_, head_counters_, stream_);
+    FullHeadFallback(full.data, model_->output_row_bytes(), full.cols, vocab, x,
+                     head_flags_, rows, out, head_counters_, head_quantized_,
+                     stream_);
+  }
+  return Check(hipGetLastError(), "trimmed head", error_msg);
+}
+
+HeadTrimStats Executor::HeadStatistics() const {
+  HeadTrimStats stats;
+  if (head_counters_ == nullptr)
+    return stats;
+  unsigned long long counters[3]{};
+  if (hipMemcpyAsync(counters, head_counters_, sizeof(counters),
+                     hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+      hipStreamSynchronize(stream_) != hipSuccess)
+    return stats;
+  stats.rows = counters[0];
+  stats.fallbacks = counters[1];
+  stats.full_reads = counters[2];
+  return stats;
 }
 
 bool Executor::DraftLogits(const Session& session, const float* x,
@@ -3417,7 +3482,7 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
-            : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
+            : HeadProject(s_.mixed, s_.logits, 1, false, false, error_msg))) {
     return false;
   }
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
@@ -4050,7 +4115,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!HcMix(model_->hc_head(),
                s_.res + std::size_t{checkpoint->tokens - 1} * c.HcDim(), false,
                s_.mixed, nullptr, 1, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg) ||
+        !HeadProject(s_.mixed, s_.logits, 1, false, true, error_msg) ||
         !Check(hipMemcpyAsync(checkpoint->logits.data(), s_.logits,
                               std::size_t{c.vocab_size} * sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
@@ -4080,7 +4145,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const DeviceMixer& head = model_->hc_head();
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+        !HeadProject(s_.mixed, s_.logits, n_logits, false, true, error_msg)) {
       return false;
     }
     if (download_logits &&

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -114,6 +115,31 @@ private:
 
 using ChatRequest = ext::ChatRequest;
 
+/// Adds a decode step's counters to a request's sums: same name, same entry;
+/// a new name is appended. Steps report their counters in the same order, so
+/// the entry at the counter's own index is tried first.
+inline void AddRunnerCounters(std::span<const ext::TextRunnerCounter> step,
+                              std::vector<ext::TextRunnerCounter>* sums) {
+  for (std::size_t i = 0; i < step.size(); ++i) {
+    const auto& counter = step[i];
+    ext::TextRunnerCounter* sum = nullptr;
+    if (i < sums->size() && (*sums)[i].name == counter.name) {
+      sum = &(*sums)[i];
+    } else {
+      const auto found =
+          std::find_if(sums->begin(), sums->end(),
+                       [&](const auto& c) { return c.name == counter.name; });
+      if (found != sums->end())
+        sum = &*found;
+    }
+    if (sum == nullptr) {
+      sums->push_back(counter);
+    } else {
+      sum->value += counter.value;
+    }
+  }
+}
+
 /// Model-agnostic text generation boundary used by the HTTP transport.
 ///
 /// Implementations retain ownership of tokenization, templates, complete
@@ -201,6 +227,9 @@ public:
     std::size_t ngram_dedup_rows{0};
     std::size_t ngram_cache_hits{0};
     std::size_t ngram_disk_reads{0};
+    /// Model-specific counters the runner reported (TextDecodeStep::counters),
+    /// summed over the request's steps by name in first-reported order.
+    std::vector<ext::TextRunnerCounter> runner_counters;
     std::size_t prefill_tokens{0};
     std::size_t prefill_chunks{0};
     std::size_t active_decode_prefill_chunks{0};

@@ -67,6 +67,28 @@
         "flash-next-q4"
       ],
       "help": "Token-ID list (one decimal ID per line) the MTP draft also scores above its prefix (needs --speculative mtp)"
+    },
+    {
+      "name": "--vocab-trim-set",
+      "type": "path",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "Token-ID list (one decimal ID per line) the target output head scores instead of every row; the special and stop tokens are always added and the draft reads the same rows (needs --speculative mtp; excludes --mtp-draft-vocab-prefix and --mtp-draft-vocab-set)"
+    },
+    {
+      "name": "--vocab-trim-fallback-threshold",
+      "type": "number",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set: re-run the full head for a position whose best probability over the scored rows is below P (default: 0.5; 0 never)"
     }
   ],
   "targets": {
@@ -142,6 +164,12 @@
     {
       "target": "qwen38_flash_next_continuation_layout_test",
       "ctest": "qwen38_flash_next\\.continuation_layout",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "qwen38_flash_next_head_trim_test",
+      "ctest": "qwen38_flash_next\\.head_trim",
       "check_pr": true,
       "windows_build": true
     }

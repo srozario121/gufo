@@ -19,6 +19,7 @@
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -64,6 +65,14 @@ struct ModelOptions {
   /// Optional token-ID list (one decimal ID per line) added to every
   /// session's draft table above the prefix. Empty adds none.
   std::string draft_vocab_set_path;
+  /// Token-ID list (one decimal ID per line) the target output head scores
+  /// (head_trim.hpp); the special and stop tokens are always added. Empty
+  /// keeps the full head. Excludes the draft-vocabulary options: the draft
+  /// reads the same compact rows.
+  std::string head_trim_set_path;
+  /// Top probability over the scored rows below which a position re-runs the
+  /// full head; 0 never does.
+  float head_trim_threshold = kHeadTrimDefaultThreshold;
 };
 
 class Session;
@@ -101,6 +110,8 @@ public:
   /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
   /// inject as Q8_0, so the draft block is not counted.
   [[nodiscard]] std::size_t ExpandedQ8_0Tensors() const noexcept;
+  /// The target head scores a token subset (ModelOptions::head_trim_set_path).
+  [[nodiscard]] bool HeadTrimmed() const noexcept { return head_trimmed_; }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -140,6 +151,7 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  bool head_trimmed_{false};
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
   /// Static rows at the start of every session's draft table: the special
@@ -150,6 +162,9 @@ private:
   speculative::DraftVocabPlan draft_plan_;
   /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
+  /// Sets the trimmed target head from ModelOptions::head_trim_set_path.
+  [[nodiscard]] bool LoadHeadTrim(const ModelOptions& options,
+                                  std::string* error_msg);
   /// Sets the small head from ModelOptions::draft_vocab_prefix and
   /// draft_vocab_set_path (draft_plan_).
   [[nodiscard]] bool LoadDraftPlan(const ModelOptions& options,
@@ -265,10 +280,14 @@ public:
     /// Of drafted/accepted: proposals copied by prompt lookup.
     std::uint64_t lookup{0};
     std::uint64_t lookup_accepted{0};
+    /// Trimmed head (head_trim.hpp), counted for the whole model since it
+    /// loaded and read afresh by every Statistics() call: target rows scored,
+    /// rows re-run on the full head, full-head passes. Take differences.
+    std::uint64_t head_rows{0};
+    std::uint64_t head_fallbacks{0};
+    std::uint64_t head_full_reads{0};
   };
-  [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
-    return stats_;
-  }
+  [[nodiscard]] const SpeculativeStats& Statistics() const noexcept;
   /// PLE rows gathered by this execution slot since creation; zero without
   /// a PLE table.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
@@ -387,7 +406,7 @@ private:
   std::uint32_t copy_rows_{0};
   /// Whole copies accepted in a row at copy_rows_ (two widen it).
   std::uint32_t copy_streak_{0};
-  SpeculativeStats stats_;
+  mutable SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;

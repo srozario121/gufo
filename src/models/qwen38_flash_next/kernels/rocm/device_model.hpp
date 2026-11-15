@@ -123,6 +123,25 @@ public:
   [[nodiscard]] bool SetDraftVocab(std::uint32_t prefix_rows,
                                    std::vector<std::int32_t> specials,
                                    std::string* error_msg);
+  /// The trimmed target head (head_trim.hpp): the set's rows of output() in a
+  /// compact copy, and the token ID -> compact row map.
+  struct HeadTrim {
+    DeviceTensor head;                     ///< rows = padded compact rows
+    const std::int32_t* inverse{nullptr};  ///< device, vocab entries
+    std::uint32_t scored{0};               ///< compact rows that are real
+    float threshold{0.0F};                 ///< fallback below this top prob
+  };
+  /// Gathers output() rows `ids` (ascending token IDs, `padded_rows` >= their
+  /// count) into a compact device copy and keeps `inverse` (one entry per
+  /// output row, -1 for a row that is not scored) beside it. Needs a Q8_0
+  /// head. The compact copy is read-only after this.
+  [[nodiscard]] bool SetHeadTrim(std::span<const std::int32_t> ids,
+                                 std::span<const std::int32_t> inverse,
+                                 std::uint32_t padded_rows, float threshold,
+                                 std::string* error_msg);
+  [[nodiscard]] const HeadTrim* head_trim() const noexcept {
+    return head_trim_.head.empty() ? nullptr : &head_trim_;
+  }
   const DeviceMixer& hc_head() const noexcept { return hc_head_; }
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
@@ -147,6 +166,7 @@ private:
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
   std::vector<std::int32_t> draft_specials_;
+  HeadTrim head_trim_;
   DeviceMixer hc_head_;
   std::vector<DeviceLayer> layers_;
   DeviceLayer mtp_;
