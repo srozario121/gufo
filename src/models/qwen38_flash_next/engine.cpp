@@ -308,13 +308,15 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
                             options.head_trim_threshold, error_msg))
     return false;
   device_->SetHeadTrimTiming(options.head_trim_timing);
+  device_->SetHeadTrimCounters(options.head_trim_counters);
   head_trimmed_ = true;
   std::cerr << "[head-trim] set_ids=" << plan.from_set
             << " special_added=" << plan.added_special
             << " rows=" << plan.ids.size() << " padded=" << plan.padded_rows
             << " of=" << vocab
             << " fallback_threshold=" << options.head_trim_threshold
-            << " timing=" << (options.head_trim_timing ? 1 : 0) << '\n';
+            << " timing=" << (options.head_trim_timing ? 1 : 0)
+            << " counters=" << (options.head_trim_counters ? 1 : 0) << '\n';
   return true;
 }
 
@@ -745,6 +747,7 @@ const Session::SpeculativeStats& Session::Statistics() const noexcept {
     stats_.head_fallbacks = head.fallbacks;
     stats_.head_full_reads = head.full_reads;
     stats_.head_timing = model_->executor_->HeadTimingStatistics();
+    stats_.head_counters = model_->executor_->HeadCounterStatistics();
   }
   return stats_;
 }
@@ -1566,6 +1569,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
           std::span<const float>(raw).subspan((keep - 1) * vocab, vocab),
           *stop_token, sampler.config().logprobs);
   }
+  // Counters only: which flagged rows of this round were never used.
+  exec.RecordHeadChain(k, keep);
   if (!exec.Rollback(
           *session_, keep, error_msg,
           gpu_verification && !cpu_rows ? logits_.data() : nullptr)) {

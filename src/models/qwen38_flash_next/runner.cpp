@@ -71,6 +71,13 @@ void AddHeadTrimCounters(const Model& model,
       step->counters.push_back(
           {.name = std::string("head_trim_t_") + name, .value = value});
     });
+  // --vocab-trim-counters: what the fallback bought.
+  if (const auto counters = after.head_counters.Since(before.head_counters);
+      counters.flagged > 0 || counters.chains > 0)
+    counters.ForEachField([&](const char* name, double value) {
+      step->counters.push_back(
+          {.name = std::string("head_trim_ctr_") + name, .value = value});
+    });
 }
 
 std::vector<std::int32_t> QwenFlashNextEngineTokens(
@@ -853,9 +860,13 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
     return value != nullptr && *value;
   };
   model_options->head_trim_timing = flag("--vocab-trim-timing");
-  if (set == nullptr && model_options->head_trim_timing) {
+  model_options->head_trim_counters = flag("--vocab-trim-counters");
+  if (set == nullptr &&
+      (model_options->head_trim_timing || model_options->head_trim_counters)) {
     if (error)
-      *error = "--vocab-trim-timing needs --vocab-trim-set";
+      *error =
+          "--vocab-trim-timing and --vocab-trim-counters need "
+          "--vocab-trim-set";
     return false;
   }
   return true;
