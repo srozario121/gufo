@@ -122,6 +122,28 @@
         "flash-next-q4"
       ],
       "help": "With --vocab-trim-set and a fallback threshold above 0: do not pay a full-head read for chain rows that cannot be used. Greedy chains drop the flags after the first unflagged rejected draft token; other chains read a flagged row only when verification reaches it. Output unchanged"
+    },
+    {
+      "name": "--vocab-trim-tier2",
+      "type": "integer",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set: re-score a flagged position over the first N token ids first, and re-run the full head only if the best probability over those and the scored tokens is still under --vocab-trim-tier2-threshold (default: off)"
+    },
+    {
+      "name": "--vocab-trim-tier2-threshold",
+      "type": "number",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-tier2: the second tier's threshold (default: --vocab-trim-fallback-threshold)"
     }
   ],
   "targets": {

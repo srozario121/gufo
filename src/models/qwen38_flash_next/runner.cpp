@@ -862,17 +862,34 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
   model_options->head_trim_timing = flag("--vocab-trim-timing");
   model_options->head_trim_counters = flag("--vocab-trim-counters");
   model_options->head_trim_discard_aware = flag("--vocab-trim-discard-aware");
+  const auto* tier2 =
+      ext::FindOption<std::int64_t>(given, "--vocab-trim-tier2");
+  const auto* tier2_threshold =
+      ext::FindOption<double>(given, "--vocab-trim-tier2-threshold");
+  const bool tier2_on = tier2 != nullptr && *tier2 != 0;
+  const bool trim_ready =
+      set != nullptr && model_options->head_trim_threshold > 0.0F;
   if ((set == nullptr && (model_options->head_trim_timing ||
                           model_options->head_trim_counters)) ||
-      (model_options->head_trim_discard_aware &&
-       (set == nullptr || model_options->head_trim_threshold <= 0.0F))) {
+      (model_options->head_trim_discard_aware && !trim_ready) ||
+      (tier2 != nullptr &&
+       (*tier2 < 0 || *tier2 > 0x7fffffff || (tier2_on && !trim_ready))) ||
+      (tier2_threshold != nullptr &&
+       (!tier2_on || !(*tier2_threshold >= 0.0 && *tier2_threshold <= 1.0)))) {
     if (error)
       *error =
           "--vocab-trim-timing and --vocab-trim-counters need "
-          "--vocab-trim-set; --vocab-trim-discard-aware needs it and a "
-          "fallback threshold above 0";
+          "--vocab-trim-set; --vocab-trim-discard-aware and "
+          "--vocab-trim-tier2 need it and a fallback threshold above 0; "
+          "--vocab-trim-tier2-threshold needs --vocab-trim-tier2 and is in "
+          "[0, 1]";
     return false;
   }
+  if (tier2_on)
+    model_options->head_trim_tier2_rows = static_cast<std::uint32_t>(*tier2);
+  if (tier2_threshold != nullptr)
+    model_options->head_trim_tier2_threshold =
+        static_cast<float>(*tier2_threshold);
   return true;
 }
 

@@ -310,6 +310,10 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
   device_->SetHeadTrimTiming(options.head_trim_timing);
   device_->SetHeadTrimCounters(options.head_trim_counters);
   device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
+  if (!device_->SetHeadTrimTier2(options.head_trim_tier2_rows,
+                                 options.head_trim_tier2_threshold, plan.ids,
+                                 error_msg))
+    return false;
   head_trimmed_ = true;
   std::cerr << "[head-trim] set_ids=" << plan.from_set
             << " special_added=" << plan.added_special
@@ -318,7 +322,13 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
             << " fallback_threshold=" << options.head_trim_threshold
             << " timing=" << (options.head_trim_timing ? 1 : 0)
             << " counters=" << (options.head_trim_counters ? 1 : 0)
-            << " discard_aware=" << (HeadDiscardAware() ? 1 : 0) << '\n';
+            << " discard_aware=" << (HeadDiscardAware() ? 1 : 0)
+            << " tier2_rows=" << options.head_trim_tier2_rows
+            << " tier2_threshold="
+            << (device_->head_trim()->tier2_rows != 0
+                    ? device_->head_trim()->tier2_threshold
+                    : 0.0F)
+            << '\n';
   return true;
 }
 
