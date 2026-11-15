@@ -89,6 +89,17 @@
         "flash-next-q4"
       ],
       "help": "With --vocab-trim-set: re-run the full head for a position whose best probability over the scored rows is below P (default: 0.5; 0 never)"
+    },
+    {
+      "name": "--vocab-trim-timing",
+      "type": "boolean",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set: time the trimmed head's phases on the device and report them per request (head_trim_t_*)"
     }
   ],
   "targets": {

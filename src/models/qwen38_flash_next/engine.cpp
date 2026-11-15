@@ -307,12 +307,14 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
   if (!device_->SetHeadTrim(plan.ids, plan.inverse, plan.padded_rows,
                             options.head_trim_threshold, error_msg))
     return false;
+  device_->SetHeadTrimTiming(options.head_trim_timing);
   head_trimmed_ = true;
   std::cerr << "[head-trim] set_ids=" << plan.from_set
             << " special_added=" << plan.added_special
             << " rows=" << plan.ids.size() << " padded=" << plan.padded_rows
             << " of=" << vocab
-            << " fallback_threshold=" << options.head_trim_threshold << '\n';
+            << " fallback_threshold=" << options.head_trim_threshold
+            << " timing=" << (options.head_trim_timing ? 1 : 0) << '\n';
   return true;
 }
 
@@ -742,6 +744,7 @@ const Session::SpeculativeStats& Session::Statistics() const noexcept {
     stats_.head_rows = head.rows;
     stats_.head_fallbacks = head.fallbacks;
     stats_.head_full_reads = head.full_reads;
+    stats_.head_timing = model_->executor_->HeadTimingStatistics();
   }
   return stats_;
 }
