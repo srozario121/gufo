@@ -9,8 +9,9 @@
 # hosted CI runs: `format` (clang-format), `pr-tests` (the CPU contract suite,
 # `check-pr`), `docs`, `dependency-inventory`. `cache-tests` is not a flake
 # check: it builds the flake's CPU configuration the same way and runs the
-# continuation-cache test, which `check-pr` leaves to the full suite. With no
-# argument all five run.
+# continuation-cache test, which `check-pr` leaves to the full suite. From
+# v0.34.0 the flake's `tests` (the whole CPU suite) and `rust` replace
+# `pr-tests` and `cache-tests`. With no argument the base's default set runs.
 #
 # What it does (FORK.md has the why):
 #   1. Host refusals, before any container: not the fork's main clone; a dirty
@@ -46,7 +47,13 @@ case "${GF_CPUSET:-}" in *[!0-9,-]*) echo "GF_CPUSET must be a cpuset list like 
 
 GF_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GF_CONF="${GF_CONF:-$GF_TOOL_DIR/build.conf}"
-GF_ALL_CHECKS="format pr-tests cache-tests docs dependency-inventory"
+# Upstream renamed its flake checks: up to v0.28.x the CPU contract suite is
+# `pr-tests` and `cache-tests` covers the continuation-cache test it leaves out;
+# from v0.34.0 `tests` builds and runs the whole CPU suite (cache test included)
+# and `rust` checks the Rust components. The default follows the base tag.
+GF_KNOWN_CHECKS="format pr-tests cache-tests tests rust docs dependency-inventory"
+GF_OLD_CHECKS="format pr-tests cache-tests docs dependency-inventory"
+GF_NEW_CHECKS="format tests rust docs dependency-inventory"
 
 gf_say()  { printf '%s\n' "$*" >&2; }
 gf_die()  { printf 'test: %s\n' "$*" >&2; exit "${2:-1}"; }
@@ -200,11 +207,12 @@ gf_cleanup() {
 main() {
   local rc c h12 why
   case "${1:-}" in -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; return 0 ;; esac
-  GF_CHECKS="${*:-$GF_ALL_CHECKS}"
-  for c in $GF_CHECKS; do
-    case " $GF_ALL_CHECKS " in *" $c "*) ;; *) gf_die "usage: test.sh [check ...] (unknown '$c'; one of: $GF_ALL_CHECKS)" 2 ;; esac
+  for c in "$@"; do
+    case " $GF_KNOWN_CHECKS " in *" $c "*) ;; *) gf_die "usage: test.sh [check ...] (unknown '$c'; one of: $GF_KNOWN_CHECKS)" 2 ;; esac
   done
   gf_load_conf
+  case "$BASE_TAG" in v0.[0-9].*|v0.[12][0-9].*) GF_ALL_CHECKS="$GF_OLD_CHECKS" ;; *) GF_ALL_CHECKS="$GF_NEW_CHECKS" ;; esac
+  GF_CHECKS="${*:-$GF_ALL_CHECKS}"
   GF_HEAD="$(git rev-parse HEAD 2>/dev/null)"; h12="${GF_HEAD:0:12}"
   GF_OUT="${XDG_CACHE_HOME:-$HOME/.cache}/gufo-fork-test/${h12:-nohead}"
   GF_NAME="gufo-fork-test-${h12:-nohead}"
