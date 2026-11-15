@@ -40,7 +40,9 @@
 # checks pass, 1 otherwise); GF_DOCKER the docker CLI; GF_MEMINFO a meminfo
 # file; GF_CONF the config file. GF_TEST_MEM_MIB (8192) and GF_TEST_CORES (4) size
 # the container.
+# GF_CPUSET (unset) pins the container to these cores (--cpuset-cpus, e.g. 0-3,8-11).
 set -uo pipefail
+case "${GF_CPUSET:-}" in *[!0-9,-]*) echo "GF_CPUSET must be a cpuset list like 0-3,8-11, got '$GF_CPUSET'" >&2; exit 2 ;; esac
 
 GF_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GF_CONF="${GF_CONF:-$GF_TOOL_DIR/build.conf}"
@@ -174,6 +176,7 @@ INNER
 gf_argv() {  # fills GF_ARGV: the test container's docker argv
   GF_REF="git+file:///work/gufo.git?ref=refs/heads/${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}&rev=$GF_HEAD"
   GF_ARGV=(run --name "$GF_NAME" --pull never --network bridge --cpus "$GF_TEST_CORES"
+    ${GF_CPUSET:+--cpuset-cpus "$GF_CPUSET"}
     --memory "${GF_TEST_MEM_MIB}m" --memory-swap "${GF_TEST_MEM_MIB}m"
     -v "$GF_SRC:/src/gufo:ro" -v "$NIX_VOLUME:/nix" -v "$GF_OUT:/out"
     -e "NIX_CONFIG=experimental-features = nix-command flakes

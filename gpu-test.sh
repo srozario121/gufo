@@ -54,6 +54,7 @@
 # (${XDG_STATE_HOME:-$HOME/.local/state}/ai-sdlc/server-measure.lock),
 # GF_MODEL_DIR, GF_MODEL, GF_MTP,
 # GF_TRIM_SET, GF_LOW_SET, GF_PORT (18099), GF_MAX_TOKENS (256),
+# GF_CPUSET (unset; the build containers' --cpuset-cpus, e.g. 0-3,8-11, to stay off cores other work uses),
 # GF_SHADOW (1 adds the cand-shadow arm: the candidate with GUFO_TRIE_SHADOW set must
 # reply as cand-off and write valid trie v3 shadow records; MTP item 1.32),
 # GF_RUN_DOCKER_EXTRA (extra `docker run` words for the GPU containers, empty by
@@ -88,6 +89,8 @@ GF_LOW_SET="${GF_LOW_SET:-}"
 GF_PORT="${GF_PORT:-18099}"
 GF_MAX_TOKENS="${GF_MAX_TOKENS:-256}"
 GF_RUN_DOCKER_EXTRA="${GF_RUN_DOCKER_EXTRA:-}"
+GF_CPUSET="${GF_CPUSET:-}"
+case "$GF_CPUSET" in *[!0-9,-]*) echo "GF_CPUSET must be a cpuset list like 0-3,8-11, got '$GF_CPUSET'" >&2; exit 2 ;; esac
 for k in GF_BUILD_MEM_MIB GF_BUILD_CORES GF_RUN_MIN_AVAIL_MIB GF_PORT GF_MAX_TOKENS; do
   case "${!k}" in ''|*[!0-9]*) gf_die "$k must be a whole number, got '${!k}'" 2 ;; esac
 done
@@ -175,6 +178,7 @@ gf_container() {
     [ -n "$GF_RUN_DOCKER_EXTRA" ] && argv+=($GF_RUN_DOCKER_EXTRA)
   else
     argv+=(--cpus "$GF_BUILD_CORES" --network bridge)
+    [ -n "$GF_CPUSET" ] && argv+=(--cpuset-cpus "$GF_CPUSET")
   fi
   argv+=("$@" "$NIX_IMAGE" bash -euo pipefail -c
     "trap 'chown -R \"\$GF_OWNER\" /build /logs 2>/dev/null || true' EXIT; $script")

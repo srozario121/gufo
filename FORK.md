@@ -127,6 +127,9 @@ EXPECTED_DRV=/nix/store/izfwqpzfim1bz2n1nj3i6nsbpdww2q6w-gufo-runtime.tar.gz.drv
   the patch range, a linked worktree, a Nix image not by digest or not local,
   more than 16 build cores, a disk budget that does not fit, or too little
   memory. Each is refused before any build container starts.
+- **Cores.** `GF_CPUSET=<list>` (for example `0-3,8-11`) pins the build, test and gpu-test build
+  containers to those cores with `--cpuset-cpus`, so a shared box's other work keeps its cores. Unset, Docker
+  places them anywhere, as before.
 - **Another branch.** `GF_PATCH_BRANCH=<branch> ai-sdlc/build.sh` (and
   `test.sh`) builds a local experiment branch on top of the base, such as an
   item's port or revert branch, in place of `ai-sdlc/<tag>`. HEAD must be on

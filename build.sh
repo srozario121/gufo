@@ -56,12 +56,14 @@
 # file; GF_DF the df used on the out dir; GF_CONF the config file;
 # GF_WATCH_S the watcher's tick (2 s).
 #
+# GF_CPUSET (unset) pins the build container to these cores (--cpuset-cpus, e.g. 0-3,8-11).
 # GF_PATCH_BRANCH (default ai-sdlc/$BASE_TAG) names the branch HEAD must be on,
 # for a local experiment branch on top of the base (item 151's ports, item
 # 152.5's reverts). It sets the refusal, the bare clone's ref and the
 # org.ai-sdlc.gufo-fork.branch label; every other check is unchanged (HEAD must
 # still descend from BASE_COMMIT with no merge).
 set -uo pipefail
+case "${GF_CPUSET:-}" in *[!0-9,-]*) echo "GF_CPUSET must be a cpuset list like 0-3,8-11, got '$GF_CPUSET'" >&2; exit 2 ;; esac
 
 GF_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GF_CONF="${GF_CONF:-$GF_TOOL_DIR/build.conf}"
@@ -261,6 +263,7 @@ gf_argv() {  # fills GF_ARGV: the build container's docker argv
   [ "$mem_mib" -gt 98304 ] && mem_mib=98304
   GF_REF="git+file:///work/gufo.git?ref=refs/heads/${GF_PATCH_BRANCH:-ai-sdlc/$BASE_TAG}&rev=$GF_HEAD"
   GF_ARGV=(run --name "$GF_NAME" --pull never --network bridge --cpus 16
+    ${GF_CPUSET:+--cpuset-cpus "$GF_CPUSET"}
     --memory "${mem_mib}m" --memory-swap "${mem_mib}m"
     -v "$GF_SRC:/src/gufo:ro" -v "$NIX_VOLUME:/nix" -v "$GF_OUT:/out"
     -e "NIX_CONFIG=experimental-features = nix-command flakes
