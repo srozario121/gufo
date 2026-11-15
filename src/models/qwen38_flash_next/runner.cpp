@@ -44,13 +44,25 @@ using QwenFlashNextSession = models::qwen38_flash_next::Session;
 
 /// The trimmed head's counters (head_trim.hpp) over one decode step, as
 /// TextDecodeStep::counters. The counters are the model's, so a batched step
-/// reports the whole step's to each of its requests. Nothing without a
-/// trimmed head.
+/// covers every request of the batch: `head` reports the head statistics
+/// (each request of a batch does, unless --vocab-trim-count-once leaves them
+/// to the first), `rowlog` the row log (only the first request of a batch).
+/// Nothing without a trimmed head.
 void AddHeadTrimCounters(const Model& model,
                          const Session::SpeculativeStats& before,
                          const Session::SpeculativeStats& after,
-                         TextDecodeStep* step) {
+                         TextDecodeStep* step, bool head = true,
+                         bool rowlog = true) {
   if (!model.HeadTrimmed())
+    return;
+  // --vocab-trim-rowlog: head calls by call site.
+  if (rowlog)
+    if (const auto log = after.head_rowlog.Since(before.head_rowlog); log.Any())
+      log.ForEachField([&](const char* name, double value) {
+        step->counters.push_back(
+            {.name = std::string("head_trim_rowhist_") + name, .value = value});
+      });
+  if (!head)
     return;
   const auto rows = static_cast<double>(after.head_rows - before.head_rows);
   const auto fallbacks =
@@ -763,6 +775,7 @@ public:
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
     std::vector<TextDecodeStep> steps(count);
+    bool head_reported = false;
     for (std::size_t i = 0; i < count; ++i) {
       if (!outcomes[i].completed) {
         steps[i].failure = std::make_exception_ptr(
@@ -790,7 +803,16 @@ public:
       step.lookup_tokens = stats.lookup - before[i].lookup;
       step.lookup_accepted_tokens =
           stats.lookup_accepted - before[i].lookup_accepted;
-      AddHeadTrimCounters(*model_, before[i], stats, &step);
+      // The head statistics are the model's: every request of the batch would
+      // report the whole step's. --vocab-trim-count-once gives them to the
+      // first request that decoded (the row log always does, so its sum is
+      // exact).
+      const bool first_report = !head_reported && !results[i].tokens.empty();
+      if (first_report)
+        head_reported = true;
+      AddHeadTrimCounters(*model_, before[i], stats, &step,
+                          first_report || !model_->HeadCountOnce(),
+                          first_report);
     }
     return steps;
   }
@@ -864,6 +886,8 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
   model_options->head_trim_discard_aware = flag("--vocab-trim-discard-aware");
   model_options->head_trim_skip_scored =
       flag("--vocab-trim-fallback-skip-scored");
+  model_options->head_trim_rowlog = flag("--vocab-trim-rowlog");
+  model_options->head_trim_count_once = flag("--vocab-trim-count-once");
   const auto* tier2 =
       ext::FindOption<std::int64_t>(given, "--vocab-trim-tier2");
   const auto* tier2_threshold =
@@ -871,8 +895,10 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
   const bool tier2_on = tier2 != nullptr && *tier2 != 0;
   const bool trim_ready =
       set != nullptr && model_options->head_trim_threshold > 0.0F;
-  if ((set == nullptr && (model_options->head_trim_timing ||
-                          model_options->head_trim_counters)) ||
+  if ((set == nullptr &&
+       (model_options->head_trim_timing || model_options->head_trim_counters ||
+        model_options->head_trim_rowlog ||
+        model_options->head_trim_count_once)) ||
       ((model_options->head_trim_discard_aware ||
         model_options->head_trim_skip_scored) &&
        !trim_ready) ||
@@ -882,8 +908,9 @@ bool ApplyHeadTrimOptions(const ext::ParsedOptions& given, bool use_mtp,
        (!tier2_on || !(*tier2_threshold >= 0.0 && *tier2_threshold <= 1.0)))) {
     if (error)
       *error =
-          "--vocab-trim-timing and --vocab-trim-counters need "
-          "--vocab-trim-set; --vocab-trim-discard-aware, "
+          "--vocab-trim-timing, --vocab-trim-counters, --vocab-trim-rowlog "
+          "and --vocab-trim-count-once need --vocab-trim-set; "
+          "--vocab-trim-discard-aware, "
           "--vocab-trim-tier2 and --vocab-trim-fallback-skip-scored need it "
           "and a fallback threshold above 0; "
           "--vocab-trim-tier2-threshold needs --vocab-trim-tier2 and is in "

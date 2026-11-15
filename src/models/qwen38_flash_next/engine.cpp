@@ -309,6 +309,8 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
     return false;
   device_->SetHeadTrimTiming(options.head_trim_timing);
   device_->SetHeadTrimCounters(options.head_trim_counters);
+  device_->SetHeadTrimRowLog(options.head_trim_rowlog);
+  head_count_once_ = options.head_trim_count_once;
   device_->SetHeadTrimDiscardAware(options.head_trim_discard_aware);
   if (!device_->SetHeadTrimTier2(options.head_trim_tier2_rows,
                                  options.head_trim_tier2_threshold, plan.ids,
@@ -326,6 +328,8 @@ bool Model::LoadHeadTrim(const ModelOptions& options, std::string* error_msg) {
             << " counters=" << (options.head_trim_counters ? 1 : 0)
             << " discard_aware=" << (HeadDiscardAware() ? 1 : 0)
             << " skip_scored=" << (options.head_trim_skip_scored ? 1 : 0)
+            << " rowlog=" << (options.head_trim_rowlog ? 1 : 0)
+            << " count_once=" << (options.head_trim_count_once ? 1 : 0)
             << " tier2_rows=" << options.head_trim_tier2_rows
             << " tier2_threshold="
             << (device_->head_trim()->tier2_rows != 0
@@ -768,6 +772,7 @@ const Session::SpeculativeStats& Session::Statistics() const noexcept {
     stats_.head_full_reads = head.full_reads;
     stats_.head_timing = model_->executor_->HeadTimingStatistics();
     stats_.head_counters = model_->executor_->HeadCounterStatistics();
+    stats_.head_rowlog = model_->executor_->HeadRowLogStatistics();
   }
   return stats_;
 }

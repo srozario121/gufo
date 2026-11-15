@@ -155,6 +155,28 @@
         "flash-next-q4"
       ],
       "help": "With --vocab-trim-set and a fallback threshold above 0: the full-head pass reads only the rows the scored set does not hold and keeps the scored values for the rest (not bit-identical to a full pass)"
+    },
+    {
+      "name": "--vocab-trim-rowlog",
+      "type": "boolean",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set: log every head call by call site (rows, sessions, flagged rows, verification rounds) and report it per request (head_trim_rowhist_*)"
+    },
+    {
+      "name": "--vocab-trim-count-once",
+      "type": "boolean",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "With --vocab-trim-set: report a batched decode step's head statistics to the first request that decoded instead of to every request of the batch (accounting only)"
     }
   ],
   "targets": {
