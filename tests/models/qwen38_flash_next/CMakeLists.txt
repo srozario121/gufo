@@ -53,6 +53,9 @@ if (ENGINE_ENABLE_HIP)
       head_trim_ops)
     add_qwen38_flash_next_test(${name} qwen38_flash_next_test_hip "hip;gpu;gfx1151")
   endforeach()
+  # The head-trim test keeps the replaced fallback kernel as its reference:
+  # device code, so HIP-Clang compiles it whatever the C++ compiler is.
+  set_source_files_properties(head_trim_ops_test.cpp PROPERTIES LANGUAGE HIP)
   # Reuse the synthetic model fixture, with short prompts around a reduced
   # sparse budget. This exercises actual Executor capture/replay without GGUFs.
   add_test(NAME qwen38_flash_next.decode_graph
