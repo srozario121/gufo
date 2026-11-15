@@ -5,9 +5,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <gufo/ext/gguf_reader.hpp>
+#include <iostream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <type_traits>
 
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
@@ -153,8 +156,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
-  if (m->mtp_weights_ &&
-      m->device_->output().rows > speculative::kDraftVocabPrefix) {
+  const bool draft_plan =
+      m->mtp_weights_ && (options.draft_vocab_prefix != 0 ||
+                          !options.draft_vocab_set_path.empty());
+  if (draft_plan) {
+    if (!m->LoadDraftPlan(options, error_msg))
+      return nullptr;
+  } else if (m->mtp_weights_ &&
+             m->device_->output().rows > speculative::kDraftVocabPrefix) {
     std::vector<std::int32_t> specials;
     for (std::uint32_t id = speculative::kDraftVocabPrefix;
          id < m->device_->output().rows; ++id)
@@ -263,7 +272,64 @@ std::size_t Model::ExpandedQ8_0Tensors() const noexcept {
   return count;
 }
 
+bool Model::LoadDraftPlan(const ModelOptions& options, std::string* error_msg) {
+  const std::uint32_t vocab = device_->output().rows;
+  const std::uint32_t prefix = options.draft_vocab_prefix != 0
+                                   ? options.draft_vocab_prefix
+                                   : speculative::kDraftVocabPrefix;
+  if (options.draft_vocab_prefix != 0 && prefix >= vocab) {
+    AssignError(error_msg, "draft vocabulary prefix must leave rows out");
+    return false;
+  }
+  std::vector<std::int32_t> set;
+  if (!options.draft_vocab_set_path.empty()) {
+    std::ifstream in(options.draft_vocab_set_path, std::ios::binary);
+    std::ostringstream text;
+    text << in.rdbuf();
+    if (!in.is_open() || in.bad()) {
+      AssignError(error_msg, "cannot read the draft vocabulary set file");
+      return false;
+    }
+    std::string parse_error;
+    auto ids = speculative::ParseTokenIdList(text.str(), vocab, &parse_error);
+    if (!ids) {
+      AssignError(error_msg, "draft vocabulary set: " + parse_error);
+      return false;
+    }
+    set = std::move(*ids);
+  }
+  if (prefix >= vocab)
+    return true;  // the built-in prefix holds the whole head: no small head
+  std::vector<std::int32_t> specials;
+  for (std::uint32_t id = prefix; id < vocab; ++id)
+    if (tokenizer_->IsSpecialToken(id))
+      specials.push_back(static_cast<std::int32_t>(id));
+  // A vocabulary with more special tokens than table rows drafts over the
+  // full head.
+  if (specials.size() >= speculative::kDraftVocabExtraRows)
+    return true;
+  draft_plan_ =
+      speculative::PlanDraftVocab(prefix, vocab, std::move(specials), set);
+  draft_specials_ = static_cast<std::uint32_t>(draft_plan_.rows.size());
+  if (!device_->SetDraftVocab(prefix, draft_plan_.rows, error_msg))
+    return false;
+  draft_subset_ = true;
+  // One line at load, so a run records what the draft head scores.
+  std::cerr << "[draft-vocab] prefix=" << prefix
+            << " static_rows=" << draft_plan_.rows.size()
+            << " set_ids=" << draft_plan_.set_ids
+            << " set_below_prefix=" << draft_plan_.set_prefix
+            << " set_rows=" << draft_plan_.set_rows
+            << " set_dropped=" << draft_plan_.set_dropped << '\n';
+  return true;
+}
+
 bool Model::InDraftSubset(std::int32_t token) const {
+  if (!draft_plan_.member.empty())
+    return token >= 0 &&
+           (static_cast<std::uint32_t>(token) < draft_plan_.prefix ||
+            (static_cast<std::size_t>(token) < draft_plan_.member.size() &&
+             draft_plan_.member[static_cast<std::size_t>(token)]));
   return token >= 0 &&
          (static_cast<std::uint32_t>(token) < speculative::kDraftVocabPrefix ||
           tokenizer_->IsSpecialToken(

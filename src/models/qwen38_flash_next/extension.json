@@ -45,6 +45,28 @@
         "flash-next-q4"
       ],
       "help": "MTP draft model path for speculative decoding"
+    },
+    {
+      "name": "--mtp-draft-vocab-prefix",
+      "type": "integer",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "Output rows the MTP draft head scores in place (default: 98304; fewer rows read less per draft token; the target still verifies over every row; needs --speculative mtp)"
+    },
+    {
+      "name": "--mtp-draft-vocab-set",
+      "type": "path",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "flash-next-q4"
+      ],
+      "help": "Token-ID list (one decimal ID per line) the MTP draft also scores above its prefix (needs --speculative mtp)"
     }
   ],
   "targets": {

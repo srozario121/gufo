@@ -57,6 +57,13 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
+  /// Output rows the MTP draft head scores in place (draft_vocab.hpp). Zero
+  /// keeps speculative::kDraftVocabPrefix. A lower prefix reads fewer rows per
+  /// draft token; the target still verifies over the whole vocabulary.
+  std::uint32_t draft_vocab_prefix = 0;
+  /// Optional token-ID list (one decimal ID per line) added to every
+  /// session's draft table above the prefix. Empty adds none.
+  std::string draft_vocab_set_path;
 };
 
 class Session;
@@ -135,10 +142,18 @@ private:
   MtpBatchController batch_policy_;
   /// MTP drafts may use the small head (draft_vocab.hpp).
   bool draft_subset_{false};
-  /// Special tokens at the start of every session's draft table.
+  /// Static rows at the start of every session's draft table: the special
+  /// tokens, then (with a draft set) the set's IDs above the prefix.
   std::uint32_t draft_specials_{0};
-  /// Prefix and special tokens: always in the small head.
+  /// The small head's run-time prefix and static rows (draft_vocab.hpp); empty
+  /// unless ModelOptions::draft_vocab_prefix or draft_vocab_set_path is set.
+  speculative::DraftVocabPlan draft_plan_;
+  /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
+  /// Sets the small head from ModelOptions::draft_vocab_prefix and
+  /// draft_vocab_set_path (draft_plan_).
+  [[nodiscard]] bool LoadDraftPlan(const ModelOptions& options,
+                                   std::string* error_msg);
 
   friend class Session;
   friend class ContinuationAdapter;

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -19,6 +20,7 @@
 #include "gufo/ext/experimental/admission_query.hpp"
 #include "gufo/ext/gguf_identity.hpp"
 #include "gufo/ext/host_budget.hpp"
+#include "gufo/ext/options.hpp"
 #include "src/families/qwen/control_tokens/control_tokens.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
 #include "src/families/qwen/text/tokenizer.hpp"
@@ -791,6 +793,30 @@ private:
   cache::Identity component_identity_;
 };
 
+bool ApplyDraftVocabOptions(const ext::ParsedOptions& given, bool use_mtp,
+                            ModelOptions* model_options, std::string* error) {
+  const auto* prefix =
+      ext::FindOption<std::int64_t>(given, "--mtp-draft-vocab-prefix");
+  const auto* set =
+      ext::FindOption<std::string>(given, "--mtp-draft-vocab-set");
+  if (prefix == nullptr && set == nullptr)
+    return true;
+  if (!use_mtp ||
+      (prefix != nullptr &&
+       (*prefix < 0 || *prefix > std::numeric_limits<std::uint32_t>::max()))) {
+    if (error)
+      *error =
+          "--mtp-draft-vocab-prefix and --mtp-draft-vocab-set need "
+          "--speculative mtp and a 32-bit prefix";
+    return false;
+  }
+  if (prefix != nullptr)
+    model_options->draft_vocab_prefix = static_cast<std::uint32_t>(*prefix);
+  if (set != nullptr)
+    model_options->draft_vocab_set_path = *set;
+  return true;
+}
+
 }  // namespace
 
 std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
@@ -857,19 +883,19 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
       *error = "Qwen3.8-Flash-Next MTP HTTP decoding requires --mtp-model";
     return nullptr;
   }
+  ModelOptions model_options{
+      .max_context = max_context,
+      .mtp_model_path =
+          use_mtp ? options.speculative.draft_model_path : std::string{},
+      .vision_model_path = options.vision_model_path,
+      .decode_concurrency = DecodeConcurrencyForSessions(options.session_count),
+      .rope_scaling = rope_scaling,
+  };
+  if (!ApplyDraftVocabOptions(options.provider_options, use_mtp, &model_options,
+                              error))
+    return nullptr;
   std::string load_error;
-  auto model = Model::Load(
-      options.model_path,
-      ModelOptions{
-          .max_context = max_context,
-          .mtp_model_path =
-              use_mtp ? options.speculative.draft_model_path : std::string{},
-          .vision_model_path = options.vision_model_path,
-          .decode_concurrency =
-              DecodeConcurrencyForSessions(options.session_count),
-          .rope_scaling = rope_scaling,
-      },
-      &load_error);
+  auto model = Model::Load(options.model_path, model_options, &load_error);
   if (!model) {
     if (error)
       *error = "Failed to load Flash-Next model: " + load_error;
