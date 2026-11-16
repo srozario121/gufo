@@ -288,6 +288,12 @@ Push state (2026-11-03, the maintainer's choice that day "Publish all of them" a
 lease item 876). Every experiment branch above, and `ai-sdlc/v0.28.1-876`, is pushed, each with `leakcheck.sh
 --range` clean, noreply authors and no merges.
 
+Push state (2026-11-16, the maintainer's choice that day "Push both"): `ai-sdlc/v0.34.0-vocab-trim` (`7bc5a4fa`, the
+vocab-trim series ported onto `ai-sdlc/v0.34.0` for item 185.4; its image is
+`ai-sdlc/gufo-runtime-fork@sha256:a6d5c2b1c7372f20801b614bf1cb08cab3935fb2d8c5b30185671e811191d192`) and
+`ai-sdlc/tooling` are pushed, each with `leakcheck.sh --range` clean, noreply authors and no merges.
+`ai-sdlc/v0.34.0` does not move; the deployment's evaluation decides whether the port is served.
+
 ## Push checklist
 
 Do every item, every push:
