@@ -247,6 +247,12 @@ gf_prepare() {
       git_ archive "$sha" | tar -x -C "$td/src" || gf_die "git archive of $sha failed" 3
       printf '%s\n' "$sha" > "$td/src.sha"
     fi
+    # From v0.34.0 the model-backed GPU tests (external-model label) are
+    # EXCLUDE_FROM_ALL behind qwen38_flash_next_model_tests; build them too.
+    if [ "$tree" = cand ] && grep -qs 'add_custom_target(qwen38_flash_next_model_tests' \
+        "$td/src/tests/models/qwen38_flash_next/CMakeLists.txt"; then
+      targets="$targets qwen38_flash_next_model_tests"
+    fi
     gf_say "gpu-test: building $tree at ${sha:0:12} ($targets), log $GF_OUT/logs/gufo-gpu-build-$tree.log"
     gf_container "gufo-gpu-build-$tree" "$GF_BUILD_MEM_MIB" 0 "$tree" "$GF_ENV_SCRIPT
 nix develop --no-write-lock-file path:/src#default -c bash -euo pipefail -c '
@@ -408,7 +414,9 @@ gf_run() {
   gf_say "gpu-test: GPU operator tests on the candidate"
   gf_container gufo-gpu-ctest "$runmem" 1 cand "$GF_ENV_SCRIPT
 nix develop --no-write-lock-file path:/src#default -c \
-  ctest --test-dir /build -L gpu -R '^qwen38_flash_next\\.' --output-on-failure --timeout 900"
+  ctest --test-dir /build -L gpu -R '^qwen38_flash_next\\.' --output-on-failure --timeout 1800" \
+    -v "$GF_MODEL_DIR:/models:ro" -e "QWEN38_FLASH_NEXT_MODEL=/models/$GF_MODEL" \
+    -e "QWEN38_FLASH_NEXT_MTP_MODEL=/models/$GF_MTP"
   r=$?; [ "$r" = 5 ] && gf_die "$(cat "$GF_OUT/logs/gufo-gpu-ctest.stopped")" 5
   [ "${GF_DRY_RUN:-0}" = 1 ] || { [ "$r" = 0 ] && gf_result gpu_ops PASS || { gf_result gpu_ops FAIL; rc=3; }; }
 
