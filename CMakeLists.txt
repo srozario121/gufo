@@ -924,6 +924,11 @@ endfunction()
   target_link_libraries(audio_websocket_test PRIVATE gufo_http)
   add_test(NAME audio_websocket_test COMMAND audio_websocket_test)
   set_tests_properties(audio_websocket_test PROPERTIES LABELS "cpu;server;audio" TIMEOUT 30)
+
+  add_executable(voice_chain_test tests/cli/voice_chain_test.cpp)
+  target_link_libraries(voice_chain_test PRIVATE gufo_http)
+  add_test(NAME voice_chain_test COMMAND voice_chain_test)
+  set_tests_properties(voice_chain_test PROPERTIES LABELS "cpu;server;audio" TIMEOUT 30)
   endif()
 
   add_test(NAME serve_cli_test

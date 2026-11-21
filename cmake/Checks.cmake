@@ -26,7 +26,7 @@ set(gufo_pr_targets
   logit_sampler_test ggml_dequant_test
   quote_tracker_test logprobs_test sampling_test image_api_test
   openai_chat_test http_server_test http_server_signals_test trace_test
-  audio_websocket_test
+  audio_websocket_test voice_chain_test
   text_generation_scheduler_test layered_prefill_conformance_test
   component_text_cache_test text_model_runner_test
   bench_cli_test prompt_cli_test text_cli_dispatch_test eval_http_client_test
