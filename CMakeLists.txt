@@ -423,6 +423,7 @@ add_library(gufo_http STATIC
   src/cli/serve/websocket.cpp
   src/cli/serve/asr_websocket.cpp
   src/cli/serve/voice_websocket.cpp
+  src/cli/serve/voice_chain.cpp
   src/cli/serve/voice_page.cpp
   src/cli/serve/decision_service.cpp
   src/cli/serve/tts_websocket.cpp
