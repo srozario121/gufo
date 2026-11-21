@@ -136,7 +136,9 @@ broken output, then delete the file: it holds whole conversations.
   each; see [Qwen3-ASR](models/qwen3-asr.md) and
   [Qwen3-TTS](models/qwen3-tts.md). `gufo transcribe` and `gufo speak` run
   the same models without a server. Models with an audio projector accept
-  `--mmproj`.
+  `--mmproj`. `gufo serve asr --voice-chain-llm URL --voice-chain-model ID
+  --voice-chain-tts DIR` adds spoken conversations through a chat server
+  ([spoken conversations](models/qwen3-asr.md#spoken-conversations)).
 - **Images:** `gufo serve image --model DIR`; see
   [Qwen-Image-2.1](models/qwen-image-2.1.md). Register LoRA adapters with
   `--lora NAME=PATH`; requests select them by name

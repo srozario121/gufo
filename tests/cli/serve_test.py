@@ -90,6 +90,27 @@ def main():
         assert ("--voice " in text) == (modality == "tts")
         assert "--served-model-name" in text
     check(["serve", "asr", "--voice", "x=y"], 2, "Unknown option")
+    # The voice chain of `serve asr`: its flags go together and are checked
+    # before any model loads.
+    assert "--voice-chain-llm" in check(["serve", "asr", "--help"], 0,
+                                        "--voice-chain-tts")
+    assert "--voice-chain" not in check(["serve", "tts", "--help"], 0,
+                                        "--model")
+    check(["serve", "tts", "--voice-chain-llm", "http://x"], 2,
+          "Unknown option")
+    for partial in (["--voice-chain-llm", "http://127.0.0.1:1"],
+                    ["--voice-chain-voice", "vivian"],
+                    ["--voice-chain-llm", "http://127.0.0.1:1",
+                     "--voice-chain-model", "m"]):
+        check(["serve", "asr", "--model", "/missing", *partial], 2,
+              "are required together")
+    check(["serve", "asr", "--model", "/missing", "--voice-chain-llm",
+           "ftp://x", "--voice-chain-model", "m", "--voice-chain-tts",
+           "/missing-tts"], 2, "must be an http:// or https:// URL")
+    # Complete flags pass validation and fail at the missing TTS model.
+    check(["serve", "asr", "--model", "/missing", "--voice-chain-llm",
+           "http://127.0.0.1:1", "--voice-chain-model", "m",
+           "--voice-chain-tts", "/missing-tts"], 1, "--voice-chain-tts")
     text = check(["transcribe", "--help"], 0, "--prompt")
     assert "--context" in text
 

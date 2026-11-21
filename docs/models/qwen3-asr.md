@@ -67,6 +67,39 @@ the joined text can differ from transcribing the whole recording at once.
 Gufo doesn't detect speech turns itself, revise earlier text, or return
 timestamps.
 
+## Spoken conversations
+
+`gufo serve asr` can also hold a spoken, tool-calling conversation on
+`/v1/realtime` (without `intent`), using the OpenAI Realtime conversation
+messages. Each user turn is transcribed by this model, answered by a chat
+server through its streaming `POST /v1/chat/completions`, and spoken by a
+Qwen3-TTS CustomVoice model loaded in the same process:
+
+```sh
+gufo serve llm --model "$LLM" --port 18091
+gufo serve asr --model models/Qwen3-ASR-1.7B \
+  --voice-chain-llm http://127.0.0.1:18091 \
+  --voice-chain-model qwen3.8-flash-next \
+  --voice-chain-tts models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --voice-chain-voice vivian
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--voice-chain-llm URL` | Base URL of the OpenAI-compatible chat server |
+| `--voice-chain-model ID` | Model ID sent to that server |
+| `--voice-chain-tts DIR` | Qwen3-TTS CustomVoice model that speaks the answers |
+| `--voice-chain-voice NAME` | Its speaker (default: `vivian`, or its first) |
+
+The first three go together; without them the server transcribes only, as
+before. Session instructions become the system message and session tools the
+chat request's `tools`; function calls and their outputs stay in the
+conversation. Speech starts at the end of the first sentence and continues
+sentence by sentence while the answer streams. When the user interrupts,
+the conversation keeps the sentences they heard, the interrupted one whole.
+A turn with no recognised words gets no answer. Reasoning text is never
+spoken.
+
 ## Serving
 
 Two requests can prepare audio at the same time; the GPU work runs one piece at

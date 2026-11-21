@@ -46,6 +46,7 @@
 #include "src/cli/serve/audio_buffer.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
+#include "src/cli/serve/voice_chain.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
 
@@ -466,6 +467,12 @@ struct SpeechOptions {
   std::vector<std::pair<std::string, std::string>> voice_specs;
   std::map<std::string, std::string> voice_text_specs;
   std::map<std::string, std::string> voice_lang_specs;
+  // Spoken conversations of `serve asr` through a chat server and a TTS
+  // model (voice chain).
+  std::string voice_chain_llm;
+  std::string voice_chain_model;
+  std::filesystem::path voice_chain_tts;
+  std::string voice_chain_voice;
 };
 
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
@@ -484,8 +491,25 @@ void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
                        : "Context capacity per audio chunk (default: 1024)",
                    "Model", &options->context);
   AddServedModelNamesOption(parser, &options->served_model_names);
-  if (!tts)
+  if (!tts) {
+    parser.AddOption("", "--voice-chain-llm", "URL",
+                     "Hold spoken conversations on /v1/realtime: answer each "
+                     "transcribed turn with this OpenAI-compatible chat "
+                     "server (base URL, e.g. http://127.0.0.1:8080); needs "
+                     "--voice-chain-model and --voice-chain-tts",
+                     "Voice chain", &options->voice_chain_llm);
+    parser.AddOption("", "--voice-chain-model", "ID",
+                     "Model ID sent to the --voice-chain-llm server",
+                     "Voice chain", &options->voice_chain_model);
+    parser.AddOption("", "--voice-chain-tts", "DIR",
+                     "Qwen3-TTS CustomVoice model that speaks the answers",
+                     "Voice chain", &options->voice_chain_tts);
+    parser.AddOption("", "--voice-chain-voice", "NAME",
+                     "Speaker of the --voice-chain-tts model (default: "
+                     "vivian, or its first speaker)",
+                     "Voice chain", &options->voice_chain_voice);
     return;
+  }
   parser.AddCustomOption(
       "", "--voice", "NAME=PATH",
       "Register a named Qwen3-TTS Base voice from a reference WAV "
@@ -1352,6 +1376,26 @@ int RunServe(std::span<const char* const> args) {
                 << '\n';
       return 2;
     }
+    const bool voice_chain =
+        !options.voice_chain_llm.empty() ||
+        !options.voice_chain_model.empty() ||
+        !options.voice_chain_tts.empty() ||
+        !options.voice_chain_voice.empty();
+    if (voice_chain) {
+      if (options.voice_chain_llm.empty() ||
+          options.voice_chain_model.empty() ||
+          options.voice_chain_tts.empty()) {
+        std::cerr << "Error: --voice-chain-llm, --voice-chain-model and "
+                     "--voice-chain-tts are required together\n";
+        return 2;
+      }
+      if (!options.voice_chain_llm.starts_with("http://") &&
+          !options.voice_chain_llm.starts_with("https://")) {
+        std::cerr << "Error: --voice-chain-llm must be an http:// or "
+                     "https:// URL\n";
+        return 2;
+      }
+    }
     ModelLoadLog load_log(subcommand, options.model);
     if (is_tts) {
       std::map<std::string, server::TtsVoicePreset> voice_presets;
@@ -1386,16 +1430,81 @@ int RunServe(std::span<const char* const> args) {
           "model=" + tts->model_id() +
           " sessions=1 context_tokens=" + std::to_string(options.context));
     } else {
+      server::AsrServiceOptions asr_options{
+          .model_root = options.model,
+          .projector_path = options.mmproj,
+          .native_context_tokens = options.context,
+          .validate_model = true,
+          .model_id = PrimaryModelName(options.served_model_names),
+          .model_aliases = ModelAliases(options.served_model_names),
+          .runner = {},
+      };
+      // The chain transcribes with the service it is part of, which exists
+      // only once constructed; conversations open after that.
+      auto chain_asr = std::make_shared<server::AsrService*>(nullptr);
+      std::string chain_speaker;
+      if (voice_chain) {
+        std::shared_ptr<server::TtsService> chain_tts;
+        try {
+          chain_tts =
+              std::make_shared<server::TtsService>(server::TtsServiceOptions{
+                  .model_root = options.voice_chain_tts,
+                  .validate_model = true,
+              });
+        } catch (const std::exception& error) {
+          std::cerr << "Error loading --voice-chain-tts: " << error.what()
+                    << '\n';
+          return 1;
+        }
+        if (!chain_tts->ready()) {
+          std::cerr << "Error enabling --voice-chain-tts: "
+                    << chain_tts->initialization_error() << '\n';
+          return 1;
+        }
+        const auto& conditioning = chain_tts->conditioning();
+        const auto voices = chain_tts->voices();
+        if (!conditioning.unconditioned ||
+            conditioning.instructions == ext::TtsConditioningMode::kRequired ||
+            voices.empty()) {
+          std::cerr << "Error: --voice-chain-tts must be a Qwen3-TTS "
+                       "CustomVoice model with named speakers\n";
+          return 1;
+        }
+        chain_speaker = options.voice_chain_voice;
+        if (chain_speaker.empty())
+          chain_speaker = std::ranges::find(voices, "vivian") != voices.end()
+                              ? std::string("vivian")
+                              : voices.front();
+        if (std::ranges::find(voices, chain_speaker) == voices.end()) {
+          std::string names;
+          for (const auto& name : voices)
+            names += (names.empty() ? "" : ", ") + name;
+          std::cerr << "Error: --voice-chain-voice '" << chain_speaker
+                    << "' is not a speaker of the TTS model (" << names
+                    << ")\n";
+          return 2;
+        }
+        asr_options.voice =
+            [chain_asr,
+             chat = server::CreateHttpChainChatClient(
+                 options.voice_chain_llm, options.voice_chain_model),
+             synthesizer = server::CreateTtsChainSynthesizer(
+                 chain_tts, chain_speaker)](std::uint32_t rate,
+                                            std::string* error)
+            -> std::unique_ptr<server::VoiceConversation> {
+          if (*chain_asr == nullptr) {
+            *error = "the ASR service is not ready";
+            return nullptr;
+          }
+          return server::CreateChainConversation(
+              {.chat = chat,
+               .transcriber = server::CreateAsrChainTranscriber(*chain_asr),
+               .synthesizer = synthesizer},
+              rate, error);
+        };
+      }
       try {
-        asr = std::make_shared<server::AsrService>(server::AsrServiceOptions{
-            .model_root = options.model,
-            .projector_path = options.mmproj,
-            .native_context_tokens = options.context,
-            .validate_model = true,
-            .model_id = PrimaryModelName(options.served_model_names),
-            .model_aliases = ModelAliases(options.served_model_names),
-            .runner = {},
-        });
+        asr = std::make_shared<server::AsrService>(std::move(asr_options));
       } catch (const std::exception& error) {
         std::cerr << "Error loading Qwen3-ASR: " << error.what() << '\n';
         return 1;
@@ -1405,6 +1514,13 @@ int RunServe(std::span<const char* const> args) {
                   << asr->initialization_error() << '\n';
         return 1;
       }
+      *chain_asr = asr.get();
+      if (voice_chain)
+        server::Logger::Info(
+            "asr", "event=voice_chain llm=" + options.voice_chain_llm +
+                       " model=" + options.voice_chain_model +
+                       " tts=" + options.voice_chain_tts.string() +
+                       " voice=" + chain_speaker);
       load_log.Complete(
           "model=" + asr->model_id() +
           " sessions=1 context_tokens=" + std::to_string(options.context));
