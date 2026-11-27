@@ -262,6 +262,12 @@
       "windows_build": true
     },
     {
+      "target": "qwen38_flash_next_mtp_depth_test",
+      "ctest": "qwen38_flash_next\\.mtp_depth",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
       "target": "qwen38_flash_next_trie_draft_test",
       "ctest": "qwen38_flash_next\\.trie_draft",
       "check_pr": true,

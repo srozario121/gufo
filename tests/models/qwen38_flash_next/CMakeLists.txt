@@ -38,6 +38,7 @@ add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 add_qwen38_flash_next_test(head_trim gufo_core "cpu")
 add_qwen38_flash_next_test(trie_draft gufo_core "cpu")
 add_qwen38_flash_next_test(trie_shadow gufo_core "cpu")
+add_qwen38_flash_next_test(mtp_depth gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
@@ -112,10 +113,18 @@ if (ENGINE_ENABLE_HIP)
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
     qwen38_flash_next_test_hip)
+  # Depth-14 probe build: every limit 7..14 against ordinary decoding, chains
+  # past eight rows through ForwardWide (needs the model files; run by hand,
+  # see the file's usage).
+  add_executable(qwen38_flash_next_depth_session_test EXCLUDE_FROM_ALL
+    depth_session_test.cpp)
+  target_link_libraries(qwen38_flash_next_depth_session_test PRIVATE
+    qwen38_flash_next_test_hip)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test
-      qwen38_flash_next_layered_prefill_test)
+      qwen38_flash_next_layered_prefill_test
+      qwen38_flash_next_depth_session_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)
