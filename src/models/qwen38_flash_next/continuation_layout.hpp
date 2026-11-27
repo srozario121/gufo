@@ -41,7 +41,7 @@ struct ContinuationComponent {
 // model-owned length policy, PLE n-gram tail, hidden frontier and input
 // identity. Vision layout is rebuilt from the matching request attachment on
 // restoration.
-inline constexpr std::size_t kContinuationMetadataBytes = 160;
+inline constexpr std::size_t kContinuationMetadataBytes = 224;
 
 struct ContinuationBackingClass {
   std::size_t block_bytes{}, blocks{}, metadata_bytes{};

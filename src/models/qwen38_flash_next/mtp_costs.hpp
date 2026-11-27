@@ -5,8 +5,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 
 namespace gufo::models::qwen38_flash_next {
+
+/// Verification widths the cost tables measure: 1..8 rows, at most seven MTP
+/// drafts and the anchor. A longer chain (kMaxMtpDraftTokens) is never priced
+/// from these tables; the controllers stop their scans at the last measured
+/// width (mtp_policy.hpp).
+inline constexpr std::size_t kMtpCostWidths = 8;
 
 // gfx1151, pinned Flash-Next Q4 target/Q8 MTP, 2026-09-20. Milliseconds per
 // cohort, including catch-up, recursive proposals and target verification.
@@ -53,6 +60,8 @@ inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
     {35.1F, 42.9F, 48.7F, 54.8F, 60.8F, 66.5F, 74.3F, 81.5F},
     {35.2F, 42.9F, 48.9F, 55.1F, 60.9F, 66.5F, 74.4F, 81.5F},
 };
+static_assert(std::size(kMtpCycleMilliseconds[0][0]) == kMtpCostWidths &&
+              std::size(kMtpSampledSubsetMilliseconds[0]) == kMtpCostWidths);
 
 // Seeded sampled policy uses fixed configured capacity for reproducibility;
 // greedy batch policy uses these curves to bootstrap each physical occupancy,
@@ -60,7 +69,7 @@ inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
 // decoding with it (MtpPolicyConcurrency).
 // Intermediate capacities use the next measured cohort. Context costs
 // interpolate, then extrapolate the measured QSA slope to the native limit.
-[[nodiscard]] inline std::array<float, 8> MtpCycleCosts(
+[[nodiscard]] inline std::array<float, kMtpCostWidths> MtpCycleCosts(
     std::uint32_t context, std::uint32_t concurrency,
     bool sampled_subset = false) noexcept {
   const auto cohort = concurrency <= 1   ? 0
@@ -79,7 +88,7 @@ inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
   const auto* high_row = sampled_subset && cohort == 0
                              ? kMtpSampledSubsetMilliseconds[interval + 1]
                              : kMtpCycleMilliseconds[interval + 1][cohort];
-  std::array<float, 8> costs{};
+  std::array<float, kMtpCostWidths> costs{};
   for (std::size_t i = 0; i < costs.size(); ++i) {
     const auto low = low_row[i];
     const auto high = high_row[i];

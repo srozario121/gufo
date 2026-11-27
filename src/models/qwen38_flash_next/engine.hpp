@@ -50,7 +50,7 @@ struct ModelOptions {
   /// speculative decoding off.
   std::string mtp_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
-  std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
+  std::uint32_t max_draft_tokens = kDefaultMtpDraftTokens;
   std::string vision_model_path;
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
@@ -332,7 +332,7 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 19;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(

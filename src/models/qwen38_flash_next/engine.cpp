@@ -90,7 +90,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!options.mtp_model_path.empty() &&
       options.max_draft_tokens > kMaxMtpDraftTokens) {
     AssignError(error_msg,
-                "Flash-Next MTP supports at most seven draft tokens");
+                "Flash-Next MTP supports at most fourteen draft tokens");
     return nullptr;
   }
   m->options_ = options;
@@ -885,8 +885,16 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
       return false;
     if (replays[i].empty())
       continue;
-    items.push_back({session.session_.get(), replays[i], hidden_row,
-                     propose.empty() || !propose[i]});
+    const bool kv_only = propose.empty() || !propose[i];
+    // A chain longer than a batched one (a lone cycle past seven drafts)
+    // catches up on its own, as a batch of one would.
+    if (replays[i].size() > kMaxBatchedMtpDraftTokens + 1) {
+      if (!exec.MtpForward(*session.session_, replays[i], hidden_row,
+                           {.kv_only = kv_only}, error_msg))
+        return false;
+      continue;
+    }
+    items.push_back({session.session_.get(), replays[i], hidden_row, kv_only});
   }
   return items.empty() || exec.MtpForwardBatch(items, error_msg);
 }
@@ -1193,8 +1201,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   };
   rocm::Executor& exec = *model_->executor_;
   const std::size_t room = ContextSize() - tokens_.size();
-  const std::size_t cap =
-      std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  // A deferred head is a batched cycle: its chain verifies in the decode
+  // batch's rows (kMaxBatchedMtpDraftTokens), whatever the session limit.
+  const std::size_t cap = std::min<std::size_t>(
+      {max_tokens, room, exec.max_speculative(),
+       defer_head ? std::size_t{kMaxBatchedMtpDraftTokens} + 1
+                  : std::numeric_limits<std::size_t>::max()});
   // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
   // jointly planned (DecodeBatchImpl), so a sampled request decides the same
   // way alone and in any batch. A greedy request decoding alone has no

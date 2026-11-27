@@ -592,6 +592,11 @@ struct GreedyPenaltyRows {
   const sampling::TokenPenalty* penalties;
   std::uint32_t offsets[8]{};
 };
+/// Rows one PenalizedArgmax or VerificationCandidates launch takes (its
+/// offsets bound them); a longer chain is verified in consecutive launches.
+inline constexpr std::uint32_t kGreedyPenaltyRowsPerLaunch = 7;
+static_assert(sizeof(GreedyPenaltyRows::offsets) ==
+              (kGreedyPenaltyRowsPerLaunch + 1) * sizeof(std::uint32_t));
 struct PenaltyArgmaxCandidate {
   double value;
   std::int32_t index;

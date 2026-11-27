@@ -1296,7 +1296,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     std::construct_at(e->mtp_candidates_host_);
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
-    const auto rows = std::min<std::size_t>(7, e->options_.max_speculative - 1);
+    const auto rows = std::size_t{e->options_.max_speculative} - 1;
     if (rows != 0) {
       e->verification_ids_ = Alloc<std::uint32_t>(
           a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
@@ -4600,8 +4600,9 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     std::span<const std::int32_t> drafts,
                                     std::string* error_msg) const {
   const auto rows = predictions.size();
-  if (rows == 0 || rows > options_.max_logit_rows || rows > 7 ||
-      drafts.size() != rows || s_.mtp_ids == nullptr) {
+  if (rows == 0 || rows > options_.max_logit_rows ||
+      rows >= options_.max_speculative || drafts.size() != rows ||
+      s_.mtp_ids == nullptr) {
     AssignError(error_msg, "invalid greedy MTP verification request");
     return false;
   }
@@ -4616,11 +4617,11 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
     // Drafts may violate the target grammar. Only their conditional penalty
     // history is needed here; FinishDecode checks each winner's grammar.
     auto tentative = sampler.WithoutConstraint();
-    GreedyPenaltyRows batch{};
+    std::vector<std::uint32_t> offsets(rows + 1, 0);
     for (std::size_t row = 0; row < rows; ++row) {
       const auto counts = tentative.penalties();
       penalties.insert(penalties.end(), counts.begin(), counts.end());
-      batch.offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
+      offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
       if (row + 1 < rows)
         tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
     }
@@ -4635,7 +4636,6 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
       verification_penalties_ = allocated;
       verification_penalty_capacity_ = capacity;
     }
-    batch.penalties = verification_penalties_;
     if (!penalties.empty() &&
         !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
                               penalties.size() * sizeof(penalties.front()),
@@ -4643,11 +4643,24 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                "verification penalty upload", error_msg))
       return false;
     const auto& config = sampler.config();
-    PenalizedArgmax(
-        VerificationLogits(), batch, config.repeat_penalty,
-        config.frequency_penalty, config.presence_penalty,
-        reinterpret_cast<PenaltyArgmaxCandidate*>(s_.mtp_scratch_ids),
-        s_.mtp_argmax, rows, vocab, stream_);
+    // Up to kGreedyPenaltyRowsPerLaunch rows take one launch, as before; a
+    // longer chain continues in consecutive launches over its later rows.
+    // Offsets index the whole upload, so each launch keeps them unchanged.
+    for (std::size_t first = 0; first < rows;
+         first += kGreedyPenaltyRowsPerLaunch) {
+      const auto count = std::min<std::size_t>(kGreedyPenaltyRowsPerLaunch,
+                                               rows - first);
+      GreedyPenaltyRows batch{};
+      batch.penalties = verification_penalties_;
+      std::copy_n(offsets.begin() + first, count + 1, batch.offsets);
+      PenalizedArgmax(
+          VerificationLogits() + first * vocab, batch, config.repeat_penalty,
+          config.frequency_penalty, config.presence_penalty,
+          reinterpret_cast<PenaltyArgmaxCandidate*>(s_.mtp_scratch_ids) +
+              first * kArgmaxParts,
+          s_.mtp_argmax + first, static_cast<std::uint32_t>(count), vocab,
+          stream_);
+    }
   } else {
     gufo::hip::LaunchBatchedGPUArgmax(
         VerificationLogits(), s_.mtp_ids, rows, vocab,
@@ -4683,7 +4696,7 @@ bool Executor::SampledMtpCandidates(
     const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
     std::string* error_msg) const {
   const auto rows = output.size();
-  if (rows == 0 || rows > 7 || rows >= options_.max_speculative ||
+  if (rows == 0 || rows >= options_.max_speculative ||
       rows != drafts.size() || verification_ids_ == nullptr ||
       !CanCompactMtpVerification(sampler)) {
     AssignError(error_msg, "invalid compact MTP verification request");
@@ -4691,25 +4704,39 @@ bool Executor::SampledMtpCandidates(
   }
   auto& penalties = verification_penalty_host_;
   penalties.clear();
-  GreedyPenaltyRows batch{};
+  std::vector<std::uint32_t> offsets(rows + 1, 0);
   auto tentative = sampler.WithoutConstraint();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto counts = tentative.penalties();
     penalties.insert(penalties.end(), counts.begin(), counts.end());
-    batch.offsets[row + 1] = penalties.size();
+    offsets[row + 1] = static_cast<std::uint32_t>(penalties.size());
     if (row + 1 < rows)
       tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
   }
-  batch.penalties = verification_penalties_;
   if (!penalties.empty() &&
       !Check(hipMemcpyAsync(verification_penalties_, penalties.data(),
                             penalties.size() * sizeof(penalties[0]),
                             hipMemcpyHostToDevice, stream_),
              "compact verification penalties", error_msg))
     return false;
-  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
-                         verification_scratch_ids_, verification_candidates_,
-                         rows, config().vocab_size, stream_);
+  // As in GreedyMtpPredictions: one launch up to kGreedyPenaltyRowsPerLaunch
+  // rows, then consecutive launches. Row r's output still starts at
+  // r * kMtpCandidates + offsets[r], and each row owns its ID workspace.
+  const auto vocab = config().vocab_size;
+  const auto stride = MtpCandidateWorkspaceSize(vocab);
+  for (std::size_t first = 0; first < rows;
+       first += kGreedyPenaltyRowsPerLaunch) {
+    const auto count =
+        std::min<std::size_t>(kGreedyPenaltyRowsPerLaunch, rows - first);
+    GreedyPenaltyRows batch{};
+    batch.penalties = verification_penalties_;
+    std::copy_n(offsets.begin() + first, count + 1, batch.offsets);
+    VerificationCandidates(VerificationLogits() + first * vocab, batch,
+                           verification_ids_ + first * stride,
+                           verification_scratch_ids_ + first * stride,
+                           verification_candidates_ + first * kMtpCandidates,
+                           static_cast<std::uint32_t>(count), vocab, stream_);
+  }
   const auto count = rows * kMtpCandidates + penalties.size();
   const bool copied = Check(
       hipMemcpyAsync(verification_candidates_host_, verification_candidates_,
@@ -4722,9 +4749,8 @@ bool Executor::SampledMtpCandidates(
     return false;
   for (std::size_t row = 0; row < rows; ++row)
     output[row] = {
-        verification_candidates_host_ + row * kMtpCandidates +
-            batch.offsets[row],
-        kMtpCandidates + batch.offsets[row + 1] - batch.offsets[row]};
+        verification_candidates_host_ + row * kMtpCandidates + offsets[row],
+        kMtpCandidates + offsets[row + 1] - offsets[row]};
   return true;
 }
 
