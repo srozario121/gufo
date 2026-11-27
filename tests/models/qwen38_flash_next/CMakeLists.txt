@@ -36,6 +36,7 @@ add_qwen38_flash_next_test(rope_scaling_oracle
   gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(prompt_lookup gufo_core "cpu")
 add_qwen38_flash_next_test(head_trim gufo_core "cpu")
+add_qwen38_flash_next_test(trie_draft gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
