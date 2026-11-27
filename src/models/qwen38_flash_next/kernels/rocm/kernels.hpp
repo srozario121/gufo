@@ -10,6 +10,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/head_trim.hpp"
+#include "src/models/qwen38_flash_next/rollback_rows.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 
 /// Model-private HIP launchers for everything outside the quantized GEMM
@@ -18,11 +19,7 @@
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
 
-/// Stable per-prefix rollback addresses. Growing the depth does not move
-/// existing buffers or invalidate graphs captured for a smaller batch.
-struct RollbackRows {
-  float* rows[7]{};
-};
+// RollbackRows (rollback_rows.hpp) holds one row per MTP draft.
 
 // Recurrent rollback keeps the state after the first token, then exact
 // FP32 keys/decays/betas/errors for later tokens. No inverse or quantization.

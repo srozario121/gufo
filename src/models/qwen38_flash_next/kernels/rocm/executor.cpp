@@ -936,8 +936,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->options_.max_batch = std::max<std::uint32_t>(1, options.max_batch);
   e->options_.max_logit_rows = std::clamp<std::uint32_t>(
       options.max_logit_rows, 1, e->options_.max_batch);
+  // Each proper prefix of a speculative pass takes one RollbackRows slot.
   e->options_.max_speculative = std::clamp<std::uint32_t>(
-      options.max_speculative, 1, e->options_.max_logit_rows);
+      options.max_speculative, 1,
+      std::min(e->options_.max_logit_rows, kMaxRollbackRows + 1));
   if (qfn_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -1774,9 +1776,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
                               std::string* error_msg) const {
   if (depth <= session.rollback_depth_)
     return true;
-  if (depth >= options_.max_speculative ||
-      depth > std::size(session.ple_snapshots_.rows) ||
-      session.spec_tokens_ != 0) {
+  if (!RollbackDepthAllowed(depth, options_.max_speculative,
+                            session.spec_tokens_)) {
     AssignError(error_msg, "invalid rollback allocation depth");
     return false;
   }

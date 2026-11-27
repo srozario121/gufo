@@ -16,6 +16,8 @@ namespace {
 
 constexpr std::uint32_t kBatchSessions = 8;
 constexpr std::uint32_t kDecodeRows = 8;
+// A batched speculative chain snapshots its proper prefixes in RollbackRows.
+static_assert(kDecodeRows - 1 <= kMaxRollbackRows);
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {

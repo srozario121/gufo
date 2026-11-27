@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <iterator>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,6 +17,7 @@
 
 #include "src/models/qwen38_flash_next/mtp_costs.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
+#include "src/models/qwen38_flash_next/rollback_rows.hpp"
 #include "src/models/qwen38_flash_next/trie_shadow.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
@@ -298,6 +300,43 @@ void CheckConstants() {
   std::cout << "depth constants: limit 14, default 7, priced widths 1..8\n";
 }
 
+// A verification of kMaxMtpDraftTokens drafts snapshots one proper prefix
+// per draft; the device rollback rows (RollbackRows) held seven, so a
+// fourteen-draft pass failed EnsureRollback ("invalid rollback allocation
+// depth") on the GPU.
+void CheckRollbackRows() {
+  namespace rocm = qfn::rocm;
+  static_assert(std::size(rocm::RollbackRows{}.rows) >= qfn::kMaxMtpDraftTokens,
+                "rollback rows must cover the longest chain");
+  static_assert(rocm::kMaxRollbackRows == qfn::kMaxMtpDraftTokens);
+  static_assert(rocm::kMaxRollbackRows >= qfn::kMaxBatchedMtpDraftTokens);
+  // The engine verifies limit + 1 rows (max_speculative), so EnsureRollback
+  // asks for one row per draft.
+  for (std::uint32_t limit = 1; limit <= qfn::kMaxMtpDraftTokens; ++limit) {
+    const auto max_speculative = limit + 1;
+    for (std::uint32_t depth = 0; depth <= limit; ++depth)
+      Require(rocm::RollbackDepthAllowed(depth, max_speculative, 0),
+              "rollback depth " + std::to_string(depth) + " refused at limit " +
+                  std::to_string(limit));
+    Require(!rocm::RollbackDepthAllowed(limit + 1, max_speculative, 0),
+            "rollback depth past the pass width accepted");
+    Require(!rocm::RollbackDepthAllowed(limit, max_speculative, 1),
+            "rollback grown under a pending speculative batch");
+  }
+  // Past the rows themselves, even a wider executor must refuse.
+  Require(!rocm::RollbackDepthAllowed(rocm::kMaxRollbackRows + 1,
+                                      rocm::kMaxRollbackRows + 3, 0),
+          "rollback depth past RollbackRows accepted");
+  // The default limit asks for exactly the seven rows it always used.
+  Require(rocm::RollbackDepthAllowed(qfn::kDefaultMtpDraftTokens,
+                                     qfn::kDefaultMtpDraftTokens + 1, 0) &&
+              !rocm::RollbackDepthAllowed(qfn::kDefaultMtpDraftTokens + 1,
+                                          qfn::kDefaultMtpDraftTokens + 1, 0),
+          "the default limit's rollback depth changed");
+  std::cout << "rollback rows: " << rocm::kMaxRollbackRows
+            << " slots, depths 1..14 accepted\n";
+}
+
 // Every decision and state at limits 1..7 equals the seven-draft controller,
 // across occupancies, contexts and both head curves.
 void CheckLengthControllerAtSeven() {
@@ -542,6 +581,7 @@ void CheckProbeRecordAtFourteen() {
 int main() {
   try {
     CheckConstants();
+    CheckRollbackRows();
     CheckLengthControllerAtSeven();
     CheckBatchControllerAtSeven();
     CheckLengthControllerAtFourteen();
