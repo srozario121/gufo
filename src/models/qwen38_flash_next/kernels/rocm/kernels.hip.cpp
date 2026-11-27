@@ -2315,6 +2315,8 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
 /// loads. Lanes run along channels, so every access is a contiguous row.
 constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
+// The register-history route snapshots up to this many tokens' prefixes.
+static_assert(kSsmConvTokensPerThread - 1 <= kMaxRollbackRows);
 /// The four-tap convolution of one channel, SiLU applied, in one pinned
 /// F32 order. Every route uses it: a prefill pass of eight rows or fewer
 /// (SsmConv4Kernel<true, ...>), a wider one (SsmConv4Kernel<false, ...>) and
