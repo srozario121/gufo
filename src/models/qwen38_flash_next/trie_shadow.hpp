@@ -48,6 +48,21 @@ struct TrieShadowEvent {
   bool sampled{false};
   std::uint32_t chain{0};  ///< tokens in the chain (anchor included)
   std::uint32_t keep{0};   ///< tokens verification kept
+  /// Variant A (a filtered append): the product of the chain's draft
+  /// confidences (greedy: the head's probability; sampled: q), a predictor of
+  /// reaching the position. 1 for a chain without drafts.
+  double confidence{1};
+  /// Variant B (a gate relaxer): at a gate stop, the trie's prediction for the
+  /// gated draft itself (the chain's last token); -1 when none. `g_acc` in
+  /// the line is whether verification accepted that draft (keep == chain).
+  std::int32_t gate_token{-1};
+  bool gate_agree{false};  ///< gate_token equals the gated draft
+  std::uint32_t gate_order{0};
+  double gate_probability{0};
+  /// Variant D (a shorter prompt-lookup match): the longest match from the
+  /// 3-token key up, and the token it would copy next; 0 / -1 when none.
+  std::uint32_t lookup_length{0};
+  std::int32_t lookup_token{-1};
 };
 
 /// One JSON line. `emitted` is -1 when the position was not reached or the
@@ -55,17 +70,26 @@ struct TrieShadowEvent {
 [[nodiscard]] inline std::string FormatTrieShadow(const TrieShadowEvent& e,
                                                   bool reached,
                                                   std::int32_t emitted) {
-  char line[320];
+  char line[512];
+  const bool gate = e.gate_token >= 0;
   const int n = std::snprintf(
       line, sizeof line,
       "{\"pos\":%llu,\"reason\":\"%s\",\"sampled\":%s,\"chain\":%u,"
       "\"keep\":%u,\"reached\":%s,\"trie\":%d,\"order\":%u,\"p\":%.6g,"
-      "\"emitted\":%d,\"match\":%s}\n",
+      "\"emitted\":%d,\"match\":%s,\"conf\":%.6g,\"g_tok\":%d,"
+      "\"g_order\":%u,\"g_p\":%.6g,\"g_agree\":%s,\"g_acc\":%s,"
+      "\"lk_len\":%u,\"lk_tok\":%d,\"lk_match\":%s}\n",
       static_cast<unsigned long long>(e.position),
       e.reason == TrieShadowReason::kGate ? "gate" : "width",
       e.sampled ? "true" : "false", e.chain, e.keep, reached ? "true" : "false",
       e.token, e.order, e.probability, emitted,
-      reached && emitted == e.token ? "true" : "false");
+      reached && emitted == e.token ? "true" : "false", e.confidence,
+      e.gate_token, e.gate_order, e.gate_probability,
+      gate && e.gate_agree ? "true" : "false",
+      gate && e.keep >= e.chain ? "true" : "false", e.lookup_length,
+      e.lookup_token,
+      reached && e.lookup_token >= 0 && emitted == e.lookup_token ? "true"
+                                                                  : "false");
   return n > 0 ? std::string(line, static_cast<std::size_t>(n)) : std::string();
 }
 

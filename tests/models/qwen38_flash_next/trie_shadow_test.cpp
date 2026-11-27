@@ -101,8 +101,52 @@ void TestFormat() {
   Expect(line ==
              "{\"pos\":104,\"reason\":\"width\",\"sampled\":false,\"chain\":4,"
              "\"keep\":4,\"reached\":true,\"trie\":42,\"order\":6,\"p\":0.25,"
-             "\"emitted\":42,\"match\":true}\n",
-         "the JSON line: " + line);
+             "\"emitted\":42,\"match\":true,\"conf\":1,\"g_tok\":-1,"
+             "\"g_order\":0,\"g_p\":0,\"g_agree\":false,\"g_acc\":false,"
+             "\"lk_len\":0,\"lk_tok\":-1,\"lk_match\":false}\n",
+         "the JSON line, no variant data: " + line);
+}
+
+void TestVariants() {
+  // A: the confidence product is carried as given.
+  auto e = Event(4, 4);
+  e.confidence = 0.125;
+  Expect(Has(q::FormatTrieShadow(e, false, -1), "\"conf\":0.125"),
+         "A: the confidence product");
+  // B: a gate prediction that agrees with the gated draft, accepted (kept
+  // whole) and not accepted (kept short).
+  e.gate_token = 9;
+  e.gate_agree = true;
+  e.gate_order = 3;
+  e.gate_probability = 0.75;
+  auto line = q::FormatTrieShadow(e, true, 1);
+  Expect(Has(line,
+             "\"g_tok\":9,\"g_order\":3,\"g_p\":0.75,"
+             "\"g_agree\":true,\"g_acc\":true"),
+         "B: an agreeing gate prediction on a chain kept whole: " + line);
+  e.keep = 3;
+  line = q::FormatTrieShadow(e, false, -1);
+  Expect(Has(line, "\"g_agree\":true,\"g_acc\":false"),
+         "B: ... and on a chain the gated draft was rejected in");
+  e.gate_agree = false;
+  Expect(Has(q::FormatTrieShadow(e, false, -1), "\"g_agree\":false"),
+         "B: a disagreeing gate prediction");
+  // D: a lookup proposal matches only when reached and equal to the emitted.
+  e = Event(4, 4);
+  e.lookup_length = 5;
+  e.lookup_token = 77;
+  Expect(Has(q::FormatTrieShadow(e, true, 77),
+             "\"lk_len\":5,\"lk_tok\":77,\"lk_match\":true"),
+         "D: a reached lookup proposal equal to the emitted token matches");
+  Expect(Has(q::FormatTrieShadow(e, true, 78), "\"lk_match\":false"),
+         "D: ... a different emitted token does not");
+  Expect(Has(q::FormatTrieShadow(e, false, -1), "\"lk_match\":false"),
+         "D: ... nor an unreached position");
+  // The tracker carries the variant fields through to the resolved line.
+  q::TrieShadowTracker t;
+  (void)t.Verified(e);
+  Expect(Has(t.Anchor(104, 77), "\"lk_match\":true"),
+         "D: the tracker resolves the lookup match with the anchor");
 }
 
 void TestSink() {
@@ -142,6 +186,7 @@ int main() {
   TestFires();
   TestTracker();
   TestFormat();
+  TestVariants();
   TestSink();
   if (failures != 0)
     return 1;
