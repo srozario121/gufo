@@ -91,7 +91,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!options.mtp_model_path.empty() &&
       options.max_draft_tokens > kMaxMtpDraftTokens) {
     AssignError(error_msg,
-                "Flash-Next MTP supports at most seven draft tokens");
+                "Flash-Next MTP supports at most fourteen draft tokens");
     return nullptr;
   }
   m->options_ = options;
@@ -186,10 +186,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
+  // The verifier width stays at eight rows past a limit of seven: a longer
+  // MTP chain (the depth probe) verifies wide (Executor::ForwardWide), so
+  // every buffer sized from these is the seven-draft one.
   exec.max_logit_rows =
       m->mtp_weights_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
+                exec.max_batch, MtpVerifierRows(options.max_draft_tokens)))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
@@ -451,6 +454,10 @@ std::size_t Model::DeferredScratchBytes() const {
 
 void Model::LimitCopyRows(std::uint32_t rows) noexcept {
   executor_->LimitCopyRows(rows);
+}
+
+std::uint32_t Model::MaxCopyRows() const noexcept {
+  return executor_->max_copy_rows();
 }
 
 void Model::SetPrefillYield(std::size_t groups,
@@ -1211,6 +1218,9 @@ struct Session::PendingDecode {
   std::uint32_t policy_concurrency{0};
   /// A copy-only cycle here may verify more than max_speculative() rows.
   bool wide{false};
+  /// Depth probe: an MTP chain that may verify more than max_speculative()
+  /// rows (PrepareDecode); never set at a limit of seven or less.
+  bool mtp_wide{false};
   /// Trie v3 shadow (variant A): the product of the drafts' confidences.
   double draft_confidence_product{1.0};
   /// MTP gate probe: each MTP draft's probability, in chain order.
@@ -1312,9 +1322,18 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  // Depth probe: past a limit of seven, a session decoding alone drafts up
+  // to its limit and verifies the chain wide (ForwardWide, segments of eight
+  // rows with the decode arithmetic), up to max_copy_rows(). Batched cycles
+  // (a deferred head) and copies keep the verifier width. At a limit of seven
+  // or less mtp_cap is cap.
+  const std::size_t mtp_cap = MtpChainRows(
+      cap, std::min(max_tokens, room), model_->options_.max_draft_tokens,
+      exec.max_copy_rows(), MtpEnabled() && !defer_head);
   if (exec.DynamicYarn() &&
-      !exec.SetYarnFactor(
-          *session_, exec.YarnLevelFor(tokens_.size() + cap + 1), error_msg)) {
+      !exec.SetYarnFactor(*session_,
+                          exec.YarnLevelFor(tokens_.size() + mtp_cap + 1),
+                          error_msg)) {
     return false;
   }
   // Head eligibility is speculative::DraftSubsetAllowed. Sampled cohorts are
@@ -1339,11 +1358,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   if (MtpEnabled() && cap > 1) {
     drafts = batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
                           : draft_length_.Choose(
-                                static_cast<std::uint32_t>(cap - 1),
+                                static_cast<std::uint32_t>(mtp_cap - 1),
                                 static_cast<std::uint32_t>(tokens_.size()),
                                 pending->policy_concurrency);
     if (!batch_drafts && drafts != 0)
-      drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
+      drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(mtp_cap - 1),
                                        model_->options_.max_draft_tokens);
   }
   const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
@@ -1477,6 +1496,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   pending->draft = draft_token_;
   pending->draft_confidence = draft_confidence_;
+  // Depth probe: an MTP chain past the verifier width verifies wide with its
+  // own head mode (DecodeStep). Copy-only cycles returned above.
+  pending->mtp_wide = pending->width > exec.max_speculative();
   if (!defer_head) {
     while (pending->chain.size() < pending->width) {
       AppendDraft(*pending);
@@ -1857,11 +1879,14 @@ bool Session::DecodeStep(std::size_t max_tokens,
                                              : verify_logits_.data();
   auto& exec = *model_->executor_;
   if (pending.chain.size() > exec.max_speculative()) {
-    // A wide copy (PrepareDecode).
+    // A wide copy, or the depth probe's MTP chain past eight rows, which
+    // keeps its head mode (PrepareDecode).
     if (!pending.gpu_verification)
       verify_logits_.resize(std::max(
           verify_logits_.size(), pending.chain.size() * model_->VocabSize()));
-    if (!exec.ForwardWide(*session_, pending.chain, error_msg) ||
+    if (!exec.ForwardWide(
+            *session_, pending.chain, error_msg,
+            pending.mtp_wide ? pending.head_mode : rocm::kHeadChainInline) ||
         !exec.SelectBatchLogits(
             0, static_cast<std::uint32_t>(pending.chain.size()),
             pending.gpu_verification ? nullptr : verify_logits_.data(),

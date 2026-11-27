@@ -420,10 +420,13 @@ public:
   /// recurrent state, attention and PLE run as consecutive segments of at
   /// most eight rows, so every row has the arithmetic of an ordinary
   /// verification. Logit rows are selected as after ForwardBatch, and
-  /// Rollback() cuts the chain back to any kept prefix.
-  [[nodiscard]] bool ForwardWide(Session& session,
-                                 std::span<const std::int32_t> tokens,
-                                 std::string* error_msg) const;
+  /// Rollback() cuts the chain back to any kept prefix. `head_mode` is the
+  /// chain's kHeadChain* (BatchItem): copies keep kHeadChainInline; the
+  /// depth probe's MTP chains of nine rows or more pass their own.
+  [[nodiscard]] bool ForwardWide(
+      Session& session, std::span<const std::int32_t> tokens,
+      std::string* error_msg,
+      std::uint32_t head_mode = kHeadChainInline) const;
   /// Moves kept trunk hidden row `row` to row 0 (the draft block caught up
   /// to it, so the rows before it are no longer needed).
   [[nodiscard]] bool KeepHiddenRow(Session& session, std::uint32_t row,

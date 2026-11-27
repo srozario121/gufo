@@ -1782,22 +1782,29 @@ bool Executor::ResolveDeferredHeadRows(std::uint32_t from, std::uint32_t rows,
                      head_last_out_, config().vocab_size, trim->inverse,
                      final_flags, head_rowinfo_, head_last_rows_, head_ctr_,
                      stream_);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    if (!Check(hipMemcpyAsync(
-                   logits_host_ + std::size_t{i} * vocab,
-                   head_last_out_ + std::size_t{first + wanted[i]} * vocab,
-                   std::size_t{vocab} * sizeof(float), hipMemcpyDeviceToHost,
-                   stream_),
-               "deferred head rows", error_msg))
+  // The pinned staging buffer holds max_logit_rows rows. A chain of up to
+  // eight rows takes one piece, as before; a wide MTP chain (the depth
+  // probe) downloads its deferred rows in pieces of that size.
+  for (std::uint32_t piece = 0; piece < count;
+       piece += options_.max_logit_rows) {
+    const std::uint32_t end = std::min(count, piece + options_.max_logit_rows);
+    for (std::uint32_t i = piece; i < end; ++i) {
+      if (!Check(hipMemcpyAsync(
+                     logits_host_ + std::size_t{i - piece} * vocab,
+                     head_last_out_ + std::size_t{first + wanted[i]} * vocab,
+                     std::size_t{vocab} * sizeof(float), hipMemcpyDeviceToHost,
+                     stream_),
+                 "deferred head rows", error_msg))
+        return false;
+    }
+    if (!Check(hipGetLastError(), "deferred head pass", error_msg) ||
+        !Check(hipStreamSynchronize(stream_), "deferred head pass", error_msg))
       return false;
-  }
-  if (!Check(hipGetLastError(), "deferred head pass", error_msg) ||
-      !Check(hipStreamSynchronize(stream_), "deferred head pass", error_msg))
-    return false;
-  for (std::uint32_t i = 0; i < count; ++i) {
-    std::copy_n(logits_host_ + std::size_t{i} * vocab, vocab,
-                host_rows + std::size_t{wanted[i]} * vocab);
-    head_defer_host_[first + wanted[i]] = 0;
+    for (std::uint32_t i = piece; i < end; ++i) {
+      std::copy_n(logits_host_ + std::size_t{i - piece} * vocab, vocab,
+                  host_rows + std::size_t{wanted[i]} * vocab);
+      head_defer_host_[first + wanted[i]] = 0;
+    }
   }
   return true;
 }

@@ -50,7 +50,7 @@ struct ModelOptions {
   /// speculative decoding off.
   std::string mtp_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
-  std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
+  std::uint32_t max_draft_tokens = kDefaultMtpDraftTokens;
   std::string vision_model_path;
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
@@ -159,6 +159,9 @@ public:
   /// Caps wide copy verification (Executor::LimitCopyRows); call before any
   /// session is created.
   void LimitCopyRows(std::uint32_t rows) noexcept;
+  /// Rows one wide verification may take (Executor::max_copy_rows): copies,
+  /// and the depth probe's MTP chains past eight rows.
+  [[nodiscard]] std::uint32_t MaxCopyRows() const noexcept;
   /// Splits the following prefill passes into at most `groups` layer groups
   /// and calls `yield` between them, where other sessions may decode. One
   /// group, or an empty `yield`, restores unsplit passes.
@@ -341,7 +344,7 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 21;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(

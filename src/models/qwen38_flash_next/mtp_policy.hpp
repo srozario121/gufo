@@ -12,7 +12,50 @@
 
 namespace gufo::models::qwen38_flash_next {
 
-inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
+/// The longest MTP chain a session may draft (gate-probe depth build: 14, so
+/// 15 verification rows). The default and the served setting stay at
+/// kDefaultMtpDraftTokens; every buffer and decision at that limit is the
+/// same as with a cap of seven.
+inline constexpr std::uint32_t kMaxMtpDraftTokens = 14;
+inline constexpr std::uint32_t kDefaultMtpDraftTokens = 7;
+/// Drafts the measured cycle costs price (mtp_costs.hpp: widths 1..8). The
+/// length controller's profitability scan stops here, so a longer limit only
+/// lengthens chains the gate and budget allow; it is never priced from an
+/// extrapolated width.
+inline constexpr auto kMtpPricedDraftTokens =
+    static_cast<std::uint32_t>(kMtpCostWidths - 1);
+/// A jointly decoded batch verifies each chain within the eight-row decode
+/// arithmetic (rocm batch.cpp), so a batched chain keeps at most seven drafts.
+inline constexpr std::uint32_t kMaxBatchedMtpDraftTokens = 7;
+static_assert(kDefaultMtpDraftTokens <= kMtpPricedDraftTokens &&
+              kMtpPricedDraftTokens <= kMaxMtpDraftTokens &&
+              kMaxBatchedMtpDraftTokens == kMtpPricedDraftTokens);
+
+/// The verifier width (rocm Executor max_logit_rows and max_speculative) for
+/// a session limit: limit + 1 rows up to seven drafts, and eight past it. A
+/// longer chain verifies wide (ForwardWide), so every buffer sized from this
+/// width is the seven-draft one.
+[[nodiscard]] constexpr std::uint32_t MtpVerifierRows(
+    std::uint32_t limit) noexcept {
+  return std::min(limit, kMaxBatchedMtpDraftTokens) + 1;
+}
+
+/// Rows one cycle's chain may reach, anchor included (PrepareDecode). `cap`
+/// is the verifier width within `budget` (the output budget and context
+/// room). Past a limit of seven, a session decoding alone (`alone`: not a
+/// deferred, batched head) may draft to its limit, verified wide within
+/// `wide_rows` (Executor::max_copy_rows). At a limit of seven or less, and in
+/// every batched cycle, it is `cap`.
+[[nodiscard]] constexpr std::size_t MtpChainRows(std::size_t cap,
+                                                 std::size_t budget,
+                                                 std::uint32_t limit,
+                                                 std::uint32_t wide_rows,
+                                                 bool alone) noexcept {
+  if (!alone || limit <= kMaxBatchedMtpDraftTokens)
+    return cap;
+  return std::max(cap, std::min({budget, std::size_t{limit} + 1,
+                                  std::size_t{wide_rows}}));
+}
 /// A chain ends after its first proposal below its gate: the head's
 /// probability of a greedy draft, or the proposal probability q of a sampled
 /// one.
@@ -178,6 +221,8 @@ private:
     float expected_tokens = 1.0F;  // The sampled target anchor.
     float best_score = 1.0F;       // Ordinary target decoding.
     std::uint32_t best = 0;
+    // Only measured widths are priced (kMtpPricedDraftTokens).
+    cap = std::min(cap, kMtpPricedDraftTokens);
     for (std::uint32_t length = 1; length <= cap; ++length) {
       const auto depth = length - 1;
       // An explored depth with no actual rejection remains optimistic.
@@ -217,7 +262,7 @@ public:
     if (rows.empty() || rows.size() > 8)
       return 0;
     const auto& cell = CellFor(rows.size(), context);
-    std::uint32_t cap = kMaxMtpDraftTokens;
+    std::uint32_t cap = kMaxBatchedMtpDraftTokens;
     for (const auto& row : rows)
       cap = std::min(cap, row.budget);
     if (cap == 0)
@@ -273,8 +318,8 @@ public:
 
   void Observe(std::size_t concurrency, std::uint32_t context,
                std::uint32_t drafts, float ms) noexcept {
-    if (concurrency == 0 || concurrency > 8 || drafts > kMaxMtpDraftTokens ||
-        !std::isfinite(ms) || ms <= 0)
+    if (concurrency == 0 || concurrency > 8 ||
+        drafts > kMaxBatchedMtpDraftTokens || !std::isfinite(ms) || ms <= 0)
       return;
     const auto bin = ContextBin(context);
     const bool same_cohort =
@@ -305,8 +350,8 @@ public:
 
 private:
   struct Cell {
-    std::array<float, 8> ms{};
-    std::array<unsigned, 8> samples{};
+    std::array<float, kMaxBatchedMtpDraftTokens + 1> ms{};
+    std::array<unsigned, kMaxBatchedMtpDraftTokens + 1> samples{};
     std::uint64_t cycles{0};
     std::uint32_t last_drafts{0};
   };

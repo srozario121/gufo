@@ -844,8 +844,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
 
 bool Executor::ForwardWide(Session& session,
                            std::span<const std::int32_t> tokens,
-                           std::string* error) const {
-  const BatchItem item{&session, tokens, true};
+                           std::string* error, std::uint32_t head_mode) const {
+  const BatchItem item{&session, tokens, true, head_mode};
   return ForwardBatchImpl(std::span(&item, 1), true, error);
 }
 

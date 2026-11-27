@@ -42,7 +42,7 @@ struct ContinuationComponent {
 // model-owned length policy, PLE n-gram tail, hidden frontier and input
 // identity. Vision layout is rebuilt from the matching request attachment on
 // restoration.
-inline constexpr std::size_t kContinuationMetadataBytes = 160;
+inline constexpr std::size_t kContinuationMetadataBytes = 224;
 
 // Backing classes are the cache's neutral contract (RFC step 6); the layout
 // owns the arithmetic that fills them.
