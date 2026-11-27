@@ -16,6 +16,7 @@ add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
+add_qwen38_flash_next_test(mtp_depth gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
 # The HF-oracle/off-bit-identity checks link the scalar model oracle, so
 # (like ngram) this stays out of cmake/Checks.cmake's hosted check-pr set.
@@ -70,9 +71,16 @@ if (ENGINE_ENABLE_HIP)
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
     gufo_qwen38_flash_next)
+  # Depth-14 probe build: greedy chains past seven drafts against ordinary
+  # decoding (needs the model files, like the session test).
+  add_executable(qwen38_flash_next_depth_session_test EXCLUDE_FROM_ALL
+    depth_session_test.cpp)
+  target_link_libraries(qwen38_flash_next_depth_session_test PRIVATE
+    gufo_qwen38_flash_next)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
-      qwen38_flash_next_continuation_adapter_test)
+      qwen38_flash_next_continuation_adapter_test
+      qwen38_flash_next_depth_session_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)

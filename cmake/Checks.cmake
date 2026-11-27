@@ -27,6 +27,7 @@ set(gufo_pr_targets
   qwen_tokenizer_test qwen_chat_template_test
   qwen27b_continuation_layout_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
+  qwen38_flash_next_mtp_depth_test
   qwen38_flash_next_rope_scaling_test
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_draft_vocab_test qwen38_flash_next_logit_bias_default_test
@@ -47,6 +48,7 @@ if(NOT WIN32)
 endif()
 list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
+  qwen38_flash_next_mtp_depth_test
   qwen38_flash_next_rope_scaling_test
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_draft_vocab_test qwen38_flash_next_logit_bias_default_test
@@ -55,6 +57,7 @@ list(REMOVE_ITEM gufo_pr_tests
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
+  "qwen38_flash_next\\.mtp_depth"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.draft_vocab" "qwen38_flash_next\\.logit_bias_default"
   "qwen38_flash_next\\.head_trim" "qwen38_flash_next\\.trie_draft" "qwen38_flash_next\\.trie_shadow"
