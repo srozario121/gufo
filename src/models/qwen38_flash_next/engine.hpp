@@ -22,6 +22,8 @@
 #include "src/models/qwen38_flash_next/head_trim.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/trie_draft.hpp"
+#include "src/models/qwen38_flash_next/trie_shadow.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -190,6 +192,8 @@ private:
   /// The small head's run-time prefix and static rows (draft_vocab.hpp); empty
   /// unless ModelOptions::draft_vocab_prefix or draft_vocab_set_path is set.
   speculative::DraftVocabPlan draft_plan_;
+  /// Trie v3 shadow mode (trie_shadow.hpp): null unless GUFO_TRIE_SHADOW.
+  std::unique_ptr<TrieShadowLog> trie_shadow_;
   /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
   /// Sets the trimmed target head from ModelOptions::head_trim_set_path.
@@ -442,6 +446,9 @@ private:
   std::uint32_t copy_rows_{0};
   /// Whole copies accepted in a row at copy_rows_ (two widen it).
   std::uint32_t copy_streak_{0};
+  /// Trie v3 shadow mode only: indexed and queried, never proposed.
+  TrieDraft trie_;
+  TrieShadowTracker shadow_;
   mutable SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

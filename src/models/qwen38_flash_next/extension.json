@@ -266,6 +266,12 @@
       "ctest": "qwen38_flash_next\\.trie_draft",
       "check_pr": true,
       "windows_build": true
+    },
+    {
+      "target": "qwen38_flash_next_trie_shadow_test",
+      "ctest": "qwen38_flash_next\\.trie_shadow",
+      "check_pr": true,
+      "windows_build": false
     }
   ],
   "test_labels": [
