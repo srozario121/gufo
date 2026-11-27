@@ -1525,7 +1525,8 @@ int RunServe(std::span<const char* const> args) {
         "Speculative", &mtp_model_path);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
-        "Deprecated and ignored: each model sets its draft length",
+        "Depth-probe build: the Flash-Next MTP draft limit (1..14, default "
+        "7); ignored by other models",
         "Speculative", &draft_tokens);
 
     llm_parser.AddOption(
@@ -1614,9 +1615,14 @@ int RunServe(std::span<const char* const> args) {
           "event=deprecated_option option=--prefill-chunk action=ignored "
           "reason=layered_prefill");
     }
-    // Each model sets its draft settings (TextSpeculativeDefaults).
-    for (const char* option :
-         {"--draft-tokens", "--min-draft-tokens", "--draft-policy"}) {
+    // Each model sets its draft settings (TextSpeculativeDefaults). The
+    // depth-probe build honours --draft-tokens for flash-next-q4 (below).
+    if (llm_parser.WasSupplied("--draft-tokens"))
+      server::Logger::Warn("speculative",
+                           "event=probe_option option=--draft-tokens "
+                           "action=honoured_for=flash-next-q4 value=" +
+                               std::to_string(draft_tokens));
+    for (const char* option : {"--min-draft-tokens", "--draft-policy"}) {
       if (llm_parser.WasSupplied(option)) {
         server::Logger::Warn("speculative",
                              std::string("event=deprecated_option option=") +
@@ -1752,8 +1758,17 @@ int RunServe(std::span<const char* const> args) {
             ext::TextRunnerOptions* options, std::string* error) {
           try {
             options->provider_options = provider_options.Select(provider.id);
+            // Depth probe: --draft-tokens reaches Flash-Next again (the
+            // engine refuses a limit above fourteen).
+            SpeculativeFlags flags;
+            if (provider.id == "flash-next-q4" &&
+                llm_parser.WasSupplied("--draft-tokens"))
+              flags.max_draft_tokens = static_cast<std::uint32_t>(std::min<
+                  std::size_t>(draft_tokens,
+                               std::numeric_limits<std::uint32_t>::max()));
             ApplySpeculativeSettings(
-                ResolveSpeculativeSettings(provider, speculative_backend, {}),
+                ResolveSpeculativeSettings(provider, speculative_backend,
+                                           flags),
                 &options->speculative);
             loaded_speculative = options->speculative;
             return true;

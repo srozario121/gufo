@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1023,6 +1024,10 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
       .decode_concurrency = DecodeConcurrencyForSessions(options.session_count),
       .rope_scaling = rope_scaling,
   };
+  // Depth probe: the served limit (serve --draft-tokens, honoured again for
+  // Flash-Next in this build; otherwise the provider default of seven).
+  if (use_mtp && options.speculative.max_draft_tokens != 0)
+    model_options.max_draft_tokens = options.speculative.max_draft_tokens;
   if (!ApplyDraftVocabOptions(options.provider_options, use_mtp, &model_options,
                               error) ||
       !ApplyHeadTrimOptions(options.provider_options, use_mtp, &model_options,
@@ -1059,6 +1064,21 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
               free_bytes)
         break;
     }
+  }
+  if (use_mtp) {
+    // Depth probe: the widest verification, which bounds an MTP chain past
+    // seven drafts as well as a copy (a chain of `limit` drafts needs
+    // limit + 1 rows).
+    const auto rows = model->MaxCopyRows();
+    const auto limit = model_options.max_draft_tokens;
+    std::cerr << "[depth-probe] max_copy_rows=" << rows
+              << " draft_limit=" << limit << " sessions="
+              << std::max<std::size_t>(options.session_count, 1) << "\n";
+    if (limit > kMaxBatchedMtpDraftTokens && rows < limit + 1)
+      std::cerr << "[depth-probe] WARNING max_copy_rows=" << rows
+                << " is below the " << (limit + 1) << " rows a chain of "
+                << limit << " drafts needs: chains are cut to " << rows
+                << " rows\n";
   }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
   if (!options.disk_cache.directory.empty() && model_fingerprint.empty()) {
