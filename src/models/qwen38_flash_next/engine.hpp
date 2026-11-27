@@ -194,6 +194,8 @@ private:
   speculative::DraftVocabPlan draft_plan_;
   /// Trie v3 shadow mode (trie_shadow.hpp): null unless GUFO_TRIE_SHADOW.
   std::unique_ptr<TrieShadowLog> trie_shadow_;
+  /// MTP gate probe (trie_shadow.hpp): null unless GUFO_MTP_GATE_PROBE.
+  std::unique_ptr<TrieShadowLog> gate_probe_;
   /// Prefix and static rows: always in the small head.
   [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
   /// Sets the trimmed target head from ModelOptions::head_trim_set_path.

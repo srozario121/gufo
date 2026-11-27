@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -131,6 +132,44 @@ private:
   std::optional<TrieShadowEvent> waiting_;
 };
 
+/// The MTP gate probe (MTP item 1.33): GUFO_MTP_GATE_PROBE names a JSON-lines
+/// file. The confidence gate never ends a chain (it drafts to the length
+/// controller's width) and every verified chain is recorded: each MTP draft's
+/// probability (greedy: the head's; sampled: q), the trie's agreement with it
+/// and its matched order, and how many tokens verification kept. Any gate
+/// rule is then a truncation of these chains. Greedy output is unchanged;
+/// sampled output keeps its distribution.
+struct GateProbeChain {
+  std::uint64_t position{0};  ///< the anchor's token index
+  bool sampled{false};
+  std::uint32_t chain{0};          ///< tokens in the chain (anchor included)
+  std::uint32_t keep{0};           ///< tokens verification kept
+  std::uint32_t lookup{0};         ///< trailing prompt-lookup copies
+  std::vector<float> probability;  ///< per MTP draft, in chain order
+  std::vector<int> agree;          ///< per MTP draft: 1, 0, or -1 (no trie)
+  std::vector<std::uint32_t> order;
+};
+
+[[nodiscard]] inline std::string FormatGateProbe(const GateProbeChain& c) {
+  std::string s = "{\"pos\":" + std::to_string(c.position) +
+                  ",\"sampled\":" + (c.sampled ? "true" : "false") +
+                  ",\"chain\":" + std::to_string(c.chain) +
+                  ",\"keep\":" + std::to_string(c.keep) +
+                  ",\"lookup\":" + std::to_string(c.lookup) + ",\"p\":[";
+  char num[32];
+  for (std::size_t i = 0; i < c.probability.size(); ++i) {
+    std::snprintf(num, sizeof num, "%s%.6g", i ? "," : "", c.probability[i]);
+    s += num;
+  }
+  s += "],\"agree\":[";
+  for (std::size_t i = 0; i < c.agree.size(); ++i)
+    s += (i ? "," : "") + std::to_string(c.agree[i]);
+  s += "],\"order\":[";
+  for (std::size_t i = 0; i < c.order.size(); ++i)
+    s += (i ? "," : "") + std::to_string(c.order[i]);
+  return s + "]}\n";
+}
+
 /// The model-wide sink: one file, lines appended under a lock.
 class TrieShadowLog {
 public:
@@ -143,7 +182,8 @@ public:
   TrieShadowLog& operator=(const TrieShadowLog&) = delete;
   /// Opens GUFO_TRIE_SHADOW's path for appending; null when unset or the
   /// file cannot be opened (shadow mode then stays off).
-  [[nodiscard]] static std::unique_ptr<TrieShadowLog> FromEnvironment();
+  [[nodiscard]] static std::unique_ptr<TrieShadowLog> FromEnvironment(
+      const char* name = "GUFO_TRIE_SHADOW");
   void Write(const std::string& lines) {
     if (lines.empty())
       return;
@@ -157,8 +197,9 @@ private:
   std::FILE* file_;
 };
 
-inline std::unique_ptr<TrieShadowLog> TrieShadowLog::FromEnvironment() {
-  const char* path = std::getenv("GUFO_TRIE_SHADOW");
+inline std::unique_ptr<TrieShadowLog> TrieShadowLog::FromEnvironment(
+    const char* name) {
+  const char* path = std::getenv(name);
   if (path == nullptr || *path == '\0')
     return nullptr;
   std::FILE* file = std::fopen(path, "a");
