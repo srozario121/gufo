@@ -286,8 +286,7 @@ public:
   void Observe(std::size_t concurrency, std::uint32_t context,
                std::uint32_t drafts, float ms) noexcept {
     if (concurrency == 0 || concurrency > 8 ||
-        drafts > kMaxBatchedMtpDraftTokens ||
-        !std::isfinite(ms) || ms <= 0)
+        drafts > kMaxBatchedMtpDraftTokens || !std::isfinite(ms) || ms <= 0)
       return;
     const auto bin = ContextBin(context);
     const bool same_cohort =

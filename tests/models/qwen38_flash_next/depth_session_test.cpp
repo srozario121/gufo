@@ -170,8 +170,8 @@ std::uint32_t CheckProbeRecords(const char* path) {
     const auto lookup = number(line, "lookup");
     const auto drafts = count(line, "p");
     const auto keep = number(line, "keep");
-    const bool lists = count(line, "agree") == drafts &&
-                       count(line, "order") == drafts;
+    const bool lists =
+        count(line, "agree") == drafts && count(line, "order") == drafts;
     const bool shape = chain <= qfn::kMaxMtpDraftTokens + 1 &&
                        chain == 1 + drafts + lookup && keep >= 1;
     Require(lists && shape && keep <= chain, "inconsistent record: " + line);

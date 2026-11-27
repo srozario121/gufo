@@ -4648,8 +4648,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
     // Offsets index the whole upload, so each launch keeps them unchanged.
     for (std::size_t first = 0; first < rows;
          first += kGreedyPenaltyRowsPerLaunch) {
-      const auto count = std::min<std::size_t>(kGreedyPenaltyRowsPerLaunch,
-                                               rows - first);
+      const auto count =
+          std::min<std::size_t>(kGreedyPenaltyRowsPerLaunch, rows - first);
       GreedyPenaltyRows batch{};
       batch.penalties = verification_penalties_;
       std::copy_n(offsets.begin() + first, count + 1, batch.offsets);
@@ -4696,9 +4696,8 @@ bool Executor::SampledMtpCandidates(
     const sampling::SamplerState& sampler, std::span<const std::int32_t> drafts,
     std::string* error_msg) const {
   const auto rows = output.size();
-  if (rows == 0 || rows >= options_.max_speculative ||
-      rows != drafts.size() || verification_ids_ == nullptr ||
-      !CanCompactMtpVerification(sampler)) {
+  if (rows == 0 || rows >= options_.max_speculative || rows != drafts.size() ||
+      verification_ids_ == nullptr || !CanCompactMtpVerification(sampler)) {
     AssignError(error_msg, "invalid compact MTP verification request");
     return false;
   }

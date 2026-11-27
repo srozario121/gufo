@@ -317,9 +317,9 @@ void CheckLengthControllerAtSeven() {
                 "a limit of seven or less chose another width");
         ++decisions;
         for (std::uint32_t drafts = 0; drafts <= 9; ++drafts)
-          Require(actual.ExpectedTokens(drafts) ==
-                      expected.ExpectedTokens(drafts),
-                  "expected tokens changed at a limit of seven or less");
+          Require(
+              actual.ExpectedTokens(drafts) == expected.ExpectedTokens(drafts),
+              "expected tokens changed at a limit of seven or less");
         if (length == 0) {
           actual.ObserveArToken();
           expected.ObserveArToken();
@@ -409,9 +409,9 @@ void CheckLengthControllerAtFourteen() {
   Require(std::ranges::equal(std::span(lengths).first(5),
                              std::array<std::uint32_t, 5>{3, 6, 12, 14, 7}),
           "a perfect head did not probe its way to fourteen drafts");
-  Require(*std::ranges::max_element(lengths) == 14 &&
-              controller.Choose(14) == 7,
-          "the priced width of a perfect head is not the measured maximum");
+  Require(
+      *std::ranges::max_element(lengths) == 14 && controller.Choose(14) == 7,
+      "the priced width of a perfect head is not the measured maximum");
   Require(controller.Choose(5) == 5 && controller.Choose(0) == 0,
           "limit 14 ignored the output budget");
   Require(controller.ExpectedTokens(14) > controller.ExpectedTokens(7),
@@ -512,11 +512,8 @@ void CheckBatchControllerAtFourteen() {
 // of a seven-draft one (score_gate.RECORD_KEYS | V2_KEYS); only its lists
 // are longer.
 void CheckProbeRecordAtFourteen() {
-  qfn::GateProbeChain record{.position = 100,
-                             .sampled = false,
-                             .chain = 16,
-                             .keep = 12,
-                             .lookup = 1};
+  qfn::GateProbeChain record{
+      .position = 100, .sampled = false, .chain = 16, .keep = 12, .lookup = 1};
   for (int j = 0; j < 14; ++j) {
     record.probability.push_back(j % 2 == 0 ? 1.0F : 0.5F);
     record.agree.push_back(j % 3 - 1);
