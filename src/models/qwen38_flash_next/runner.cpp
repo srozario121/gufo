@@ -1072,8 +1072,9 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
     const auto rows = model->MaxCopyRows();
     const auto limit = model_options.max_draft_tokens;
     std::cerr << "[depth-probe] max_copy_rows=" << rows
-              << " draft_limit=" << limit << " sessions="
-              << std::max<std::size_t>(options.session_count, 1) << "\n";
+              << " draft_limit=" << limit
+              << " sessions=" << std::max<std::size_t>(options.session_count, 1)
+              << "\n";
     if (limit > kMaxBatchedMtpDraftTokens && rows < limit + 1)
       std::cerr << "[depth-probe] WARNING max_copy_rows=" << rows
                 << " is below the " << (limit + 1) << " rows a chain of "

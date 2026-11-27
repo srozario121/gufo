@@ -53,8 +53,8 @@ static_assert(kDefaultMtpDraftTokens <= kMtpPricedDraftTokens &&
                                                  bool alone) noexcept {
   if (!alone || limit <= kMaxBatchedMtpDraftTokens)
     return cap;
-  return std::max(cap, std::min({budget, std::size_t{limit} + 1,
-                                  std::size_t{wide_rows}}));
+  return std::max(
+      cap, std::min({budget, std::size_t{limit} + 1, std::size_t{wide_rows}}));
 }
 /// A chain ends after its first proposal below its gate: the head's
 /// probability of a greedy draft, or the proposal probability q of a sampled

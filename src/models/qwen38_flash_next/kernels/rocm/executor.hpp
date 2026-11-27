@@ -425,8 +425,7 @@ public:
   /// depth probe's MTP chains of nine rows or more pass their own.
   [[nodiscard]] bool ForwardWide(
       Session& session, std::span<const std::int32_t> tokens,
-      std::string* error_msg,
-      std::uint32_t head_mode = kHeadChainInline) const;
+      std::string* error_msg, std::uint32_t head_mode = kHeadChainInline) const;
   /// Moves kept trunk hidden row `row` to row 0 (the draft block caught up
   /// to it, so the rows before it are no longer needed).
   [[nodiscard]] bool KeepHiddenRow(Session& session, std::uint32_t row,

@@ -1763,13 +1763,12 @@ int RunServe(std::span<const char* const> args) {
             SpeculativeFlags flags;
             if (provider.id == "flash-next-q4" &&
                 llm_parser.WasSupplied("--draft-tokens"))
-              flags.max_draft_tokens = static_cast<std::uint32_t>(std::min<
-                  std::size_t>(draft_tokens,
-                               std::numeric_limits<std::uint32_t>::max()));
-            ApplySpeculativeSettings(
-                ResolveSpeculativeSettings(provider, speculative_backend,
-                                           flags),
-                &options->speculative);
+              flags.max_draft_tokens =
+                  static_cast<std::uint32_t>(std::min<std::size_t>(
+                      draft_tokens, std::numeric_limits<std::uint32_t>::max()));
+            ApplySpeculativeSettings(ResolveSpeculativeSettings(
+                                         provider, speculative_backend, flags),
+                                     &options->speculative);
             loaded_speculative = options->speculative;
             return true;
           } catch (const std::invalid_argument& exception) {

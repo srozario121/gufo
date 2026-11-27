@@ -155,17 +155,16 @@ struct Outcome {
 };
 
 std::string Json(const Outcome& o) {
-  std::string s = "{\"limit\":" + std::to_string(o.limit) + ",\"prompt\":\"" +
-                  o.prompt + "\",\"config\":\"" + o.config +
-                  "\",\"status\":\"" + o.status +
-                  "\",\"matched\":" + std::to_string(o.matched) +
-                  ",\"of\":" + std::to_string(kTokens) +
-                  ",\"first_divergence\":" +
-                  std::to_string(o.first_divergence) +
-                  ",\"expected\":" + std::to_string(o.expected) +
-                  ",\"actual\":" + std::to_string(o.actual) +
-                  ",\"widest_cycle\":" + std::to_string(o.widest) +
-                  ",\"tokens\":" + List(o.tokens);
+  std::string s =
+      "{\"limit\":" + std::to_string(o.limit) + ",\"prompt\":\"" + o.prompt +
+      "\",\"config\":\"" + o.config + "\",\"status\":\"" + o.status +
+      "\",\"matched\":" + std::to_string(o.matched) +
+      ",\"of\":" + std::to_string(kTokens) +
+      ",\"first_divergence\":" + std::to_string(o.first_divergence) +
+      ",\"expected\":" + std::to_string(o.expected) +
+      ",\"actual\":" + std::to_string(o.actual) +
+      ",\"widest_cycle\":" + std::to_string(o.widest) +
+      ",\"tokens\":" + List(o.tokens);
   if (!o.error.empty()) {
     std::string escaped;
     for (const char c : o.error)
@@ -210,8 +209,7 @@ std::uint32_t CheckProbeRecords(const char* path, std::streamoff* offset) {
     const auto keep = number(line, "keep");
     const bool lists =
         count(line, "agree") == drafts && count(line, "order") == drafts;
-    Require(lists && chain == 1 + drafts + lookup && keep >= 1 &&
-                keep <= chain,
+    Require(lists && chain == 1 + drafts + lookup && keep >= 1 && keep <= chain,
             "inconsistent record: " + line);
     Require(drafts <= kLastLimit, "a chain drafted past 14: " + line);
     if (lookup == 0)

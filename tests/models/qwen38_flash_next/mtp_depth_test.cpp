@@ -325,9 +325,9 @@ void CheckRollbackRows() {
                   std::to_string(limit));
     Require(!rocm::RollbackDepthAllowed(max_speculative, max_speculative, 0),
             "rollback depth past the pass width accepted");
-    Require(!rocm::RollbackDepthAllowed(max_speculative - 1, max_speculative,
-                                        1),
-            "rollback grown under a pending speculative batch");
+    Require(
+        !rocm::RollbackDepthAllowed(max_speculative - 1, max_speculative, 1),
+        "rollback grown under a pending speculative batch");
   }
   // Past the rows themselves, even a wider executor must refuse.
   Require(!rocm::RollbackDepthAllowed(rocm::kMaxRollbackRows + 1,
@@ -344,18 +344,18 @@ void CheckChainRows() {
   for (std::size_t budget = 0; budget <= 70; ++budget) {
     for (std::uint32_t wide : {8U, 16U, 24U, 64U}) {
       const auto cap = std::min<std::size_t>(budget, 8);
-      for (std::uint32_t limit = 1; limit <= qfn::kMaxMtpDraftTokens;
-           ++limit) {
+      for (std::uint32_t limit = 1; limit <= qfn::kMaxMtpDraftTokens; ++limit) {
         for (const bool alone : {false, true}) {
           const auto rows = qfn::MtpChainRows(cap, budget, limit, wide, alone);
           if (!alone || limit <= 7) {
-            Require(rows == cap, "a limit of seven or a batched cycle moved "
-                                 "past the verifier width");
+            Require(rows == cap,
+                    "a limit of seven or a batched cycle moved "
+                    "past the verifier width");
             continue;
           }
           const auto expected = std::max(
-              cap, std::min<std::size_t>({budget, std::size_t{limit} + 1,
-                                          std::size_t{wide}}));
+              cap, std::min<std::size_t>(
+                       {budget, std::size_t{limit} + 1, std::size_t{wide}}));
           Require(rows == expected && rows <= limit + 1 &&
                       rows <= std::max<std::size_t>(cap, wide) &&
                       rows <= std::max<std::size_t>(budget, cap),
