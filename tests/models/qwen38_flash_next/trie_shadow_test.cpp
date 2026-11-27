@@ -169,6 +169,28 @@ void TestGateProbe() {
   c.order.clear();
   Expect(Has(q::FormatGateProbe(c), "\"p\":[],\"agree\":[],\"order\":[]"),
          "a chain without MTP drafts has empty arrays");
+  // Probe v2: the cycle's time, the trie's token per draft and the kept tokens
+  // follow the v1 fields; an untimed cycle omits "ms".
+  c.probability = {0.5F, 0.25F};
+  c.agree = {1, -1};
+  c.order = {3, 0};
+  c.trie = {11, -1};
+  c.kept = {10, 11};
+  c.ms = 41.25;
+  const auto v2 = q::FormatGateProbe(c);
+  Expect(Has(v2,
+             "\"order\":[3,0],\"ms\":41.250,\"trie\":[11,-1],"
+             "\"kept\":[10,11]}\n"),
+         "the probe v2 fields: " + v2);
+  c.ms = -1.0;
+  Expect(!Has(q::FormatGateProbe(c), "\"ms\""), "an untimed cycle has no ms");
+  const auto anchor =
+      q::FormatGateAnchor({.position = 9, .token = 42, .continuation = {7, 8}});
+  Expect(anchor == "{\"anchor\":9,\"tok\":42,\"cont\":[7,8]}\n",
+         "the anchor line: " + anchor);
+  Expect(q::FormatGateAnchor({.position = 1, .token = 2}) ==
+             "{\"anchor\":1,\"tok\":2,\"cont\":[]}\n",
+         "an anchor without a trie continuation");
 }
 
 void TestSink() {

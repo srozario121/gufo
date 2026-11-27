@@ -148,7 +148,40 @@ struct GateProbeChain {
   std::vector<float> probability;  ///< per MTP draft, in chain order
   std::vector<int> agree;          ///< per MTP draft: 1, 0, or -1 (no trie)
   std::vector<std::uint32_t> order;
+  /// Probe v2 (MTP item 1.36): the cycle's wall milliseconds from drafting to
+  /// verified (negative when not timed, as in batched cycles), the trie's
+  /// token per MTP draft (-1 without a prediction) and the kept tokens.
+  double ms{-1.0};
+  std::vector<std::int32_t> trie;
+  std::vector<std::int32_t> kept;
 };
+
+/// Probe v2: the target's anchor at `position` (the token emitted where the
+/// last cycle stopped) and the trie's greedy continuation after it.
+struct GateProbeAnchor {
+  std::uint64_t position{0};
+  std::int32_t token{0};
+  std::vector<std::int32_t> continuation;
+};
+
+namespace detail {
+template<class T>
+void AppendList(std::string& s, const char* key, const std::vector<T>& v) {
+  s += ",\"";
+  s += key;
+  s += "\":[";
+  for (std::size_t i = 0; i < v.size(); ++i)
+    s += (i ? "," : "") + std::to_string(v[i]);
+  s += "]";
+}
+}  // namespace detail
+
+[[nodiscard]] inline std::string FormatGateAnchor(const GateProbeAnchor& a) {
+  std::string s = "{\"anchor\":" + std::to_string(a.position) +
+                  ",\"tok\":" + std::to_string(a.token);
+  detail::AppendList(s, "cont", a.continuation);
+  return s + "}\n";
+}
 
 [[nodiscard]] inline std::string FormatGateProbe(const GateProbeChain& c) {
   std::string s = "{\"pos\":" + std::to_string(c.position) +
@@ -167,7 +200,16 @@ struct GateProbeChain {
   s += "],\"order\":[";
   for (std::size_t i = 0; i < c.order.size(); ++i)
     s += (i ? "," : "") + std::to_string(c.order[i]);
-  return s + "]}\n";
+  s += "]";
+  if (c.ms >= 0.0) {
+    std::snprintf(num, sizeof num, ",\"ms\":%.3f", c.ms);
+    s += num;
+  }
+  if (!c.trie.empty() || !c.kept.empty()) {
+    detail::AppendList(s, "trie", c.trie);
+    detail::AppendList(s, "kept", c.kept);
+  }
+  return s + "}\n";
 }
 
 /// The model-wide sink: one file, lines appended under a lock.
