@@ -134,8 +134,8 @@ std::string ChainChatBody(const std::string& model,
 std::size_t ChainSentenceEnd(std::string_view text);
 
 /// libcurl client of base_url + /v1/chat/completions for model.
-std::shared_ptr<ChainChatClient> CreateHttpChainChatClient(
-    std::string base_url, std::string model);
+std::shared_ptr<ChainChatClient> CreateHttpChainChatClient(std::string base_url,
+                                                           std::string model);
 /// Transcribes with the ASR service of this process; service must outlive
 /// the transcriber.
 std::shared_ptr<ChainTranscriber> CreateAsrChainTranscriber(

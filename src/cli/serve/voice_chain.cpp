@@ -236,8 +236,8 @@ public:
       // The server keeps generating into the socket while a sentence is
       // spoken; the next chunk is read once it has been.
       while (true) {
-        const auto end = ChainSentenceEnd(
-            std::string_view(reply->text).substr(unspoken));
+        const auto end =
+            ChainSentenceEnd(std::string_view(reply->text).substr(unspoken));
         if (end == std::string_view::npos)
           return true;
         if (!speak(unspoken + end))
@@ -320,11 +320,11 @@ public:
     auto& message = history_[*reply_message_];
     message.content.resize(std::min(keep, message.content.size()));
     const auto first = message.content.find_first_not_of(" \t\r\n");
-    message.content = first == std::string::npos
-                          ? std::string()
-                          : message.content.substr(
-                                0, message.content.find_last_not_of(" \t\r\n") +
-                                       1);
+    message.content =
+        first == std::string::npos
+            ? std::string()
+            : message.content.substr(
+                  0, message.content.find_last_not_of(" \t\r\n") + 1);
     if (message.content.empty() && message.tool_calls.empty()) {
       history_.erase(history_.begin() +
                      static_cast<std::ptrdiff_t>(*reply_message_));
@@ -424,8 +424,8 @@ public:
       s.stopped = true;
       return 0;
     };
-    using Progress = int (*)(void*, curl_off_t, curl_off_t, curl_off_t,
-                             curl_off_t);
+    using Progress =
+        int (*)(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t);
     const Progress progress = [](void* user, curl_off_t, curl_off_t, curl_off_t,
                                  curl_off_t) -> int {
       auto& s = *static_cast<State*>(user);
@@ -525,8 +525,7 @@ public:
                                       .pcm16k = pcm16k,
                                       .on_text = {}};
     ext::TranscriptionResult result;
-    if (!service_->Transcribe(
-            request, [] { return false; }, &result, error))
+    if (!service_->Transcribe(request, [] { return false; }, &result, error))
       return false;
     *text = std::move(result.text);
     return true;
@@ -555,9 +554,8 @@ public:
     const ext::CancellationCheck check = [&] {
       return cancelled && cancelled();
     };
-    ext::SynthesisRequest request{.text = std::string(text),
-                                  .speaker = speaker_,
-                                  .language = language_};
+    ext::SynthesisRequest request{
+        .text = std::string(text), .speaker = speaker_, .language = language_};
     request.on_audio = [&](std::span<const float> samples) {
       if (rate == kOutputRate)
         return on_audio(samples);
@@ -570,11 +568,11 @@ public:
     if (rate == kOutputRate || buffered.empty())
       return true;
     try {
-      const auto resampled = ResampleMono(AudioBuffer{.sample_rate = rate,
-                                                      .channels = 1,
-                                                      .samples =
-                                                          std::move(buffered)},
-                                          kOutputRate);
+      const auto resampled =
+          ResampleMono(AudioBuffer{.sample_rate = rate,
+                                   .channels = 1,
+                                   .samples = std::move(buffered)},
+                       kOutputRate);
       (void)on_audio(resampled);
     } catch (const std::exception& e) {
       SetError(error, e.what());
@@ -698,8 +696,7 @@ bool DecodeChainChatChunk(std::string_view data, const ChainChatEvents& events,
   if (const auto* calls = delta->find("tool_calls");
       calls && calls->is_array()) {
     for (const auto& call : calls->items()) {
-      const std::size_t index =
-          call.member_size("index", result->calls.size());
+      const std::size_t index = call.member_size("index", result->calls.size());
       if (index > 64) {
         SetError(error, "invalid tool call index");
         return false;
@@ -798,8 +795,8 @@ std::size_t ChainSentenceEnd(std::string_view text) {
   return std::string_view::npos;
 }
 
-std::shared_ptr<ChainChatClient> CreateHttpChainChatClient(
-    std::string base_url, std::string model) {
+std::shared_ptr<ChainChatClient> CreateHttpChainChatClient(std::string base_url,
+                                                           std::string model) {
   return std::make_shared<HttpChatClient>(std::move(base_url),
                                           std::move(model));
 }
@@ -812,9 +809,8 @@ std::shared_ptr<ChainTranscriber> CreateAsrChainTranscriber(
 std::shared_ptr<ChainSynthesizer> CreateTtsChainSynthesizer(
     std::shared_ptr<TtsService> service, std::string speaker,
     std::string language) {
-  return std::make_shared<TtsSynthesizer>(std::move(service),
-                                          std::move(speaker),
-                                          std::move(language));
+  return std::make_shared<TtsSynthesizer>(
+      std::move(service), std::move(speaker), std::move(language));
 }
 
 }  // namespace gufo::server

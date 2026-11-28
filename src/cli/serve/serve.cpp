@@ -46,8 +46,8 @@
 #include "src/cli/serve/audio_buffer.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
-#include "src/cli/serve/voice_chain.hpp"
 #include "src/cli/serve/video_jobs.hpp"
+#include "src/cli/serve/voice_chain.hpp"
 #include "src/cli/video/video.hpp"
 
 namespace gufo::cli {
@@ -1376,11 +1376,10 @@ int RunServe(std::span<const char* const> args) {
                 << '\n';
       return 2;
     }
-    const bool voice_chain =
-        !options.voice_chain_llm.empty() ||
-        !options.voice_chain_model.empty() ||
-        !options.voice_chain_tts.empty() ||
-        !options.voice_chain_voice.empty();
+    const bool voice_chain = !options.voice_chain_llm.empty() ||
+                             !options.voice_chain_model.empty() ||
+                             !options.voice_chain_tts.empty() ||
+                             !options.voice_chain_voice.empty();
     if (voice_chain) {
       if (options.voice_chain_llm.empty() ||
           options.voice_chain_model.empty() ||
@@ -1488,9 +1487,9 @@ int RunServe(std::span<const char* const> args) {
             [chain_asr,
              chat = server::CreateHttpChainChatClient(
                  options.voice_chain_llm, options.voice_chain_model),
-             synthesizer = server::CreateTtsChainSynthesizer(
-                 chain_tts, chain_speaker)](std::uint32_t rate,
-                                            std::string* error)
+             synthesizer =
+                 server::CreateTtsChainSynthesizer(chain_tts, chain_speaker)](
+                std::uint32_t rate, std::string* error)
             -> std::unique_ptr<server::VoiceConversation> {
           if (*chain_asr == nullptr) {
             *error = "the ASR service is not ready";

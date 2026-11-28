@@ -2,6 +2,8 @@
 // the real SSE parser and chunk decoder), speech by sentence, tool turns,
 // cancellation and truncation; plus the libcurl client against a canned
 // local HTTP server.
+#include "src/cli/serve/voice_chain.hpp"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -16,7 +18,6 @@
 #include <thread>
 #include <vector>
 
-#include "src/cli/serve/voice_chain.hpp"
 #include "src/core/json.hpp"
 
 namespace {
@@ -317,8 +318,10 @@ void ToolCallThenAnswer() {
   const auto& messages = body.find("messages")->items();
   const auto& assistant = messages[messages.size() - 2];
   CHECK(assistant.find("content")->is_null());
-  CHECK(assistant.find("tool_calls")->items()[0].find("function")->member_str(
-            "arguments") == R"({"city":"Rome"})");
+  CHECK(assistant.find("tool_calls")
+            ->items()[0]
+            .find("function")
+            ->member_str("arguments") == R"({"city":"Rome"})");
   CHECK(messages.back().member_str("tool_call_id") == "call_abc");
   CHECK(!body.find("chat_template_kwargs")
              ->find("enable_thinking")
@@ -377,8 +380,7 @@ Harness Spoke() {
   Harness h;
   std::string error;
   CHECK(h.conversation->AddUserText("go", &error));
-  h.chat->replies = {Content(kThree) + Finish(),
-                     Content("Next.") + Finish()};
+  h.chat->replies = {Content(kThree) + Finish(), Content("Next.") + Finish()};
   VoiceConversation::Reply reply;
   CHECK(h.Respond(&reply, &error));
   CHECK(reply.audio_samples == 3600);
@@ -503,8 +505,8 @@ public:
     address.sin_family = AF_INET;
     address.sin_port = 0;
     CHECK(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
-    CHECK(::bind(fd_, reinterpret_cast<sockaddr*>(&address),
-                 sizeof(address)) == 0);
+    CHECK(::bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
+          0);
     CHECK(::listen(fd_, 1) == 0);
     socklen_t size = sizeof(address);
     CHECK(::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &size) ==
@@ -526,6 +528,7 @@ public:
   std::string url() const {
     return "http://127.0.0.1:" + std::to_string(port_);
   }
+
 private:
   void Serve() {
     const int client = ::accept(fd_, nullptr, nullptr);
@@ -563,8 +566,8 @@ std::string HexChunk(std::string_view data) {
 }
 
 void HttpClientStreams() {
-  const std::string sse = Reasoning("hmm") + Content("Hel") + Content("lo.") +
-                          Finish();
+  const std::string sse =
+      Reasoning("hmm") + Content("Hel") + Content("lo.") + Finish();
   std::vector<std::string> pieces{
       "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
       "Transfer-Encoding: chunked\r\n\r\n"};
@@ -602,10 +605,11 @@ void HttpClientStreams() {
 }
 
 void HttpClientErrors() {
-  CannedServer server({
-      "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
-      "Content-Length: 43\r\n\r\n",
-      R"({"error":{"message":"model is not loaded"}})"});
+  CannedServer server(
+      {"HTTP/1.1 500 Internal Server Error\r\nContent-Type: "
+       "application/json\r\n"
+       "Content-Length: 43\r\n\r\n",
+       R"({"error":{"message":"model is not loaded"}})"});
   auto client = CreateHttpChainChatClient(server.url() + "/v1", "m");
   ChainChatRequest request;
   request.messages = {{.role = "user", .content = "hi"}};
